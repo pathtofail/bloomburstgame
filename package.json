@@ -1,0 +1,15 @@
+{
+  "name": "bloomsortgame",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "pixi.js": "^8.18.1",
+    "vite": "^8.0.8"
+  }
+}

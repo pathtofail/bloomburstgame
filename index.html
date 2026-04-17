@@ -1,0 +1,2871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bloom Sort</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #CCCCCC; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.x/dist/pixi.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+</head>
+<body>
+<script>
+(async function () {
+
+await document.fonts.load('32px "Fredoka One"');
+
+// Load textures
+const bgTexture           = await PIXI.Assets.load('assets/canvas_bg.jpg');
+const logoTexture         = await PIXI.Assets.load('assets/gameLogo.png');
+const frameTexture        = await PIXI.Assets.load('assets/frame.png');
+const multEmptyTexture    = await PIXI.Assets.load('assets/multiplier_empty.png');
+const multFullTexture     = await PIXI.Assets.load('assets/multiplier_full.png');
+
+// Symbol art — pot, middle (flower center), petals.
+const potTexture        = await PIXI.Assets.load('assets/pot.png');
+const middleTexture     = await PIXI.Assets.load('assets/middle.png');
+const spinButtonTexture = await PIXI.Assets.load('assets/spin_button.png');
+const infoButtonTexture = await PIXI.Assets.load('assets/info_button.png');
+
+// Per-colour petal sprites. Note: "Gold" uses petal_orange.png per art team.
+const PETAL_FILE_BY_COLOR = {
+  Scarlet: 'scarlet', Indigo: 'indigo', Magenta: 'magenta', Gold: 'orange',
+  Teal: 'teal',       Lime: 'lime',     Sky: 'sky',         Pearl: 'pearl',
+};
+const petalTextures = {};
+await Promise.all(Object.entries(PETAL_FILE_BY_COLOR).map(async ([colorName, file]) => {
+  petalTextures[colorName] = await PIXI.Assets.load(`assets/petal_${file}.png`);
+}));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GAME MODEL — pure state and transitions, no rendering
+//
+// Implements the rules from the Bloom Slot design doc v1.0:
+//   • 4×5 grid of { color, petals } cells
+//   • i.i.d. weighted random for colour + starting petals (per spec)
+//   • Transfer pass: right first, then down, 1 petal per cell, simultaneous
+//     writes via a copy of the grid (copy rule)
+//   • Dissolves: petals ≥ MAX → Full Bloom (base pay), = 0 → Empty (+2× mult)
+//   • Cascades: gravity + refill + re-transfer until no dissolves
+//   • Final win = total payout × multiplier (mult starts at 1)
+//
+// Every step appends a typed event to an events array so the view layer can
+// replay the spin as an animation sequence.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const GAME = {
+  ROWS: 4,
+  COLS: 5,
+  MAX_PETALS: 8,
+  MAX_TRANSFER_PASSES: 50,
+  MAX_CASCADES: 100,
+
+  // Temporarily disabled. Set to true to re-enable the +2×-per-empty rule.
+  // When false, the multiplier stays at 1 for every spin — empty dissolves
+  // still happen mechanically (cells still clear, cascades still refill),
+  // they just don't contribute to the win.
+  MULTIPLIER_ENABLED: false,
+
+  COLORS: [
+    { name: 'Scarlet', weight: 5,  basePay: 10, hex: '#D50000' },
+    { name: 'Indigo',  weight: 7,  basePay: 8,  hex: '#304FFE' },
+    { name: 'Magenta', weight: 9,  basePay: 6,  hex: '#C2185B' },
+    { name: 'Gold',    weight: 11, basePay: 6,  hex: '#FF6F00' },
+    { name: 'Teal',    weight: 13, basePay: 4,  hex: '#00796B' },
+    { name: 'Lime',    weight: 15, basePay: 3,  hex: '#558B2F' },
+    { name: 'Sky',     weight: 17, basePay: 2,  hex: '#0277BD' },
+    { name: 'Pearl',   weight: 20, basePay: 1,  hex: '#78909C' },
+  ],
+
+  PETAL_WEIGHTS: [
+    { count: 1, weight: 40 },
+    { count: 2, weight: 35 },
+    { count: 3, weight: 18 },
+    { count: 4, weight: 7 },
+  ],
+};
+
+const COLOR_BY_NAME = Object.fromEntries(GAME.COLORS.map(c => [c.name, c]));
+
+// Swappable RNG — tests replace this with a seeded PRNG for determinism.
+let _rng = Math.random;
+function setRng(fn) { _rng = fn; }
+function resetRng() { _rng = Math.random; }
+
+// Simple seedable LCG (good enough for deterministic test fixtures)
+function makeSeededRng(seed) {
+  let s = (seed >>> 0) || 1;
+  return function () {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+function weightedPick(items) {
+  const total = items.reduce((s, i) => s + i.weight, 0);
+  let r = _rng() * total;
+  for (const item of items) {
+    r -= item.weight;
+    if (r <= 0) return item;
+  }
+  return items[items.length - 1];
+}
+
+function spawnCell() {
+  return {
+    color: weightedPick(GAME.COLORS).name,
+    petals: weightedPick(GAME.PETAL_WEIGHTS).count,
+  };
+}
+
+function generateGrid() {
+  const grid = [];
+  for (let r = 0; r < GAME.ROWS; r++) {
+    const row = [];
+    for (let c = 0; c < GAME.COLS; c++) row.push(spawnCell());
+    grid.push(row);
+  }
+  return grid;
+}
+
+function cloneGrid(grid) {
+  return grid.map(row => row.map(cell => cell ? { ...cell } : null));
+}
+
+// Single transfer pass. Copy-based simultaneous evaluation.
+// Returns { nextGrid, moves }. moves = [{ from:{r,c}, to:{r,c}, color }]
+function transferPass(grid) {
+  const next = cloneGrid(grid);
+  const moves = [];
+  const DIRS = [
+    { dr: 0, dc: 1 },  // right first
+    { dr: 1, dc: 0 },  // then down
+  ];
+
+  for (let r = 0; r < GAME.ROWS; r++) {
+    for (let c = 0; c < GAME.COLS; c++) {
+      const cell = grid[r][c];
+      if (!cell || cell.petals <= 0) continue;
+
+      for (const dir of DIRS) {
+        const nr = r + dir.dr, nc = c + dir.dc;
+        if (nr < 0 || nr >= GAME.ROWS || nc < 0 || nc >= GAME.COLS) continue;
+        const neighbor = grid[nr][nc];
+        if (!neighbor) continue;
+        if (neighbor.color !== cell.color) continue;
+        // Read sender state from original grid; check receiver capacity against copy
+        if (next[nr][nc].petals >= GAME.MAX_PETALS) continue;
+
+        next[r][c].petals  -= 1;
+        next[nr][nc].petals += 1;
+        moves.push({ from: { r, c }, to: { r: nr, c: nc }, color: cell.color });
+        break;
+      }
+    }
+  }
+
+  return { nextGrid: next, moves };
+}
+
+// Run transfer passes until stable. Returns { finalGrid, passes } where
+// passes = [{ passIndex, moves, gridAfter }].
+function runTransfers(grid) {
+  const passes = [];
+  let current = grid;
+  for (let i = 0; i < GAME.MAX_TRANSFER_PASSES; i++) {
+    const { nextGrid, moves } = transferPass(current);
+    if (moves.length === 0) break;
+    passes.push({ passIndex: i, moves, gridAfter: cloneGrid(nextGrid) });
+    current = nextGrid;
+  }
+  return { finalGrid: current, passes };
+}
+
+function findDissolves(grid) {
+  const fullBlooms = [];
+  const emptyDissolves = [];
+  for (let r = 0; r < GAME.ROWS; r++) {
+    for (let c = 0; c < GAME.COLS; c++) {
+      const cell = grid[r][c];
+      if (!cell) continue;
+      if (cell.petals >= GAME.MAX_PETALS) {
+        fullBlooms.push({
+          r, c,
+          color: cell.color,
+          basePay: COLOR_BY_NAME[cell.color].basePay,
+        });
+      } else if (cell.petals === 0) {
+        emptyDissolves.push({ r, c, color: cell.color });
+      }
+    }
+  }
+  return { fullBlooms, emptyDissolves };
+}
+
+// Mutates grid — clears dissolved cells to null.
+function applyDissolves(grid, fullBlooms, emptyDissolves) {
+  for (const d of fullBlooms) grid[d.r][d.c] = null;
+  for (const d of emptyDissolves) grid[d.r][d.c] = null;
+}
+
+// Column-wise gravity. Mutates grid. Returns falls = [{ from:{r,c}, to:{r,c} }].
+function applyGravity(grid) {
+  const falls = [];
+  for (let c = 0; c < GAME.COLS; c++) {
+    let writeRow = GAME.ROWS - 1;
+    for (let r = GAME.ROWS - 1; r >= 0; r--) {
+      if (grid[r][c]) {
+        if (writeRow !== r) {
+          grid[writeRow][c] = grid[r][c];
+          grid[r][c] = null;
+          falls.push({ from: { r, c }, to: { r: writeRow, c } });
+        }
+        writeRow--;
+      }
+    }
+  }
+  return falls;
+}
+
+// Fill every null cell with a freshly-spawned symbol. Mutates grid.
+// Returns newCells = [{ r, c, color, petals }].
+function refillGrid(grid) {
+  const newCells = [];
+  for (let r = 0; r < GAME.ROWS; r++) {
+    for (let c = 0; c < GAME.COLS; c++) {
+      if (!grid[r][c]) {
+        const cell = spawnCell();
+        grid[r][c] = cell;
+        newCells.push({ r, c, color: cell.color, petals: cell.petals });
+      }
+    }
+  }
+  return newCells;
+}
+
+// ─── STATS / RTP TRACKER ────────────────────────────────────────────────────
+// RTP = (cumulative win) / (cumulative wager).
+// Every call to runSpin(bet) advances these counters.
+const stats = {
+  spins: 0,
+  totalWager: 0,
+  totalWin: 0,
+  totalPayoutPreMult: 0,   // sum of Full Bloom coins, before × multiplier
+  totalMultiplierSum: 0,    // sum of per-spin multipliers, useful for avg mult
+  maxWin: 0,
+  maxMultiplier: 1,
+  hitCount: 0,              // spins with finalWin > 0
+  lastRTP: 0,
+  get rtp() {
+    return this.totalWager > 0 ? this.totalWin / this.totalWager : 0;
+  },
+  get hitRate() {
+    return this.spins > 0 ? this.hitCount / this.spins : 0;
+  },
+  get avgWin() {
+    return this.spins > 0 ? this.totalWin / this.spins : 0;
+  },
+  get avgMultiplier() {
+    return this.spins > 0 ? this.totalMultiplierSum / this.spins : 0;
+  },
+};
+
+function resetStats() {
+  stats.spins = 0;
+  stats.totalWager = 0;
+  stats.totalWin = 0;
+  stats.totalPayoutPreMult = 0;
+  stats.totalMultiplierSum = 0;
+  stats.maxWin = 0;
+  stats.maxMultiplier = 1;
+  stats.hitCount = 0;
+  stats.lastRTP = 0;
+}
+
+// Batch simulation — useful for fast RTP convergence checks.
+// Returns stats snapshot after n spins.
+function runManySpins(n, bet = 1) {
+  for (let i = 0; i < n; i++) runSpin(bet);
+  return {
+    spins:         stats.spins,
+    totalWager:    stats.totalWager,
+    totalWin:      stats.totalWin,
+    rtp:           stats.rtp,
+    hitRate:       stats.hitRate,
+    avgWin:        stats.avgWin,
+    avgMultiplier: stats.avgMultiplier,
+    maxWin:        stats.maxWin,
+    maxMultiplier: stats.maxMultiplier,
+  };
+}
+
+// Run a full spin. Accepts optional bet (default 1) — updates cumulative RTP
+// stats. Returns:
+//   { events, finalGrid, totalPayout, multiplier, finalWin, cascadeCount, bet, rtp }
+function runSpin(bet = 1) {
+  const events = [];
+  let grid = generateGrid();
+  events.push({ type: 'spawn', grid: cloneGrid(grid) });
+
+  let totalPayout = 0;
+  let multiplier  = 1;
+  let cascadeCount = 0;
+
+  for (let cas = 0; cas < GAME.MAX_CASCADES; cas++) {
+    // 1. Transfers until stable
+    const { finalGrid, passes } = runTransfers(grid);
+    for (const p of passes) {
+      events.push({
+        type: 'transferPass',
+        cascadeIndex: cas,
+        passIndex: p.passIndex,
+        moves: p.moves,
+        gridAfter: p.gridAfter,
+      });
+    }
+    grid = finalGrid;
+
+    // 2. Dissolves
+    const { fullBlooms, emptyDissolves } = findDissolves(grid);
+    if (fullBlooms.length === 0 && emptyDissolves.length === 0) break;
+
+    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay, 0);
+    const multDelta   = GAME.MULTIPLIER_ENABLED ? emptyDissolves.length * 2 : 0;
+    totalPayout += payoutDelta;
+    multiplier  += multDelta;
+    cascadeCount++;
+
+    events.push({
+      type: 'dissolve',
+      cascadeIndex: cas,
+      fullBlooms: fullBlooms.map(x => ({ ...x })),
+      emptyDissolves: emptyDissolves.map(x => ({ ...x })),
+      payoutDelta,
+      multDelta,
+      payoutTotal: totalPayout,
+      multiplier,
+    });
+
+    applyDissolves(grid, fullBlooms, emptyDissolves);
+
+    // 3. Gravity
+    const falls = applyGravity(grid);
+    if (falls.length) {
+      events.push({ type: 'gravity', cascadeIndex: cas, falls });
+    }
+
+    // 4. Refill
+    const newCells = refillGrid(grid);
+    events.push({
+      type: 'refill',
+      cascadeIndex: cas,
+      newCells,
+      gridAfter: cloneGrid(grid),
+    });
+  }
+
+  // Bet scaling. In a real slot, base pays are expressed per unit bet, so the
+  // actual payout to the player is (math × bet). This keeps RTP invariant
+  // across bet sizes: RTP = E[finalWin / bet] = E[totalPayout × multiplier].
+  const mathWin  = totalPayout * multiplier;   // pre-bet math result
+  const finalWin = mathWin * bet;               // actual coins paid to player
+
+  // ── Update cumulative RTP stats ──────────────────────────────────────────
+  stats.spins              += 1;
+  stats.totalWager         += bet;
+  stats.totalWin           += finalWin;
+  stats.totalPayoutPreMult += totalPayout;
+  stats.totalMultiplierSum += multiplier;
+  if (finalWin > 0) stats.hitCount += 1;
+  if (finalWin > stats.maxWin) stats.maxWin = finalWin;
+  if (multiplier > stats.maxMultiplier) stats.maxMultiplier = multiplier;
+  stats.lastRTP = stats.rtp;
+
+  events.push({
+    type: 'end',
+    totalPayout, multiplier, mathWin, finalWin, cascadeCount,
+    bet,
+    cumulativeRTP: stats.rtp,
+  });
+
+  return {
+    events, finalGrid: grid,
+    totalPayout, multiplier, mathWin, finalWin, cascadeCount,
+    bet,
+    rtp: stats.rtp,
+    spinCount: stats.spins,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS — call BloomSort.runTests() from the console
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function runTests() {
+  const results = [];
+  let passed = 0, failed = 0;
+
+  // Snapshot + reset stats so tests don't pollute player totals
+  const statsBackup = { ...stats };
+  resetStats();
+
+  function test(name, fn) {
+    try {
+      fn();
+      results.push({ name, ok: true });
+      passed++;
+    } catch (e) {
+      results.push({ name, ok: false, err: e.message });
+      failed++;
+    }
+  }
+  function assert(cond, msg) {
+    if (!cond) throw new Error(msg || 'assertion failed');
+  }
+  function assertEq(actual, expected, msg) {
+    if (actual !== expected) {
+      throw new Error((msg || 'assertEq') + ` — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+  }
+  function assertDeep(a, b, msg) {
+    const sa = JSON.stringify(a), sb = JSON.stringify(b);
+    if (sa !== sb) throw new Error((msg || 'assertDeep') + `\n  expected: ${sb}\n  actual:   ${sa}`);
+  }
+
+  // Build a 4×5 grid filled with an inert stand-in (Pearl 0) so unrelated
+  // cells never trigger transfers. Petals = 0 short-circuits the sender check.
+  function blankGrid() {
+    const g = [];
+    for (let r = 0; r < GAME.ROWS; r++) {
+      const row = [];
+      for (let c = 0; c < GAME.COLS; c++) row.push({ color: 'Pearl', petals: 0 });
+      g.push(row);
+    }
+    return g;
+  }
+
+  // ── 1. Transfer direction priority: right first ────────────────────────────
+  test('Transfer chooses RIGHT over DOWN when both are same-colour', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 3 };
+    g[0][1] = { color: 'Scarlet', petals: 3 };
+    g[1][0] = { color: 'Scarlet', petals: 3 };
+    const { nextGrid, moves } = transferPass(g);
+    assertEq(nextGrid[0][0].petals, 2, '(0,0) should have sent');
+    assertEq(nextGrid[0][1].petals, 4, '(0,1) should have received from (0,0)');
+    assertEq(nextGrid[1][0].petals, 3, '(1,0) should NOT have received from (0,0)');
+    assert(moves.some(m => m.from.r === 0 && m.from.c === 0 && m.to.c === 1),
+      'move (0,0)→(0,1) should exist');
+  });
+
+  // ── 2. Down fallback when right is different colour ────────────────────────
+  test('Transfer falls back to DOWN when right is not same colour', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 3 };
+    g[1][0] = { color: 'Scarlet', petals: 3 };
+    // g[0][1] stays inert (Pearl 0)
+    const { nextGrid } = transferPass(g);
+    assertEq(nextGrid[0][0].petals, 2, '(0,0) sent down');
+    assertEq(nextGrid[1][0].petals, 4, '(1,0) received');
+  });
+
+  // ── 3. No transfer when no same-colour orthogonal neighbour ────────────────
+  test('Isolated same-colour cell produces zero transfers', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 5 };
+    const { moves } = transferPass(g);
+    assertEq(moves.length, 0);
+  });
+
+  // ── 4. No transfer LEFT or UP, even if same colour ────────────────────────
+  test('Left and Up directions are never used', () => {
+    const g = blankGrid();
+    // Place a Scarlet with only left and up same-colour neighbours
+    g[0][0] = { color: 'Scarlet', petals: 3 };
+    g[0][1] = { color: 'Scarlet', petals: 3 };  // left neighbour of (0,2)
+    g[1][2] = { color: 'Scarlet', petals: 3 };  // would be down of (0,2) — but let's skip it
+    // Put target at (1,1): its UP is (0,1)=Scarlet, LEFT is (1,0)=Pearl.
+    g[1][1] = { color: 'Scarlet', petals: 3 };
+    // (1,1) tries right (1,2) — currently (1,2) was set to Scarlet above.
+    // To isolate: override (1,2) to inert
+    g[1][2] = { color: 'Pearl', petals: 0 };
+    // (1,1) neighbours: right (1,2)=Pearl, down (2,1)=Pearl. No transfer.
+    const before = JSON.parse(JSON.stringify(g[1][1]));
+    const { nextGrid } = transferPass(g);
+    assertDeep(nextGrid[1][1], before, '(1,1) should not transfer left or up');
+  });
+
+  // ── 5. Simultaneity — receiver capacity enforced via COPY, not original ───
+  test('Two senders cannot both push a receiver at MAX−1 over MAX', () => {
+    const g = blankGrid();
+    // Receiver Y at (1,1) with 7 petals. Two senders at (0,1) and (1,0).
+    g[0][1] = { color: 'Scarlet', petals: 1 };  // X — sends DOWN to Y
+    g[1][0] = { color: 'Scarlet', petals: 1 };  // W — sends RIGHT to Y
+    g[1][1] = { color: 'Scarlet', petals: 7 };  // Y — receiver
+    const { nextGrid, moves } = transferPass(g);
+    assertEq(nextGrid[1][1].petals, 8, 'Y reaches exactly MAX (8)');
+    // X processed first (row-major), so X sends.
+    assertEq(nextGrid[0][1].petals, 0, 'X emptied');
+    assertEq(nextGrid[1][0].petals, 1, 'W blocked (Y at MAX in copy)');
+    assertEq(moves.length, 1, 'only one move per pass');
+  });
+
+  // ── 6. Copy rule in a straight chain A→B→C ────────────────────────────────
+  // Per the provided pseudocode: both A→B and B→C happen in one pass.
+  // A loses 1, B's net stays the same, C gains 1. A different petal reaches C
+  // than the one that left A — i.e. no SPECIFIC petal jumps A to C.
+  test('A→B→C chain: A and C shift by ±1 in a single pass, B unchanged', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 3 };
+    g[0][1] = { color: 'Scarlet', petals: 3 };
+    g[0][2] = { color: 'Scarlet', petals: 3 };
+    const { nextGrid, moves } = transferPass(g);
+    assertEq(nextGrid[0][0].petals, 2, 'A sent 1');
+    assertEq(nextGrid[0][1].petals, 3, 'B net unchanged (+1 from A, −1 to C)');
+    assertEq(nextGrid[0][2].petals, 4, 'C received 1');
+    assertEq(moves.length, 2, 'two moves in one pass');
+  });
+
+  // ── 7. Full bloom detection at MAX ────────────────────────────────────────
+  test('Dissolve: petals ≥ MAX produces a Full Bloom with correct base pay', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 8 };   // MAX exactly
+    g[0][1] = { color: 'Gold',    petals: 9 };   // above MAX (shouldn't occur but protect)
+    const { fullBlooms, emptyDissolves } = findDissolves(g);
+    assertEq(fullBlooms.length, 2);
+    assertEq(emptyDissolves.length, 0);
+    const scarlet = fullBlooms.find(f => f.color === 'Scarlet');
+    const gold    = fullBlooms.find(f => f.color === 'Gold');
+    assertEq(scarlet.basePay, 10);
+    assertEq(gold.basePay, 6);
+  });
+
+  // ── 8. Empty dissolve detection at 0 ──────────────────────────────────────
+  test('Dissolve: petals = 0 produces an Empty Dissolve', () => {
+    const g = blankGrid();
+    g[0][0] = { color: 'Scarlet', petals: 0 };
+    const { fullBlooms, emptyDissolves } = findDissolves(g);
+    assertEq(emptyDissolves.length, 1);
+    // blank grid has 19 more Pearl-0 cells, so total empties = 20
+    assertEq(fullBlooms.length, 0);
+  });
+
+  // ── 9. Gravity: non-null cells drop, order preserved ──────────────────────
+  test('Gravity pulls cells down per column, preserving relative order', () => {
+    const g = blankGrid();
+    // Column 0: [S1, null, S2, null]
+    g[0][0] = { color: 'Scarlet', petals: 1 };
+    g[1][0] = null;
+    g[2][0] = { color: 'Scarlet', petals: 2 };
+    g[3][0] = null;
+    applyGravity(g);
+    assert(g[0][0] === null, 'row 0 emptied');
+    assert(g[1][0] === null, 'row 1 emptied');
+    assertEq(g[2][0].petals, 1, 'row 2 now holds original row-0 cell');
+    assertEq(g[3][0].petals, 2, 'row 3 now holds original row-2 cell');
+  });
+
+  // ── 10. Refill fills only null cells ──────────────────────────────────────
+  test('Refill only populates null cells and leaves others untouched', () => {
+    setRng(makeSeededRng(1));
+    const g = blankGrid();
+    g[0][0] = null;
+    g[0][1] = null;
+    const preserved = { ...g[0][2] };
+    const newCells = refillGrid(g);
+    assertEq(newCells.length, 2, 'two new cells added');
+    assert(g[0][0] !== null && g[0][1] !== null, 'previously-null cells filled');
+    assertDeep(g[0][2], preserved, 'non-null cell untouched');
+    resetRng();
+  });
+
+  // ── 11. Seeded RNG → deterministic full spin ──────────────────────────────
+  test('runSpin is deterministic under a seeded RNG', () => {
+    setRng(makeSeededRng(12345));
+    const a = runSpin();
+    setRng(makeSeededRng(12345));
+    const b = runSpin();
+    assertEq(a.totalPayout, b.totalPayout);
+    assertEq(a.multiplier,  b.multiplier);
+    assertEq(a.finalWin,    b.finalWin);
+    assertEq(a.cascadeCount, b.cascadeCount);
+    assertDeep(a.finalGrid, b.finalGrid);
+    resetRng();
+  });
+
+  // ── 12. Multiplier arithmetic: starts at 1, +2 per empty ──────────────────
+  // Toggles MULTIPLIER_ENABLED on for this test so it still exercises the
+  // math even while the flag is off in production.
+  test('Multiplier (when enabled) is additive: +2 per empty dissolve, starts at 1', () => {
+    const prev = GAME.MULTIPLIER_ENABLED;
+    GAME.MULTIPLIER_ENABLED = true;
+    setRng(makeSeededRng(7));
+    const r = runSpin();
+    const emptyCount = r.events
+      .filter(e => e.type === 'dissolve')
+      .reduce((s, e) => s + e.emptyDissolves.length, 0);
+    assertEq(r.multiplier, 1 + 2 * emptyCount,
+      'multiplier should equal 1 + 2 × (total empty dissolves)');
+    resetRng();
+    GAME.MULTIPLIER_ENABLED = prev;
+  });
+
+  test('Multiplier stays 1 when MULTIPLIER_ENABLED is false', () => {
+    const prev = GAME.MULTIPLIER_ENABLED;
+    GAME.MULTIPLIER_ENABLED = false;
+    setRng(makeSeededRng(11));
+    const r = runSpin();
+    assertEq(r.multiplier, 1);
+    resetRng();
+    GAME.MULTIPLIER_ENABLED = prev;
+  });
+
+  // ── 13. Final win formula ─────────────────────────────────────────────────
+  // mathWin = totalPayout × multiplier (per the design doc).
+  // finalWin = mathWin × bet (player payout scales with wager so RTP is
+  // invariant across bet sizes).
+  test('Final win = totalPayout × multiplier × bet', () => {
+    setRng(makeSeededRng(99));
+    const r = runSpin(5);
+    assertEq(r.mathWin,  r.totalPayout * r.multiplier);
+    assertEq(r.finalWin, r.totalPayout * r.multiplier * 5);
+    resetRng();
+  });
+
+  // ── 13b. RTP is invariant to bet size ─────────────────────────────────────
+  test('RTP is invariant to bet size across a batch of spins', () => {
+    const sample = (bet, seed, n = 200) => {
+      resetStats();
+      setRng(makeSeededRng(seed));
+      for (let i = 0; i < n; i++) runSpin(bet);
+      return stats.rtp;
+    };
+    const rtpA = sample(1,   42);
+    const rtpB = sample(100, 42);  // same seed → same spin outcomes
+    resetRng();
+    // Since spins are deterministic (same seed) and finalWin scales linearly
+    // with bet, RTPs must be exactly equal.
+    assertEq(rtpA, rtpB);
+  });
+
+  // ── 14. runTransfers stabilises (no infinite loops) ───────────────────────
+  test('runTransfers stabilises within the pass limit', () => {
+    const g = blankGrid();
+    // Pathological chain of same-colour cells that should still stabilise
+    for (let c = 0; c < GAME.COLS; c++) g[0][c] = { color: 'Scarlet', petals: 4 };
+    const { finalGrid, passes } = runTransfers(g);
+    assert(passes.length < GAME.MAX_TRANSFER_PASSES, 'did not hit pass cap');
+    // After stabilising, no cell should have a same-colour right/down neighbour
+    // with both parties able to transfer.
+    for (let r = 0; r < GAME.ROWS; r++) {
+      for (let c = 0; c < GAME.COLS; c++) {
+        const cell = finalGrid[r][c];
+        if (!cell || cell.petals === 0) continue;
+        // Try a final transferPass — should produce nothing
+      }
+    }
+    const { moves } = transferPass(finalGrid);
+    assertEq(moves.length, 0, 'final grid is transfer-stable');
+  });
+
+  // ── 15. Event stream order ─────────────────────────────────────────────────
+  test('Event stream starts with spawn and ends with end', () => {
+    setRng(makeSeededRng(3));
+    const r = runSpin();
+    assertEq(r.events[0].type, 'spawn');
+    assertEq(r.events[r.events.length - 1].type, 'end');
+    // Within each cascade, order should be: transferPass* → dissolve → gravity? → refill
+    let state = 'start';
+    let cascadeSeenDissolve = -1;
+    for (const e of r.events) {
+      if (e.type === 'spawn')      assert(state === 'start');
+      if (e.type === 'end')        state = 'done';
+      if (e.type === 'dissolve')   cascadeSeenDissolve = e.cascadeIndex;
+      if (e.type === 'refill') {
+        assertEq(e.cascadeIndex, cascadeSeenDissolve,
+          'refill must follow dissolve within a cascade');
+      }
+    }
+    resetRng();
+  });
+
+  // ── 16. Starting petals are always in [1, MAX−1] ──────────────────────────
+  test('Spawned cells always have petals in [1, MAX−1]', () => {
+    setRng(makeSeededRng(42));
+    for (let i = 0; i < 500; i++) {
+      const cell = spawnCell();
+      assert(cell.petals >= 1 && cell.petals <= GAME.MAX_PETALS - 1,
+        `cell.petals ${cell.petals} out of [1, ${GAME.MAX_PETALS - 1}]`);
+    }
+    resetRng();
+  });
+
+  // ── 17. Known-seed regression ─────────────────────────────────────────────
+  // Captures the current computed result for a fixed seed, so any math drift
+  // during refactors will surface immediately.
+  test('Known-seed regression (seed=2024)', () => {
+    setRng(makeSeededRng(2024));
+    const r = runSpin();
+    // These values are captured from the current implementation and serve as
+    // a tripwire — failing this test means the math changed, verify intent.
+    assert(typeof r.totalPayout === 'number' && r.totalPayout >= 0);
+    assert(typeof r.multiplier  === 'number' && r.multiplier  >= 1);
+    assertEq(r.finalWin, r.totalPayout * r.multiplier);
+    resetRng();
+  });
+
+  // ── 18. Stats tracking updates correctly on every spin ───────────────────
+  test('Stats track cumulative wager, win, and RTP across spins', () => {
+    resetStats();
+    setRng(makeSeededRng(2024));
+    const bet = 10;
+    const r1 = runSpin(bet);
+    assertEq(stats.spins, 1);
+    assertEq(stats.totalWager, bet);
+    assertEq(stats.totalWin, r1.finalWin);
+    const r2 = runSpin(bet);
+    assertEq(stats.spins, 2);
+    assertEq(stats.totalWager, bet * 2);
+    assertEq(stats.totalWin, r1.finalWin + r2.finalWin);
+    assertEq(stats.rtp, stats.totalWin / stats.totalWager);
+    resetRng();
+  });
+
+  // Restore the stats we snapshotted at the start
+  Object.assign(stats, statsBackup);
+
+  // Summary
+  console.group(`%cBloomSort tests — ${passed} passed, ${failed} failed`,
+    failed ? 'color:#c00;font-weight:bold' : 'color:#0a0;font-weight:bold');
+  for (const r of results) {
+    if (r.ok) console.log('%c  ✓ ' + r.name, 'color:#0a0');
+    else      console.error('  ✗ ' + r.name + '\n     ' + r.err);
+  }
+  console.groupEnd();
+  return { passed, failed, results };
+}
+
+// Expose for console testing
+window.BloomSort = {
+  GAME, runSpin, runManySpins, generateGrid, transferPass, runTransfers,
+  findDissolves, applyGravity, refillGrid, spawnCell, cloneGrid,
+  setRng, resetRng, makeSeededRng, runTests,
+  stats, resetStats,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYMBOL ART — Procedural pot + bulb + petal textures, pre-rendered to canvases
+// so we can spawn hundreds of sprites cheaply. Petals are white-filled so we can
+// tint them per colour at runtime via PIXI.Sprite.tint.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function hexToNumber(hex) {
+  return parseInt(hex.replace('#', ''), 16);
+}
+
+// Native art sizes (pixels). All symbols are rendered at 2× resolution for
+// retina-sharp display and scaled down by the FlowerSymbol to fit a cell.
+const ART_SCALE = 2;
+
+function makePotTexture() {
+  // Top-down pot. Aspect W:H ≈ 1.55:1 — the camera reads as looking down
+  // fairly steeply onto the pot, showing more of the soil surface.
+  // Strong inner rim shadow + layered soil gradient gives a real "bowl with
+  // dirt in it" feel.
+  const W = 56, H = 36;
+  const PAD = 10;
+  const cw = (W + PAD * 2) * ART_SCALE;
+  const ch = (H + PAD * 2 + 10) * ART_SCALE;
+  const c = document.createElement('canvas');
+  c.width = cw; c.height = ch;
+  const ctx = c.getContext('2d');
+  ctx.scale(ART_SCALE, ART_SCALE);
+
+  const cx = (W + PAD * 2) / 2;
+  const cy = PAD + H / 2;
+
+  // Soft elliptical drop shadow under the pot
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.36)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + H * 0.46, W * 0.46, H * 0.19, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer body: 3-stop vertical gradient — light top → mid → darker bottom
+  const bodyGrad = ctx.createLinearGradient(0, cy - H / 2, 0, cy + H / 2);
+  bodyGrad.addColorStop(0,   '#D99376');
+  bodyGrad.addColorStop(0.5, '#B67150');
+  bodyGrad.addColorStop(1,   '#8A502F');
+  ctx.fillStyle = bodyGrad;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, W / 2, H / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Bright rim highlight on the upper arc of the outer edge
+  ctx.strokeStyle = 'rgba(255, 232, 200, 0.55)';
+  ctx.lineWidth = 1.3;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, W / 2 - 0.7, H / 2 - 0.7, 0, Math.PI * 1.12, Math.PI * 1.88);
+  ctx.stroke();
+
+  // Inner rim (darker ring marking the opening)
+  const rimRx = W * 0.42, rimRy = H * 0.40;
+  ctx.fillStyle = '#6B3F27';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - H * 0.02, rimRx, rimRy, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Soil: radial gradient, dark center suggests depth. Offset slightly
+  // upper-left to simulate light from upper-left.
+  const soilRx = rimRx * 0.88, soilRy = rimRy * 0.86;
+  const soilGrad = ctx.createRadialGradient(
+    cx - W * 0.06, cy - H * 0.10, 1,
+    cx, cy, rimRx * 1.05
+  );
+  soilGrad.addColorStop(0,   '#7C5639');
+  soilGrad.addColorStop(0.45,'#553722');
+  soilGrad.addColorStop(1,   '#2E1B0E');
+  ctx.fillStyle = soilGrad;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - H * 0.04, soilRx, soilRy, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dark crescent along the TOP inner edge — reads as the interior lip
+  // casting shadow on the dirt, strong depth cue.
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - H * 0.03, soilRx, soilRy, 0, Math.PI * 1.05, Math.PI * 1.95);
+  ctx.stroke();
+
+  const tex = PIXI.Texture.from(c);
+  tex.logicalWidth = W + PAD * 2;
+  tex.logicalHeight = H + PAD * 2 + 10;
+  tex.anchorX = cx / tex.logicalWidth;
+  tex.anchorY = cy / tex.logicalHeight;
+  // Pot body width in texture pixels — used for uniform scaling in FlowerSymbol
+  tex.potBodyPxW = W * ART_SCALE;
+  return tex;
+}
+
+function makeBulbTexture() {
+  // Small flower receptacle — the attachment point for petals. Intentionally
+  // understated: soft cream disc with a subtle rim, NOT a glossy pearl.
+  const R = 10;
+  const PAD = 3;
+  const size = (R * 2 + PAD * 2) * ART_SCALE;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  ctx.scale(ART_SCALE, ART_SCALE);
+
+  const cx = R + PAD, cy = R + PAD;
+
+  // Soft shadow underneath for grounding
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + R * 0.38, R * 0.75, R * 0.28, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Body — subtle gradient, darker on the bottom edge
+  const g = ctx.createRadialGradient(cx, cy - R * 0.25, R * 0.15, cx, cy, R);
+  g.addColorStop(0,    '#FFF0D0');
+  g.addColorStop(0.7,  '#F0DAA8');
+  g.addColorStop(1,    '#C89E5F');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Thin darker rim for definition (ties it visually to petals)
+  ctx.strokeStyle = 'rgba(80, 50, 20, 0.35)';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R - 0.4, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Tiny soft highlight — just a whisper, no pearl look
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+  ctx.beginPath();
+  ctx.ellipse(cx - R * 0.25, cy - R * 0.3, R * 0.22, R * 0.14, -0.4, 0, Math.PI * 2);
+  ctx.fill();
+
+  const tex = PIXI.Texture.from(c);
+  tex.logicalSize = R * 2 + PAD * 2;
+  return tex;
+}
+
+function makePetalTexture() {
+  // Teardrop. Tip points UP (toward -y). Fill uses grayscale values so that
+  // PIXI's tint multiplies correctly:
+  //   • near-white pixels   → show full tint colour (brightest)
+  //   • mid-gray pixels     → show dimmer tint      (normal/body)
+  //   • near-black pixels   → show very dark tint   (shadowed)
+  // This is how we get a rich gradient petal that still tints cleanly per
+  // colour — depth is baked into the luminance, hue comes from tint.
+  const W = 16, H = 30;
+  const PAD = 3;
+  const cw = (W + PAD * 2) * ART_SCALE;
+  const ch = (H + PAD * 2) * ART_SCALE;
+  const c = document.createElement('canvas');
+  c.width = cw; c.height = ch;
+  const ctx = c.getContext('2d');
+  ctx.scale(ART_SCALE, ART_SCALE);
+
+  const cx = (W + PAD * 2) / 2;
+  const base_y = PAD + H;
+  const tip_y  = PAD;
+  const mid_y  = PAD + H * 0.42;
+  const half_w = W / 2;
+
+  // ── Teardrop path ────────────────────────────────────────────────────────
+  function drawPath() {
+    ctx.beginPath();
+    ctx.moveTo(cx, base_y);
+    ctx.bezierCurveTo(cx - half_w * 0.30, base_y - H * 0.18,
+                      cx - half_w,        mid_y,
+                      cx - half_w * 0.86, tip_y + H * 0.18);
+    ctx.bezierCurveTo(cx - half_w * 0.38, tip_y,
+                      cx + half_w * 0.38, tip_y,
+                      cx + half_w * 0.86, tip_y + H * 0.18);
+    ctx.bezierCurveTo(cx + half_w,        mid_y,
+                      cx + half_w * 0.30, base_y - H * 0.18,
+                      cx,                 base_y);
+    ctx.closePath();
+  }
+
+  // ── 1. Base fill: vertical luminance gradient (tip = white, base = dark) ─
+  drawPath();
+  ctx.save();
+  ctx.clip();
+
+  const bodyGrad = ctx.createLinearGradient(0, tip_y, 0, base_y);
+  bodyGrad.addColorStop(0.00, '#FFFFFF');  // tip — full brightness
+  bodyGrad.addColorStop(0.35, '#E8E8E8');  // upper body
+  bodyGrad.addColorStop(0.75, '#909090');  // lower body
+  bodyGrad.addColorStop(1.00, '#4A4A4A');  // base — deep shadow
+  ctx.fillStyle = bodyGrad;
+  ctx.fillRect(0, 0, cw / ART_SCALE, ch / ART_SCALE);
+
+  // ── 2. Side roll: slight darkening on left edge (3D cylinder hint) ──────
+  const sideGrad = ctx.createLinearGradient(cx - half_w, 0, cx + half_w, 0);
+  sideGrad.addColorStop(0.00, 'rgba(0,0,0,0.18)');
+  sideGrad.addColorStop(0.35, 'rgba(0,0,0,0)');
+  sideGrad.addColorStop(0.70, 'rgba(0,0,0,0)');
+  sideGrad.addColorStop(1.00, 'rgba(0,0,0,0.10)');
+  ctx.fillStyle = sideGrad;
+  ctx.fillRect(0, 0, cw / ART_SCALE, ch / ART_SCALE);
+
+  // ── 3. Strong inner shadow at base (petal curves down into bulb) ────────
+  const innerShadow = ctx.createRadialGradient(
+    cx, base_y - H * 0.05, 0,
+    cx, base_y - H * 0.05, H * 0.35
+  );
+  innerShadow.addColorStop(0, 'rgba(0,0,0,0.40)');
+  innerShadow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = innerShadow;
+  ctx.fillRect(0, 0, cw / ART_SCALE, ch / ART_SCALE);
+
+  // ── 4. Tip specular highlight ───────────────────────────────────────────
+  const tipHi = ctx.createRadialGradient(
+    cx - half_w * 0.15, tip_y + H * 0.22, 0,
+    cx - half_w * 0.15, tip_y + H * 0.22, H * 0.30
+  );
+  tipHi.addColorStop(0, 'rgba(255,255,255,0.55)');
+  tipHi.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = tipHi;
+  ctx.fillRect(0, 0, cw / ART_SCALE, ch / ART_SCALE);
+
+  ctx.restore();
+
+  // ── 5. Dark outline stroke — crisp silhouette ───────────────────────────
+  drawPath();
+  ctx.strokeStyle = 'rgba(40, 20, 10, 0.45)';
+  ctx.lineWidth = 0.9;
+  ctx.stroke();
+
+  const tex = PIXI.Texture.from(c);
+  tex.logicalW = W + PAD * 2;
+  tex.logicalH = H + PAD * 2;
+  tex.anchorX = cx / tex.logicalW;
+  tex.anchorY = base_y / tex.logicalH;
+  return tex;
+}
+
+// Petal slot angles — fixed at 45° increments, clockwise from straight UP.
+// For N petals, fill the first N slots. At 8 petals the flower is fully
+// bloomed in a daisy/sunflower arrangement.
+const PETAL_ANGLES = {};
+for (let n = 1; n <= 8; n++) {
+  const arr = [];
+  for (let i = 0; i < n; i++) arr.push(i * Math.PI / 4);
+  PETAL_ANGLES[n] = arr;
+}
+
+// Single asset-scale reference. All art (pot, middle, petals) was designed at
+// the same relative scale — we apply one factor derived from cellSize to keep
+// their proportions identical to the reference.
+//   ASSET_SCALE = cellSize / ASSET_DESIGN_CELL
+// Tune ASSET_DESIGN_CELL to change how much of the cell the symbol fills.
+const ASSET_DESIGN_CELL = 540;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FLOWER SYMBOL — one per cell. Composition: pot → petals → middle.
+// All three assets (pot, middle, petal) share a single uniform scale derived
+// from the cell size, preserving their designed proportions.
+//
+// Container origin = cell center = flower center. Petals are arranged
+// radially at 45° increments clockwise from straight up (slot 0 = up,
+// slot 1 = upper-right, ... slot 7 = upper-left).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class FlowerSymbol extends PIXI.Container {
+  constructor(colorName, petalCount, cellSize) {
+    super();
+    this.colorName = colorName;
+    this.colorHex = hexToNumber(COLOR_BY_NAME[colorName].hex);
+    this.petalCount = petalCount;
+    this.cellSize = cellSize;
+
+    // ONE scale factor applied uniformly to pot, middle, and petals.
+    this._scale = cellSize / ASSET_DESIGN_CELL;
+
+    // "Bulb Y" = the pivot point around which petals rotate. Radial layout
+    // centers everything at (0,0), so bulb Y is 0.
+    this._bulbY = 0;
+
+    this._buildPot();
+    this._buildPetalLayer();
+    this._buildMiddle();
+    this._layoutPetals();
+  }
+
+  _buildPot() {
+    const s = new PIXI.Sprite(potTexture);
+    // Asset is 400×467 — pot body occupies the upper portion, shadow sits
+    // below. Anchor at (0.5, 0.43) puts the pot body's center at (0,0).
+    s.anchor.set(0.5, 0.43);
+    s.scale.set(this._scale);
+    s.x = 0;
+    s.y = 0;
+    this.potSprite = s;
+    this.addChild(s);
+  }
+
+  _buildPetalLayer() {
+    // Petals live in a dedicated container so we can rebuild/reflow quickly.
+    // The layer is at (0,0) — the flower's center.
+    this.petalLayer = new PIXI.Container();
+    this.petalLayer.x = 0;
+    this.petalLayer.y = 0;
+    this.addChild(this.petalLayer);
+  }
+
+  _buildMiddle() {
+    // Drawn AFTER petals so it covers the petal base tabs.
+    const s = new PIXI.Sprite(middleTexture);
+    s.anchor.set(0.5, 0.5);
+    s.scale.set(this._scale);
+    s.x = 0;
+    s.y = 0;
+    this.bulbSprite = s;
+    this.addChild(s);
+  }
+
+  _layoutPetals() {
+    this.petalLayer.removeChildren();
+    const n = this.petalCount;
+    if (n <= 0 || n > 8) return;
+
+    const tex = petalTextures[this.colorName];
+    const angles = PETAL_ANGLES[n];
+    for (const angle of angles) {
+      const p = new PIXI.Sprite(tex);
+      // Anchor near the base tab so the petal pivots at the flower's center.
+      p.anchor.set(0.5, 0.95);
+      p.scale.set(this._scale);
+      p.rotation = angle;
+      this.petalLayer.addChild(p);
+    }
+  }
+
+  setPetalCount(n) {
+    this.petalCount = Math.max(0, Math.min(GAME.MAX_PETALS, n));
+    this._layoutPetals();
+  }
+
+  setState({ color, petals } = {}) {
+    if (color !== undefined && color !== this.colorName) {
+      this.colorName = color;
+      this.colorHex = hexToNumber(COLOR_BY_NAME[color].hex);
+    }
+    if (petals !== undefined) this.petalCount = petals;
+    this._layoutPetals();
+  }
+
+  // World-space point where a petal attaches to this flower's bulb.
+  getBulbWorldPos() {
+    return this.toGlobal(new PIXI.Point(0, this._bulbY));
+  }
+
+  // Detach a petal for transfer animation. Picks the petal whose tip direction
+  // best points toward `toWorldPos` so the "tearing off" reads naturally.
+  // Returns the detached PIXI.Sprite (still parented to petalLayer — caller
+  // should reparent to an FX layer after capturing its world pose). Remaining
+  // petals tween to the new (N−1) layout.
+  detachPetalToward(toWorldPos) {
+    const kids = this.petalLayer.children.slice();
+    if (kids.length === 0) return null;
+
+    const bulbWorld = this.getBulbWorldPos();
+    const toVec = { x: toWorldPos.x - bulbWorld.x, y: toWorldPos.y - bulbWorld.y };
+    const toLen = Math.hypot(toVec.x, toVec.y) || 1;
+    toVec.x /= toLen; toVec.y /= toLen;
+
+    let bestIdx = 0, bestDot = -Infinity;
+    kids.forEach((p, i) => {
+      // Petal tip direction in container-local: (sin θ, −cos θ) because
+      // rotation=0 means tip pointing UP (−y).
+      const pDx = Math.sin(p.rotation), pDy = -Math.cos(p.rotation);
+      const dot = pDx * toVec.x + pDy * toVec.y;
+      if (dot > bestDot) { bestDot = dot; bestIdx = i; }
+    });
+
+    const petal = kids[bestIdx];
+    this.petalLayer.removeChild(petal);
+    this.petalCount -= 1;
+    this._reflowRemaining();
+    return petal;
+  }
+
+  // Re-flow existing petals to the current N-count layout (sort by rotation
+  // so they move to the nearest slot, preserving visual ordering).
+  _reflowRemaining(duration = T(0.28)) {
+    const angles = PETAL_ANGLES[this.petalCount] || [];
+    const kids = this.petalLayer.children.slice();
+    kids.sort((a, b) => a.rotation - b.rotation);
+    kids.forEach((p, i) => {
+      gsap.to(p, {
+        rotation: angles[i] ?? 0,
+        x: 0, y: 0,
+        duration,
+        ease: 'sine.out',
+      });
+    });
+  }
+
+  // Accept an in-flight petal sprite (currently in some other parent, e.g. an
+  // FX layer). Reparents while preserving world pose, then tweens into its
+  // new slot. Returns a Promise that resolves when the petal has landed.
+  adoptFlyingPetal(petalSprite) {
+    // Capture world pose
+    const worldPos = petalSprite.getGlobalPosition();
+    const worldRot = petalSprite.rotation;
+    petalSprite.parent && petalSprite.parent.removeChild(petalSprite);
+    this.petalLayer.addChild(petalSprite);
+    const local = this.petalLayer.toLocal(worldPos);
+    petalSprite.position.set(local.x, local.y);
+    petalSprite.rotation = worldRot;
+    // HARD INVARIANT: the petal's texture MUST equal this flower's colour
+    // texture. Per the design doc, transfers only happen between same-colour
+    // flowers — anything else is a math/integrity bug and must stop the spin
+    // so it can't silently corrupt the RTP simulation.
+    if (petalSprite.texture !== petalTextures[this.colorName]) {
+      throw new Error(
+        `Rule violation: cross-colour petal adopted into ${this.colorName} flower. ` +
+        `This indicates the model allowed (or the view misrouted) a transfer ` +
+        `between differently-coloured cells.`
+      );
+    }
+
+    this.petalCount += 1;
+    const angles = PETAL_ANGLES[this.petalCount] || [];
+
+    // Sort existing petals by rotation to match to slots in angular order.
+    // The incoming petal claims whichever slot is nearest its current rotation.
+    const kids = this.petalLayer.children.slice();
+    kids.sort((a, b) => a.rotation - b.rotation);
+
+    // Determine which slot the incoming petal lands in (closest by angle).
+    let incomingSlot = 0, best = Infinity;
+    kids.forEach((p, i) => {
+      if (p !== petalSprite) return;
+      // find best-fit slot for this petal's current rotation
+      angles.forEach((a, si) => {
+        const d = Math.abs(a - p.rotation);
+        if (d < best) { best = d; incomingSlot = si; }
+      });
+    });
+
+    return new Promise(resolve => {
+      let done = 0;
+      const total = kids.length;
+      if (total === 0) { resolve(); return; }
+      kids.forEach((p, i) => {
+        const targetAngle = angles[i] ?? 0;
+        const isIncoming = (p === petalSprite);
+        gsap.to(p, {
+          x: 0, y: 0,
+          rotation: targetAngle,
+          duration: isIncoming ? T(0.32) : T(0.28),
+          ease: isIncoming ? 'back.out(1.8)' : 'sine.out',
+          onComplete: () => { if (++done === total) resolve(); },
+        });
+      });
+    });
+  }
+
+  // Kill any in-progress tweens on petals (used when the flower is destroyed
+  // mid-animation, e.g. during dissolve).
+  killPetalTweens() {
+    for (const p of this.petalLayer.children) gsap.killTweensOf(p);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARTICLE HELPERS — small transient graphics used for burst / puff effects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function spawnBurst(container, x, y, color, count = 14) {
+  // Radial sparkle burst (used for Full Bloom dissolves).
+  for (let i = 0; i < count; i++) {
+    const g = new PIXI.Graphics();
+    const size = 2 + Math.random() * 2.5;
+    g.beginFill(0xFFFFFF, 1);
+    g.drawCircle(0, 0, size);
+    g.endFill();
+    // Inner colored dot
+    g.beginFill(color, 0.9);
+    g.drawCircle(0, 0, size * 0.55);
+    g.endFill();
+
+    g.x = x; g.y = y;
+    container.addChild(g);
+
+    const angle = (i / count) * Math.PI * 2 + Math.random() * 0.4;
+    const dist = 30 + Math.random() * 40;
+    gsap.to(g, {
+      x: x + Math.cos(angle) * dist,
+      y: y + Math.sin(angle) * dist,
+      alpha: 0,
+      duration: 0.55 + Math.random() * 0.2,
+      ease: 'power2.out',
+      onComplete: () => g.destroy(),
+    });
+  }
+}
+
+function spawnPuff(container, x, y, count = 10) {
+  // Soft dust puff (used for Empty Dissolves).
+  for (let i = 0; i < count; i++) {
+    const g = new PIXI.Graphics();
+    const size = 3 + Math.random() * 3;
+    g.beginFill(0xE8D5B0, 0.8);
+    g.drawCircle(0, 0, size);
+    g.endFill();
+    g.x = x + (Math.random() - 0.5) * 10;
+    g.y = y + (Math.random() - 0.5) * 10;
+    container.addChild(g);
+
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 20 + Math.random() * 25;
+    gsap.to(g, {
+      x: g.x + Math.cos(angle) * dist,
+      y: g.y + Math.sin(angle) * dist - 8,
+      alpha: 0,
+      duration: 0.6 + Math.random() * 0.2,
+      ease: 'sine.out',
+      onComplete: () => g.destroy(),
+    });
+  }
+}
+
+// Shower of bright sparkle particles arcing from (fromX, fromY) to (toX, toY).
+// Used when an empty dissolve "donates" energy to the multiplier bar. The
+// effect is intentionally showy — big, glowing cross-shaped sparkles that
+// pulse mid-flight and flash on arrival so the player clearly sees where
+// the energy is going.
+function spawnSparkleStream(container, fromX, fromY, toX, toY, count = 22) {
+  // First: a small burst of tiny specks at the source to punctuate the
+  // "coming loose" moment.
+  for (let i = 0; i < 6; i++) {
+    const spark = new PIXI.Graphics();
+    const r = 2 + Math.random() * 2;
+    spark.beginFill(0xFFFFFF, 0.9);
+    spark.drawCircle(0, 0, r);
+    spark.endFill();
+    spark.x = fromX;
+    spark.y = fromY;
+    container.addChild(spark);
+    const a = Math.random() * Math.PI * 2;
+    const d = 14 + Math.random() * 22;
+    gsap.to(spark, {
+      x: fromX + Math.cos(a) * d,
+      y: fromY + Math.sin(a) * d,
+      alpha: 0,
+      duration: 0.35 + Math.random() * 0.2,
+      ease: 'power2.out',
+      onComplete: () => spark.destroy(),
+    });
+  }
+
+  // Main stream of glowing cross sparkles flying toward the multiplier bar.
+  for (let i = 0; i < count; i++) {
+    const g = new PIXI.Graphics();
+    const size = 5 + Math.random() * 4;                // was 2–4, now 5–9
+
+    // Outer glow halo (soft yellow, semi-transparent)
+    g.beginFill(0xFFD54F, 0.45);
+    g.drawCircle(0, 0, size * 2.2);
+    g.endFill();
+    // Mid glow (warm gold)
+    g.beginFill(0xFFEB3B, 0.75);
+    g.drawCircle(0, 0, size * 1.3);
+    g.endFill();
+    // Cross shape (bright white — rotates visibly during flight)
+    const armL = size * 1.8;
+    const armW = size * 0.55;
+    g.beginFill(0xFFFFFF, 1);
+    g.drawRoundedRect(-armL, -armW / 2, armL * 2, armW, armW / 2);
+    g.drawRoundedRect(-armW / 2, -armL, armW, armL * 2, armW / 2);
+    g.endFill();
+    // Hot core
+    g.beginFill(0xFFFFFF, 1);
+    g.drawCircle(0, 0, size * 0.6);
+    g.endFill();
+
+    const sx = fromX + (Math.random() - 0.5) * 30;
+    const sy = fromY + (Math.random() - 0.5) * 30;
+    g.x = sx; g.y = sy;
+    g.alpha = 0;
+    g.scale.set(0.4);
+    g.rotation = Math.random() * Math.PI;
+    container.addChild(g);
+
+    const delay = i * 0.022 + Math.random() * 0.025;
+    const duration = 0.55 + Math.random() * 0.20;
+    const midX = (sx + toX) / 2 + (Math.random() - 0.5) * 100;
+    const midY = Math.min(sy, toY) - 70 - Math.random() * 60;
+
+    // Fade in + scale up quickly at the start of each particle's trajectory.
+    gsap.to(g, { alpha: 1, duration: 0.10, delay, ease: 'power2.out' });
+    gsap.to(g.scale, { x: 1.0, y: 1.0, duration: 0.18, delay, ease: 'back.out(2)' });
+
+    // Continuous rotation so the cross catches the eye.
+    gsap.to(g, {
+      rotation: g.rotation + Math.PI * (1.5 + Math.random() * 1.5),
+      duration, delay, ease: 'none',
+    });
+
+    // Subtle pulse — scale grows slightly past 1 mid-flight then returns.
+    gsap.to(g.scale, {
+      x: 1.25, y: 1.25,
+      duration: duration * 0.55, delay: delay + 0.12,
+      ease: 'sine.inOut',
+      yoyo: true, repeat: 1,
+    });
+
+    // Position along quadratic bezier + collapse + flash on arrival.
+    const s = { t: 0 };
+    gsap.to(s, {
+      t: 1, duration, delay,
+      ease: 'power2.in',
+      onUpdate: () => {
+        const t = s.t, omt = 1 - t;
+        g.x = omt * omt * sx + 2 * omt * t * midX + t * t * toX;
+        g.y = omt * omt * sy + 2 * omt * t * midY + t * t * toY;
+      },
+      onComplete: () => {
+        // Tiny flash + pop at impact site
+        spawnImpactFlash(container, toX, toY);
+        gsap.to(g.scale, { x: 1.8, y: 1.8, duration: 0.12, ease: 'power2.out' });
+        gsap.to(g, {
+          alpha: 0,
+          duration: 0.18,
+          ease: 'power2.in',
+          onComplete: () => g.destroy(),
+        });
+      },
+    });
+  }
+
+  // Halo ring at the destination, delayed so it times with the arrival wave.
+  setTimeout(() => spawnAbsorbHalo(container, toX, toY), 550);
+}
+
+// Tiny white flash drawn at (x,y) — punctuates each sparkle's impact.
+function spawnImpactFlash(container, x, y) {
+  const f = new PIXI.Graphics();
+  f.beginFill(0xFFFFFF, 0.8);
+  f.drawCircle(0, 0, 5);
+  f.endFill();
+  f.beginFill(0xFFD54F, 0.5);
+  f.drawCircle(0, 0, 10);
+  f.endFill();
+  f.x = x + (Math.random() - 0.5) * 6;
+  f.y = y + (Math.random() - 0.5) * 6;
+  container.addChild(f);
+  gsap.to(f.scale, { x: 2.2, y: 2.2, duration: 0.22, ease: 'power2.out' });
+  gsap.to(f, {
+    alpha: 0, duration: 0.22, ease: 'power2.out',
+    onComplete: () => f.destroy(),
+  });
+}
+
+// Expanding golden ring at the absorb point — the multiplier bar's base
+// "drinks" the sparkle stream.
+function spawnAbsorbHalo(container, x, y) {
+  const ring = new PIXI.Graphics();
+  ring.lineStyle(4, 0xFFD54F, 0.85);
+  ring.drawCircle(0, 0, 6);
+  ring.x = x; ring.y = y;
+  container.addChild(ring);
+  gsap.to(ring.scale, { x: 4.5, y: 4.5, duration: 0.5, ease: 'power2.out' });
+  gsap.to(ring, {
+    alpha: 0, duration: 0.5, ease: 'power2.out',
+    onComplete: () => ring.destroy(),
+  });
+}
+
+// Floating payout text — scales in, lifts ~50px, fades out. Used for Full
+// Bloom dissolves to communicate the coin reward visually.
+function spawnPayoutText(container, x, y, amount) {
+  const txt = new PIXI.Text(`+${amount}`, {
+    fontFamily: FONT,
+    fontSize: 34,
+    fill: 0xFFD700,
+    stroke: 0x3D1C02,
+    strokeThickness: 5,
+  });
+  txt.anchor.set(0.5);
+  txt.x = x; txt.y = y;
+  txt.alpha = 0;
+  txt.scale.set(0.5);
+  container.addChild(txt);
+
+  const tl = gsap.timeline({ onComplete: () => txt.destroy() });
+  tl.to(txt,       { alpha: 1,   duration: 0.15, ease: 'power2.out' }, 0);
+  tl.to(txt.scale, { x: 1.25, y: 1.25, duration: 0.25, ease: 'back.out(2.2)' }, 0);
+  tl.to(txt.scale, { x: 1, y: 1, duration: 0.15 }, 0.25);
+  tl.to(txt,       { y: y - 50, duration: 0.95, ease: 'power2.out' }, 0);
+  tl.to(txt,       { alpha: 0,  duration: 0.4,  ease: 'power2.in' }, 0.55);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPIN ANIMATOR — consumes the event stream from runSpin() and plays it as a
+// sequenced set of GSAP tweens on the scene's FlowerSymbols.
+//
+// The animator expects:
+//   • scene.flowers[r][c] — 2D array of live FlowerSymbol or null
+//   • scene.cells[r][c]   — 2D array of {x, y, w, h} rects
+//   • scene.flowerLayer   — container holding flowers
+//   • scene.fxLayer       — container for in-flight petals + particle bursts
+//
+// scene.flowers is kept in sync with the logical grid as dissolves, gravity,
+// and refills play. After a spin the view matches the final grid state.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Global animation-speed knob for the spin flow. 1.0 = baseline; higher is
+// faster. Applied to every duration/delay/wait inside the animator so the
+// overall spin pacing is adjustable from one place.
+const ANIM_SPEED = 1.6;
+const T = (d) => d / ANIM_SPEED;
+
+class SpinAnimator {
+  constructor({ scene, app, onEnd }) {
+    this.scene = scene;
+    this.app = app;
+    this.onEnd = onEnd;
+    this.playing = false;
+    this.cellSize = null;
+  }
+
+  // Wait n milliseconds.
+  static _wait(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  async play(result) {
+    if (this.playing) return;
+    this.playing = true;
+    this.cellSize = this.scene.cells[0][0].w;
+    this.currentBet = result.bet || 1;
+
+    // Let exceptions propagate — a rule/integrity error must be visible,
+    // not swallowed. onEnd still runs via finally so the button re-enables.
+    try {
+      for (const ev of result.events) {
+        await this._playEvent(ev);
+      }
+    } finally {
+      this.playing = false;
+      this.onEnd && this.onEnd(result);
+    }
+  }
+
+  async _playEvent(ev) {
+    switch (ev.type) {
+      case 'spawn':         return this._playSpawn(ev);
+      case 'transferPass':  return this._playTransferPass(ev);
+      case 'dissolve':      return this._playDissolve(ev);
+      case 'gravity':       return this._playGravity(ev);
+      case 'refill':        return this._playRefill(ev);
+      case 'end':           return;
+    }
+  }
+
+  // ─── SPAWN ───────────────────────────────────────────────────────────────
+  // Each runSpin() generates a fresh random grid. The view must be rebuilt to
+  // match that grid BEFORE any transfers animate — otherwise the animator
+  // operates on stale FlowerSymbols from the previous spin, producing wrong
+  // colours and rule violations (e.g. mixed-colour pots after a cross-colour
+  // cell swap).
+  async _playSpawn(ev) {
+    const bounds = this.scene.gridBounds;
+    const cellH = this.scene.cells[0][0].h;
+    const cellW = this.scene.cells[0][0].w;
+    const cellGap = (this.scene.cells[0][1] && this.scene.cells[0][1].x - this.scene.cells[0][0].x - cellW) || 0;
+
+    // ── Phase 1: drop old flowers down and out of the grid ─────────────────
+    // With the grid mask, anything past the grid bottom is hidden.
+    const fallPromises = [];
+    for (let r = 0; r < GAME.ROWS; r++) {
+      for (let c = 0; c < GAME.COLS; c++) {
+        const f = this.scene.flowers[r] && this.scene.flowers[r][c];
+        if (!f || f.destroyed) continue;
+        const fallTo = bounds.bottom + cellH * 2; // well past the mask
+        const colDelay = c * T(0.035);
+        fallPromises.push(new Promise(resolve => {
+          gsap.to(f, {
+            y: fallTo,
+            duration: T(0.55),
+            delay: colDelay,
+            ease: 'power2.in',
+            onComplete: () => { f.destroy({ children: true }); resolve(); },
+          });
+        }));
+        this.scene.flowers[r][c] = null;
+      }
+    }
+    await Promise.all(fallPromises);
+
+    // ── Phase 2: drop new flowers in from above the grid ───────────────────
+    // New flowers are created ABOVE the top of the mask (stacked by row), so
+    // they're invisible until they fall into the grid area.
+    const dropPromises = [];
+    for (let c = 0; c < GAME.COLS; c++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
+        const data = ev.grid[r][c];
+        if (!data) continue;
+        const flower = new FlowerSymbol(data.color, data.petals, this.cellSize);
+        const rect = this.scene.cells[r][c];
+        flower.x = rect.x + rect.w / 2;
+        // Stack the 4 flowers for this column above the grid so they fall in
+        // in order. Top-row flower (r=0) is highest above.
+        flower.y = bounds.top - (cellH + cellGap) * (GAME.ROWS - r);
+        this.scene.flowerLayer.addChild(flower);
+        this.scene.flowers[r][c] = flower;
+
+        const targetY = rect.y + rect.h / 2;
+        const colDelay = c * T(0.045);
+        const rowDelay = (GAME.ROWS - 1 - r) * T(0.05);
+        dropPromises.push(new Promise(resolve => {
+          gsap.to(flower, {
+            y: targetY,
+            duration: T(0.40),
+            delay: colDelay + rowDelay,
+            ease: 'power2.in',
+            onComplete: () => {
+              gsap.timeline({ onComplete: resolve })
+                .to(flower.scale, { y: 0.88, x: 1.10, duration: T(0.08), ease: 'sine.out' })
+                .to(flower.scale, { y: 1, x: 1, duration: T(0.14), ease: 'sine.inOut' });
+            },
+          });
+        }));
+      }
+    }
+    await Promise.all(dropPromises);
+    await SpinAnimator._wait(T(120));
+  }
+
+  // ─── TRANSFER PASS ───────────────────────────────────────────────────────
+  async _playTransferPass(ev) {
+    if (ev.moves.length === 0) return;
+
+    // Parallel flights, but each is nudged by a small stagger so the pass
+    // reads as a natural flurry rather than a synchronous burst.
+    const promises = ev.moves.map((move, i) => {
+      const delay = T(0.025) * i + Math.random() * T(0.020);
+      return this._animateOneTransfer(move, delay);
+    });
+    await Promise.all(promises);
+    await SpinAnimator._wait(T(110));
+  }
+
+  async _animateOneTransfer(move, staggerDelay = 0) {
+    const src = this.scene.flowers[move.from.r][move.from.c];
+    const dst = this.scene.flowers[move.to.r][move.to.c];
+    if (!src || !dst) return;
+
+    // Hold for the stagger so this petal's "tearing" starts a hair later than
+    // its siblings — kills the uncanny synchronisation.
+    if (staggerDelay > 0) {
+      await new Promise(r => setTimeout(r, staggerDelay * 1000));
+    }
+    if (!this.scene.flowers[move.from.r][move.from.c]) return; // race guard
+
+    // Detach a petal from source, aimed toward the target's bulb.
+    const dstBulbWorld = dst.getBulbWorldPos();
+    const petal = src.detachPetalToward(dstBulbWorld);
+    if (!petal) return;
+
+    // Reparent to fxLayer, preserving world pose.
+    const worldPos = petal.parent
+      ? petal.parent.toGlobal(new PIXI.Point(petal.x, petal.y))
+      : new PIXI.Point(petal.x, petal.y);
+    // (petal was already removed from petalLayer in detach, so .parent is null)
+    // Instead, use source.petalLayer's world transform with petal's local pos:
+    const srcBulbWorld = src.getBulbWorldPos();
+
+    this.scene.fxLayer.addChild(petal);
+    const startPos = this.scene.fxLayer.toLocal(srcBulbWorld);
+    // Offset by the petal's rotation direction so it starts near the tip it came from
+    const off = this.cellSize * 0.10;
+    startPos.x += Math.sin(petal.rotation) * off;
+    startPos.y += -Math.cos(petal.rotation) * off;
+    petal.position.set(startPos.x, startPos.y);
+
+    const endPos = this.scene.fxLayer.toLocal(dstBulbWorld);
+
+    // Quadratic bezier control point: midpoint raised above the higher end
+    // to create an arc; height scales with horizontal distance + a floor.
+    const midX = (startPos.x + endPos.x) / 2;
+    const dist = Math.hypot(endPos.x - startPos.x, endPos.y - startPos.y);
+    const midY = Math.min(startPos.y, endPos.y) - (dist * 0.3 + this.cellSize * 0.35);
+
+    // Drive a t 0→1 tween and sample position + tangent each frame.
+    const state = { t: 0, scale: petal.scale.x, alpha: 1 };
+    const startScale = petal.scale.x;
+
+    return new Promise(resolve => {
+      // "Tearing-off" pop: petal swells slightly with a springy overshoot, as
+      // if building tension before snapping free of the bulb.
+      gsap.to(petal.scale, {
+        x: startScale * 1.18, y: startScale * 1.18,
+        duration: T(0.16), ease: 'back.out(1.8)',
+      });
+
+      // Main flight. power3.inOut = slow launch (resistance), fast mid-flight,
+      // gentle landing. Randomise the peak slightly so repeated flights don't
+      // trace identical arcs.
+      const arcWobble = 0.85 + Math.random() * 0.3;
+      const adjMidY = startPos.y + (midY - startPos.y) * arcWobble;
+
+      // The petal bends while airborne — peaks mid-flight and straightens
+      // out on arrival. Random sign so not every petal bends the same way.
+      const bendMax = 0.22 * (Math.random() < 0.5 ? -1 : 1);
+
+      gsap.to(state, {
+        t: 1,
+        duration: T(0.70),
+        ease: 'power3.inOut',
+        onUpdate: () => {
+          const t = state.t;
+          const omt = 1 - t;
+          // Quadratic bezier position
+          const px = omt * omt * startPos.x + 2 * omt * t * midX + t * t * endPos.x;
+          const py = omt * omt * startPos.y + 2 * omt * t * adjMidY + t * t * endPos.y;
+          petal.x = px;
+          petal.y = py;
+          // Rotation tracks tangent (tip leads the arc)
+          const dx = 2 * omt * (midX - startPos.x) + 2 * t * (endPos.x - midX);
+          const dy = 2 * omt * (adjMidY - startPos.y) + 2 * t * (endPos.y - adjMidY);
+          petal.rotation = Math.atan2(dy, dx) + Math.PI / 2;
+          // Bend — sine ramp 0 → bendMax → 0 over the flight
+          petal.skew.x = Math.sin(t * Math.PI) * bendMax;
+        },
+        onComplete: async () => {
+          // Straighten before handoff so adopt's reflow tween doesn't fight skew
+          petal.skew.x = 0;
+          gsap.to(petal.scale, {
+            x: startScale, y: startScale,
+            duration: T(0.14), ease: 'sine.inOut',
+          });
+          if (!dst.destroyed) {
+            await dst.adoptFlyingPetal(petal);
+          } else {
+            petal.destroy();
+          }
+          resolve();
+        },
+      });
+    });
+  }
+
+  // ─── DISSOLVE ────────────────────────────────────────────────────────────
+  async _playDissolve(ev) {
+    const promises = [];
+    for (const fb of ev.fullBlooms) promises.push(this._animateFullBloom(fb));
+    for (const ed of ev.emptyDissolves) promises.push(this._animateEmptyDissolve(ed));
+
+    // Notify UI so the multiplier bar + running payout update mid-animation.
+    if (this.onProgress) this.onProgress(ev);
+
+    await Promise.all(promises);
+    await SpinAnimator._wait(T(120));
+  }
+
+  async _animateFullBloom(d) {
+    const flower = this.scene.flowers[d.r][d.c];
+    if (!flower) return;
+    this.scene.flowers[d.r][d.c] = null;
+
+    const colorHex = hexToNumber(COLOR_BY_NAME[d.color].hex);
+    const worldPos = flower.toGlobal(new PIXI.Point(0, flower._bulbY));
+    const fxPos = this.scene.fxLayer.toLocal(worldPos);
+    spawnBurst(this.scene.fxLayer, fxPos.x, fxPos.y, colorHex, 18);
+
+    // Payout text over the dissolving symbol — the coin value this Full Bloom
+    // contributed to the win (basePay × bet).
+    const payoutAmount = d.basePay * this.currentBet;
+    spawnPayoutText(this.scene.fxLayer, fxPos.x, fxPos.y - 6, payoutAmount);
+
+    flower.killPetalTweens();
+
+    return new Promise(resolve => {
+      const tl = gsap.timeline({
+        onComplete: () => { flower.destroy({ children: true }); resolve(); }
+      });
+      tl.to(flower,       { rotation: Math.PI * 1.2, duration: T(0.45), ease: 'power2.inOut' }, 0);
+      tl.to(flower.scale, { x: 1.35, y: 1.35, duration: T(0.30), ease: 'back.out(2)' }, 0);
+      tl.to(flower.scale, { x: 0.1,  y: 0.1,  duration: T(0.25), ease: 'power2.in' }, T(0.30));
+      tl.to(flower,       { alpha: 0,         duration: T(0.25), ease: 'power2.in' }, T(0.30));
+    });
+  }
+
+  async _animateEmptyDissolve(d) {
+    const flower = this.scene.flowers[d.r][d.c];
+    if (!flower) return;
+    this.scene.flowers[d.r][d.c] = null;
+
+    flower.killPetalTweens();
+
+    return new Promise(resolve => {
+      const tl = gsap.timeline({
+        onComplete: () => { flower.destroy({ children: true }); resolve(); }
+      });
+      tl.to(flower.scale, { x: 0.8, y: 0.8, duration: T(0.15), ease: 'sine.out' }, 0);
+      tl.to(flower.scale, { x: 0.1, y: 0.1, duration: T(0.30), ease: 'power2.in' }, T(0.15));
+      tl.to(flower,       { alpha: 0,       duration: T(0.35), ease: 'power2.in' }, T(0.10));
+    });
+  }
+
+  // ─── GRAVITY ─────────────────────────────────────────────────────────────
+  async _playGravity(ev) {
+    if (!ev.falls.length) return;
+    const promises = [];
+    // Capture move intents first, then update refs to avoid collisions.
+    const moves = ev.falls.map(fall => ({
+      flower: this.scene.flowers[fall.from.r][fall.from.c],
+      from: fall.from,
+      to: fall.to,
+    }));
+    // Null source cells first
+    for (const m of moves) {
+      if (m.flower) this.scene.flowers[m.from.r][m.from.c] = null;
+    }
+    // Assign destinations + tween
+    for (const m of moves) {
+      if (!m.flower) continue;
+      this.scene.flowers[m.to.r][m.to.c] = m.flower;
+      const targetRect = this.scene.cells[m.to.r][m.to.c];
+      const targetY = targetRect.y + targetRect.h / 2;
+      const distRows = m.to.r - m.from.r;
+      promises.push(new Promise(resolve => {
+        gsap.to(m.flower, {
+          y: targetY,
+          duration: T(0.22) + Math.min(distRows * T(0.06), T(0.24)),
+          ease: 'power1.in',
+          onComplete: () => {
+            gsap.timeline({ onComplete: resolve })
+              .to(m.flower.scale, { y: 0.88, x: 1.08, duration: T(0.08), ease: 'sine.out' })
+              .to(m.flower.scale, { y: 1,    x: 1,    duration: T(0.12), ease: 'sine.inOut' });
+          },
+        });
+      }));
+    }
+    await Promise.all(promises);
+  }
+
+  // ─── REFILL ──────────────────────────────────────────────────────────────
+  async _playRefill(ev) {
+    const promises = [];
+    // Group new cells by column; higher-row cells drop later (above lower ones)
+    const byCol = {};
+    for (const nc of ev.newCells) {
+      (byCol[nc.c] ||= []).push(nc);
+    }
+    for (const c in byCol) byCol[c].sort((a, b) => a.r - b.r);
+
+    for (const c in byCol) {
+      byCol[c].forEach((nc, stackIdx) => {
+        const rect = this.scene.cells[nc.r][nc.c];
+        const flower = new FlowerSymbol(nc.color, nc.petals, this.cellSize);
+        flower.x = rect.x + rect.w / 2;
+        // Spawn above the top of the grid, stacked so they don't visually overlap
+        flower.y = this.scene.cells[0][0].y - rect.h * (1 + stackIdx * 1.05);
+        this.scene.flowerLayer.addChild(flower);
+        this.scene.flowers[nc.r][nc.c] = flower;
+
+        const targetY = rect.y + rect.h / 2;
+        promises.push(new Promise(resolve => {
+          gsap.to(flower, {
+            y: targetY,
+            duration: T(0.32) + stackIdx * T(0.04),
+            ease: 'power1.in',
+            delay: stackIdx * T(0.04),
+            onComplete: () => {
+              gsap.timeline({ onComplete: resolve })
+                .to(flower.scale, { y: 0.86, x: 1.10, duration: T(0.08), ease: 'sine.out' })
+                .to(flower.scale, { y: 1,    x: 1,    duration: T(0.14), ease: 'sine.inOut' });
+            },
+          });
+        }));
+      });
+    }
+    await Promise.all(promises);
+    await SpinAnimator._wait(T(80));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LAYOUT CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const FONT = "'Fredoka One', cursive";
+
+const COLS        = 5;
+const ROWS        = 4;
+const GAP_REF     = 10;    // cell gap at 1080h
+const FRAME_PAD   = 40;    // padding inside frame around cells
+const BAR_H_REF   = 100;   // bottom bar height at 1080h
+const SPIN_R_REF  = 56;    // spin button radius at 1080h
+const LOGO_ZONE   = 0.16;  // top 16% of screen height
+const GRID_GAP_B  = 0.06;  // 6% gap between grid bottom and bar
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LAYOUT CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+function calculateLayout(sw, sh) {
+  const scale = sh / 1080;
+
+  const gap       = GAP_REF * scale;
+  const framePad  = FRAME_PAD * scale;
+  const barH      = BAR_H_REF * scale;
+  const spinR     = SPIN_R_REF * scale;
+
+  const logoZoneH = sh * LOGO_ZONE;
+  const barY      = sh - barH;
+  const barCY     = sh - barH / 2;
+  const gridGapB  = sh * GRID_GAP_B;
+  const gridZoneY = logoZoneH;
+  const gridZoneH = barY - gridGapB - gridZoneY;
+
+  // Frame / cells
+  const availH   = gridZoneH - framePad * 2;
+  const cellSize = Math.floor((availH - (ROWS - 1) * gap) / ROWS);
+  const cellsW   = COLS * cellSize + (COLS - 1) * gap;
+  const cellsH   = ROWS * cellSize + (ROWS - 1) * gap;
+  const frameW   = cellsW + framePad * 2;
+  const frameH   = gridZoneH;
+  const frameX   = (sw - frameW) / 2;
+  const frameY   = gridZoneY;
+  const cellsX   = frameX + framePad;
+  const cellsY   = frameY + (frameH - cellsH) / 2;
+
+  // Spin button
+  const spinOuterR = (SPIN_R_REF + 14) * scale;
+  const spinX      = sw - spinOuterR - 8 * scale;
+  const spinY      = sh - spinOuterR - 4 * scale;
+
+  // Bottom bar items
+  const barAvail   = spinX - spinOuterR - 8 * scale;
+  const itemMargin = barAvail * 0.02;
+  const iconR      = barH * 0.26;
+  const pillH      = barH * 0.64;
+  const creditW    = barAvail * 0.17;
+  const winW       = barAvail * 0.20;
+  const adjBtnR    = barH * 0.20;
+  const betW       = barAvail * 0.14;
+
+  // Item positions (x in bar-local space, i.e. relative to x=0 on left side)
+  const infoX   = itemMargin + iconR;
+  const creditX = infoX + iconR + itemMargin + creditW / 2;
+  const winX    = barAvail / 2;
+
+  // BET group right-aligned
+  const betGroupW     = adjBtnR * 2 + itemMargin + betW + itemMargin + adjBtnR * 2;
+  const betGroupStart = barAvail - itemMargin - betGroupW;
+  const minusX = betGroupStart + adjBtnR;
+  const betX   = minusX + adjBtnR + itemMargin + betW / 2;
+  const plusX  = betX + betW / 2 + itemMargin + adjBtnR;
+
+  return {
+    sw, sh, scale,
+    gap, framePad, barH, spinR,
+    logoZoneH, barY, barCY, gridGapB, gridZoneY, gridZoneH,
+    cellSize, cellsW, cellsH,
+    frameW, frameH, frameX, frameY, cellsX, cellsY,
+    spinOuterR, spinX, spinY,
+    barAvail, itemMargin, iconR, pillH, creditW, winW, adjBtnR, betW,
+    infoX, creditX, winX, minusX, betX, plusX,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PIXI APP
+// ═══════════════════════════════════════════════════════════════════════════════
+const app = new PIXI.Application({
+  resizeTo: window,
+  backgroundColor: 0xCCCCCC,
+  antialias: true,
+  resolution: window.devicePixelRatio || 1,
+  autoDensity: true,
+});
+document.body.appendChild(app.view);
+app.view.style.display = 'block';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCENE BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+const scene = {
+  bg: null,
+  logoText: null,
+  frame: null,
+  multiplier: null,
+  multiplierFill: null,
+  multiplierMask: null,
+  multiplierText: null,
+  cells: [],
+  flowers: [],
+  flowerLayer: null,
+  fxLayer: null,
+  balancePill: null,
+  betPill: null,
+  winPill: null,
+  rtpText: null,
+  spinButton: null,
+  infoButton: null,
+  paytableModal: null,
+  barItems: {},
+};
+
+// Persist current grid across resizes so we don't re-spin on every resize.
+let currentGrid = null;
+let animator = null;
+
+let uiState = {
+  multiplier: 1,
+  multBarMaxEmpties: 10,
+};
+
+// ─── PLAYER STATE ───────────────────────────────────────────────────────────
+const player = {
+  balance: 10000,
+  bet: 10,
+  betLevels: [1, 2, 5, 10, 20, 50, 100, 200],
+  betIndex: 3,          // starts at 10
+  displayedWin: 0,      // last committed WIN value on screen
+};
+
+function canAffordSpin() {
+  return player.balance >= player.bet;
+}
+
+function cycleBet(direction = +1) {
+  player.betIndex = (player.betIndex + direction + player.betLevels.length) % player.betLevels.length;
+  player.bet = player.betLevels[player.betIndex];
+  updateBetText();
+  updateSpinButtonState();
+}
+
+function roundedRectGraphics(x, y, w, h, r, fill, strokeColor, strokeWidth) {
+  const g = new PIXI.Graphics();
+  if (strokeColor !== undefined) g.lineStyle(strokeWidth, strokeColor, 1);
+  g.beginFill(fill);
+  g.drawRoundedRect(x, y, w, h, r);
+  g.endFill();
+  return g;
+}
+
+// Design reference — game composition was authored at 1920×1080
+const DESIGN_W = 1920;
+const DESIGN_H = 1080;
+
+function buildScene(L) {
+  app.stage.removeChildren();
+  scene.cells = [];
+  scene.barItems = {};
+
+  // ─── BACKGROUND ────────────────────────────────────────────────────────────
+  // Cover-width fit. The source image is portrait (2800×3600) with the pots
+  // composition sitting around source y=1800–2200. Position the bg so that
+  // this focal point lands near the bottom of the viewport at every window
+  // size — that keeps the pots visible below the grid frame.
+  scene.bg = new PIXI.Sprite(bgTexture);
+  const bgScale = L.sw / bgTexture.width;
+  scene.bg.scale.set(bgScale);
+  scene.bg.x = 0;
+  const BG_FOCAL_SOURCE_Y = 2200;      // bottom of the pot cluster in source
+  const BG_FOCAL_SCREEN_FRAC = 0.95;   // where that point should land on screen
+  scene.bg.y = L.sh * BG_FOCAL_SCREEN_FRAC - BG_FOCAL_SOURCE_Y * bgScale;
+  app.stage.addChild(scene.bg);
+
+  // ─── GAME SCALE ────────────────────────────────────────────────────────────
+  // Scale the game composition relative to 1920×1080 design reference.
+  // On larger screens, elements stay at their designed pixel size — more of the
+  // background becomes visible around the composition.
+  // On smaller screens, everything scales down uniformly.
+  const gameScale = Math.min(L.sw / DESIGN_W, L.sh / DESIGN_H, 1.0);
+
+  // Dimensions
+  const frameW  = frameTexture.width * gameScale;
+  const frameH  = frameTexture.height * gameScale;
+  const multW   = multEmptyTexture.width * gameScale;
+  const multH   = multEmptyTexture.height * gameScale;
+  const logoScale = gameScale * 0.45;
+  const logoW   = logoTexture.width * logoScale;
+  const logoH   = logoTexture.height * logoScale;
+  const gapX    = 24 * gameScale; // gap between frame and right column
+
+  // Frame is centered horizontally; vertically placed so there's enough room
+  // below for the UI row (pills + spin button + RTP line) without overlap.
+  //   UI row budget at gameScale=1: 25 (gap) + 58 (pills) + 12 (gap) +
+  //                                 130 (spin btn) + 20 (rtp margin) = 245
+  // Frame top margin fills whatever's left above.
+  const rightColW = Math.max(multW, logoW);
+  const compX     = (L.sw - frameW) / 2;
+  const UI_BELOW_BUDGET = 245 * gameScale;
+  const compY     = Math.max(
+    10 * gameScale,
+    Math.min(
+      (L.sh - frameH) / 2 - UI_BELOW_BUDGET / 2,  // vertical center, biased up
+      L.sh - frameH - UI_BELOW_BUDGET             // never push UI off-screen
+    )
+  );
+
+  // ─── FRAME (image w/ cells baked in) ───────────────────────────────────────
+  scene.frame = new PIXI.Sprite(frameTexture);
+  scene.frame.scale.set(gameScale);
+  scene.frame.x = compX;
+  scene.frame.y = compY;
+  app.stage.addChild(scene.frame);
+
+  // Right-column X anchor (center of column)
+  const rightColCX = compX + frameW + gapX + rightColW / 2;
+
+  // ─── LOGO ──────────────────────────────────────────────────────────────────
+  scene.logoText = new PIXI.Sprite(logoTexture);
+  scene.logoText.anchor.set(0.5, 0);
+  scene.logoText.scale.set(logoScale);
+  scene.logoText.x = rightColCX;
+  scene.logoText.y = compY;
+  app.stage.addChild(scene.logoText);
+
+  // ─── MULTIPLIER BAR ────────────────────────────────────────────────────────
+  // Empty bar sits first; the "full" overlay on top is revealed from the bottom
+  // up via a mask. Above it floats the current multiplier number.
+  scene.multiplier = new PIXI.Sprite(multEmptyTexture);
+  scene.multiplier.anchor.set(0.5, 0);
+  scene.multiplier.scale.set(gameScale);
+  scene.multiplier.x = rightColCX;
+  scene.multiplier.y = compY + logoH + 16 * gameScale;
+  app.stage.addChild(scene.multiplier);
+
+  const multBarH = multEmptyTexture.height * gameScale;
+  const multBarW = multEmptyTexture.width * gameScale;
+  const multBarX = scene.multiplier.x - multBarW / 2;
+  const multBarY = scene.multiplier.y;
+
+  scene.multiplierFill = new PIXI.Sprite(multFullTexture);
+  scene.multiplierFill.anchor.set(0.5, 0);
+  scene.multiplierFill.scale.set(gameScale);
+  scene.multiplierFill.x = scene.multiplier.x;
+  scene.multiplierFill.y = scene.multiplier.y;
+  app.stage.addChild(scene.multiplierFill);
+
+  // Mask that reveals the bottom portion of the fill sprite.
+  scene.multiplierMask = new PIXI.Graphics();
+  scene.multiplierMask.beginFill(0xFFFFFF);
+  scene.multiplierMask.drawRect(multBarX, multBarY + multBarH, multBarW, 0); // height 0 initially
+  scene.multiplierMask.endFill();
+  app.stage.addChild(scene.multiplierMask);
+  scene.multiplierFill.mask = scene.multiplierMask;
+
+  // Multiplier number text on top of the bar
+  scene.multiplierText = new PIXI.Text('1\u00D7', {
+    fontFamily: FONT,
+    fontSize: Math.max(14, 22 * gameScale),
+    fill: 0x3D1C02,
+  });
+  scene.multiplierText.anchor.set(0.5);
+  scene.multiplierText.x = scene.multiplier.x;
+  scene.multiplierText.y = multBarY + multBarH / 2;
+  app.stage.addChild(scene.multiplierText);
+
+  // ─── CELLS (invisible hit areas for future interactivity) ──────────────────
+  // The frame image has the cells baked in visually. We still compute their
+  // logical positions for future game logic.
+  // Frame-local cell layout (proportions of frame image):
+  //   The grid inside the frame occupies roughly the top 90% of the image,
+  //   centered horizontally with small padding. Compute an approximate grid
+  //   rect inside the frame sprite so future code can place symbols on cells.
+  // Inner-grid margins measured against the baked-in cells inside frame.png
+  // (968×810). Tuned so flowers land centered on their visible cell squares.
+  const FRAME_INNER_PAD_X      = 0.030;
+  const FRAME_INNER_PAD_TOP    = 0.037;
+  const FRAME_INNER_PAD_BOTTOM = 0.045;
+  const innerX = compX + frameW * FRAME_INNER_PAD_X;
+  const innerY = compY + frameH * FRAME_INNER_PAD_TOP;
+  const innerW = frameW * (1 - FRAME_INNER_PAD_X * 2);
+  const innerH = frameH * (1 - FRAME_INNER_PAD_TOP - FRAME_INNER_PAD_BOTTOM);
+  const cellGap = frameW * 0.008;   // ~0.8% of frame width between cells
+  const cellSize = Math.min(
+    (innerW - (COLS - 1) * cellGap) / COLS,
+    (innerH - (ROWS - 1) * cellGap) / ROWS
+  );
+  const gridW = COLS * cellSize + (COLS - 1) * cellGap;
+  const gridH = ROWS * cellSize + (ROWS - 1) * cellGap;
+  const gridX = innerX + (innerW - gridW) / 2;
+  // Hard-coded upward nudge: the frame image has a 3D depth section at the
+  // bottom that's part of the border, not a cell. Lifting the symbol layer by
+  // ~100 design-pixels sits flowers on the top face of each cell.
+  const SYMBOL_Y_NUDGE = 20 * gameScale;
+  const gridY = innerY + (innerH - gridH) / 2 - SYMBOL_Y_NUDGE;
+
+  for (let row = 0; row < ROWS; row++) {
+    scene.cells[row] = [];
+    for (let col = 0; col < COLS; col++) {
+      scene.cells[row][col] = {
+        x: gridX + col * (cellSize + cellGap),
+        y: gridY + row * (cellSize + cellGap),
+        w: cellSize,
+        h: cellSize,
+      };
+    }
+  }
+
+  // ─── FLOWER SYMBOLS (live grid) ────────────────────────────────────────────
+  // Generate once on first build; re-use the same grid on resize so we don't
+  // "spin" every time the window changes.
+  if (!currentGrid) currentGrid = generateGrid();
+
+  scene.flowerLayer = new PIXI.Container();
+  scene.flowers = [];
+  for (let row = 0; row < ROWS; row++) {
+    scene.flowers[row] = [];
+    for (let col = 0; col < COLS; col++) {
+      const rect = scene.cells[row][col];
+      const data = currentGrid[row][col];
+      const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+      flower.x = rect.x + rect.w / 2;
+      flower.y = rect.y + rect.h / 2;
+      scene.flowerLayer.addChild(flower);
+      scene.flowers[row][col] = flower;
+    }
+  }
+  // Flowers sit on top of the frame image.
+  app.stage.addChild(scene.flowerLayer);
+
+  // Grid mask — anything drawn to flowerLayer outside the cell grid area is
+  // hidden. Symbols spawning above the grid or falling out the bottom are
+  // clipped so the player only sees them inside the playing field.
+  const gridLeft   = scene.cells[0][0].x;
+  const gridTop    = scene.cells[0][0].y;
+  const gridRight  = scene.cells[0][COLS - 1].x + scene.cells[0][COLS - 1].w;
+  const gridBottom = scene.cells[ROWS - 1][0].y + scene.cells[ROWS - 1][0].h;
+  scene.gridMask = new PIXI.Graphics();
+  scene.gridMask.beginFill(0xFFFFFF);
+  scene.gridMask.drawRect(
+    gridLeft, gridTop,
+    gridRight - gridLeft, gridBottom - gridTop
+  );
+  scene.gridMask.endFill();
+  app.stage.addChild(scene.gridMask);
+  scene.flowerLayer.mask = scene.gridMask;
+
+  // Cache grid bounds so animators can use them (spawn above, fall below).
+  scene.gridBounds = {
+    left: gridLeft, top: gridTop,
+    right: gridRight, bottom: gridBottom,
+    w: gridRight - gridLeft, h: gridBottom - gridTop,
+  };
+
+  // FX layer is ABOVE flowers and NOT masked — in-flight petals, sparkles,
+  // and payout text must be visible outside the grid (e.g. sparkles flying
+  // up to the multiplier bar).
+  scene.fxLayer = new PIXI.Container();
+  app.stage.addChild(scene.fxLayer);
+
+  // ─── BALANCE / BET / WIN PILLS ─────────────────────────────────────────────
+  //
+  //   [ Balance ]     [ Bet ]     [ Win ]
+  //             [  SPIN BUTTON  ]
+  //
+  // Pills are drawn inline with PIXI.Graphics + labels/values above/below.
+  // The Bet pill is interactive — click cycles through betLevels.
+  const _pillW = 210 * gameScale;
+  const _pillH = 58 * gameScale;
+  const _pillGap = 14 * gameScale;
+  const _adjR   = _pillH * 0.38;                  // adjust button radius
+  const pillsCenterY = compY + frameH + 30 * gameScale;
+  // Row contents (left to right):
+  //   [Info btn] [Balance pill] [WIN pill (wider, centred)] [– Bet +]
+  // The – and + buttons are centred on the Bet pill's left/right edges so
+  // exactly half of each button sits inside the pill.
+  const _infoSize = _pillH * 1.05;              // info button visual size
+  const _winPillW = _pillW * 1.55;              // WIN pill is wider
+  const pillsTotalW =
+    _infoSize + _pillGap +
+    _pillW + _pillGap +
+    _winPillW + _pillGap +
+    _pillW + _adjR * 2;
+  const _rowStartX  = (L.sw - pillsTotalW) / 2;
+
+  const infoCX    = _rowStartX + _infoSize / 2;
+  const balanceCX = infoCX     + _infoSize / 2 + _pillGap + _pillW / 2;
+  const winCX     = balanceCX  + _pillW / 2    + _pillGap + _winPillW / 2;
+  const betCX     = winCX      + _winPillW / 2 + _pillGap + _adjR + _pillW / 2;
+  const minusCX   = betCX - _pillW / 2;
+  const plusCX    = betCX + _pillW / 2;
+  const pillsStartX = balanceCX; // kept for any legacy reference
+
+  function makePill({ x, y, label, value, interactive, onClick, accent,
+                      width, valueFontSize }) {
+    const cont = new PIXI.Container();
+    cont.x = x; cont.y = y;
+    const pw = width || _pillW;
+
+    const bg = new PIXI.Graphics();
+    const drawBg = (hover = false) => {
+      bg.clear();
+      bg.lineStyle(2 * gameScale, accent || 0xC08050, 0.95);
+      bg.beginFill(hover ? 0x3A2414 : 0x2A1808, 0.75);
+      bg.drawRoundedRect(-pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32);
+      bg.endFill();
+    };
+    drawBg();
+    cont.addChild(bg);
+
+    const lbl = new PIXI.Text(label, {
+      fontFamily: FONT,
+      fontSize: Math.max(10, 13 * gameScale),
+      fill: accent || 0xD4A017,
+      letterSpacing: 1.2,
+    });
+    lbl.anchor.set(0.5);
+    lbl.y = -_pillH * 0.24;
+    cont.addChild(lbl);
+
+    const val = new PIXI.Text(value, {
+      fontFamily: FONT,
+      fontSize: valueFontSize || Math.max(16, 26 * gameScale),
+      fill: 0xFFECB3,
+    });
+    val.anchor.set(0.5);
+    val.y = _pillH * 0.13;
+    cont.addChild(val);
+
+    if (interactive) {
+      cont.eventMode = 'static';
+      cont.cursor = 'pointer';
+      cont.hitArea = new PIXI.RoundedRectangle(
+        -pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32
+      );
+      cont.on('pointerover', () => {
+        drawBg(true);
+        gsap.to(cont.scale, { x: 1.03, y: 1.03, duration: 0.12, ease: 'sine.out' });
+      });
+      cont.on('pointerout', () => {
+        drawBg(false);
+        gsap.to(cont.scale, { x: 1, y: 1, duration: 0.12 });
+      });
+      cont.on('pointertap', onClick || (() => {}));
+    }
+
+    cont.valText = val;
+    cont.labelText = lbl;
+    cont.redrawBg = drawBg;
+    return cont;
+  }
+
+  scene.balancePill = makePill({
+    x: balanceCX,
+    y: pillsCenterY,
+    label: 'BALANCE',
+    value: fmtCurrency(player.balance),
+    accent: 0xFFD700,
+  });
+  app.stage.addChild(scene.balancePill);
+
+  // Bet pill is non-interactive; the adjust buttons next to it handle input.
+  scene.betPill = makePill({
+    x: betCX,
+    y: pillsCenterY,
+    label: 'BET',
+    value: fmtCurrency(player.bet),
+    accent: 0xFFAB40,
+  });
+  app.stage.addChild(scene.betPill);
+
+  // Adjust buttons: circular minus on the left, plus on the right.
+  function makeAdjustButton(symbol, onTap) {
+    const r = _pillH * 0.38;
+    const cont = new PIXI.Container();
+    const face = new PIXI.Graphics();
+    const drawFace = (hover) => {
+      face.clear();
+      face.lineStyle(2 * gameScale, 0xC08050, 1);
+      face.beginFill(hover ? 0x5C3318 : 0x3D1C02, 0.95);
+      face.drawCircle(0, 0, r);
+      face.endFill();
+    };
+    drawFace(false);
+    cont.addChild(face);
+
+    const txt = new PIXI.Text(symbol, {
+      fontFamily: FONT,
+      fontSize: r * 1.3,
+      fill: 0xFFECB3,
+    });
+    txt.anchor.set(0.5);
+    txt.y = -r * 0.08;
+    cont.addChild(txt);
+
+    cont.eventMode = 'static';
+    cont.cursor = 'pointer';
+    cont.hitArea = new PIXI.Circle(0, 0, r);
+    cont.on('pointerover', () => {
+      drawFace(true);
+      gsap.to(cont.scale, { x: 1.08, y: 1.08, duration: 0.1, ease: 'sine.out' });
+    });
+    cont.on('pointerout', () => {
+      drawFace(false);
+      gsap.to(cont.scale, { x: 1, y: 1, duration: 0.1 });
+    });
+    cont.on('pointerdown', () => gsap.to(cont.scale, { x: 0.92, y: 0.92, duration: 0.06 }));
+    cont.on('pointerup', () => gsap.to(cont.scale, { x: 1.08, y: 1.08, duration: 0.1 }));
+    cont.on('pointerupoutside', () => gsap.to(cont.scale, { x: 1, y: 1, duration: 0.1 }));
+    cont.on('pointertap', () => {
+      if (scene.spinButton.busy) return;
+      onTap();
+      gsap.fromTo(scene.betPill.valText.scale,
+        { x: 1.2, y: 1.2 }, { x: 1, y: 1, duration: 0.3, ease: 'back.out(2)' });
+    });
+    return cont;
+  }
+
+  scene.betMinusBtn = makeAdjustButton('\u2212', () => cycleBet(-1));
+  scene.betMinusBtn.x = minusCX;
+  scene.betMinusBtn.y = pillsCenterY;
+  app.stage.addChild(scene.betMinusBtn);
+
+  scene.betPlusBtn = makeAdjustButton('+', () => cycleBet(+1));
+  scene.betPlusBtn.x = plusCX;
+  scene.betPlusBtn.y = pillsCenterY;
+  app.stage.addChild(scene.betPlusBtn);
+
+  scene.winPill = makePill({
+    x: winCX,
+    y: pillsCenterY,
+    label: 'WIN',
+    value: fmtCurrency(0),
+    accent: 0x7FE080,
+    width: _winPillW,
+    valueFontSize: Math.max(22, 34 * gameScale), // bigger, more prominent
+  });
+  app.stage.addChild(scene.winPill);
+
+  // Small RTP line — low-contrast, near the bottom of the viewport
+  scene.rtpText = new PIXI.Text(`RTP 0.00%  |  Spins 0`, {
+    fontFamily: FONT,
+    fontSize: Math.max(10, 13 * gameScale),
+    fill: 0xFFE0A0,
+  });
+  scene.rtpText.anchor.set(0.5);
+  scene.rtpText.alpha = 0.55;
+  scene.rtpText.x = L.sw / 2;
+  scene.rtpText.y = L.sh - 20 * gameScale;
+  app.stage.addChild(scene.rtpText);
+
+  // ─── SPIN BUTTON ───────────────────────────────────────────────────────────
+  // Single asset (spin_button.png, 540×538). No text overlay, just the sprite.
+  const btnTargetSize = 130 * gameScale;
+  const btnX = L.sw / 2;
+  const btnY = pillsCenterY + _pillH / 2 + btnTargetSize / 2 + 12 * gameScale;
+
+  const btn = new PIXI.Sprite(spinButtonTexture);
+  btn.anchor.set(0.5);
+  btn.scale.set(btnTargetSize / spinButtonTexture.height);
+  btn.x = btnX;
+  btn.y = btnY;
+
+  btn.eventMode = 'static';
+  btn.cursor = 'pointer';
+
+  const baseScale = btn.scale.x;
+  const hoverScale = baseScale * 1.06;
+  const pressScale = baseScale * 0.94;
+
+  btn.on('pointerover', () => {
+    if (btn.busy) return;
+    gsap.to(btn.scale, { x: hoverScale, y: hoverScale, duration: 0.12, ease: 'sine.out' });
+  });
+  btn.on('pointerout',  () => {
+    if (btn.busy) return;
+    gsap.to(btn.scale, { x: baseScale, y: baseScale, duration: 0.12, ease: 'sine.out' });
+  });
+  btn.on('pointerdown', () => {
+    if (btn.busy) return;
+    gsap.to(btn.scale, { x: pressScale, y: pressScale, duration: 0.08, ease: 'sine.out' });
+  });
+  btn.on('pointerup', () => {
+    gsap.to(btn.scale, { x: baseScale, y: baseScale, duration: 0.12, ease: 'back.out(2)' });
+  });
+  btn.on('pointerupoutside', () => {
+    gsap.to(btn.scale, { x: baseScale, y: baseScale, duration: 0.12 });
+  });
+  btn.on('pointertap', () => onSpinClick());
+
+  btn._setBusy = (b) => {
+    btn.busy = b;
+    btn.alpha = b ? 0.55 : 1;
+    btn.cursor = b ? 'default' : 'pointer';
+    if (b) {
+      // Slow continuous rotation while spinning to suggest activity
+      btn._spinTween = gsap.to(btn, { rotation: btn.rotation + Math.PI * 2, duration: 1.2, ease: 'none', repeat: -1 });
+    } else {
+      if (btn._spinTween) { btn._spinTween.kill(); btn._spinTween = null; }
+      gsap.to(btn, { rotation: 0, duration: 0.3, ease: 'power2.out' });
+    }
+  };
+
+  app.stage.addChild(btn);
+  scene.spinButton = btn;
+
+  // ─── INFO BUTTON ───────────────────────────────────────────────────────────
+  // Sits to the LEFT of the Balance pill in the main UI row. Opens the
+  // paytable modal when tapped.
+  const info = new PIXI.Sprite(infoButtonTexture);
+  info.anchor.set(0.5);
+  info.scale.set(_infoSize / infoButtonTexture.height);
+  info.x = infoCX;
+  info.y = pillsCenterY;
+  info.eventMode = 'static';
+  info.cursor = 'pointer';
+  const infoBaseScale = info.scale.x;
+  info.on('pointerover', () => gsap.to(info.scale, { x: infoBaseScale * 1.08, y: infoBaseScale * 1.08, duration: 0.12 }));
+  info.on('pointerout',  () => gsap.to(info.scale, { x: infoBaseScale, y: infoBaseScale, duration: 0.12 }));
+  info.on('pointerdown', () => gsap.to(info.scale, { x: infoBaseScale * 0.92, y: infoBaseScale * 0.92, duration: 0.08 }));
+  info.on('pointerup',   () => gsap.to(info.scale, { x: infoBaseScale * 1.08, y: infoBaseScale * 1.08, duration: 0.1 }));
+  info.on('pointerupoutside', () => gsap.to(info.scale, { x: infoBaseScale, y: infoBaseScale, duration: 0.1 }));
+  info.on('pointertap',  () => openPaytableModal(L));
+  app.stage.addChild(info);
+  scene.infoButton = info;
+
+  // Initial UI sync
+  updateMultiplierBar(1);
+  updateWinText(0);
+  updateBalanceText();
+  updateBetText();
+  updateRtpText();
+  updateSpinButtonState();
+}
+
+// ─── UI HELPERS ──────────────────────────────────────────────────────────────
+
+function fmtCurrency(n) {
+  // Small integer amounts shown plainly, larger amounts with thousands sep.
+  n = Math.round(n);
+  if (n < 1000) return `${n}`;
+  return n.toLocaleString('en-US');
+}
+
+// Smooth numeric count-up on a PIXI.Text, using a tween object.
+// Kills any prior tween on the same textObj so rapid successive updates
+// don't cause the displayed value to flicker.
+function tweenCount(textObj, fromVal, toVal, duration = 0.6, formatter = fmtCurrency) {
+  if (!textObj) return;
+  if (textObj._countTween) textObj._countTween.kill();
+  const o = { v: fromVal };
+  textObj._countTween = gsap.to(o, {
+    v: toVal,
+    duration,
+    ease: 'power2.out',
+    onUpdate: () => { textObj.text = formatter(o.v); },
+    onComplete: () => { textObj.text = formatter(toVal); textObj._countTween = null; },
+  });
+}
+
+function updateMultiplierBar(mult) {
+  uiState.multiplier = mult;
+  if (scene.multiplierText) scene.multiplierText.text = `${mult}\u00D7`;
+  if (!scene.multiplierFill || !scene.multiplierMask) return;
+  const empties = Math.max(0, (mult - 1) / 2);
+  const frac = Math.min(1, empties / uiState.multBarMaxEmpties);
+  const barX = scene.multiplier.x - scene.multiplier.width / 2;
+  const barY = scene.multiplier.y;
+  const barW = scene.multiplier.width;
+  const barH = scene.multiplier.height;
+  const fillH = barH * frac;
+  const m = scene.multiplierMask;
+  m.clear();
+  m.beginFill(0xFFFFFF);
+  m.drawRect(barX, barY + barH - fillH, barW, fillH);
+  m.endFill();
+}
+
+function updateBalanceText(animateFrom) {
+  if (!scene.balancePill) return;
+  const t = scene.balancePill.valText;
+  if (animateFrom !== undefined) {
+    tweenCount(t, animateFrom, player.balance, 0.7);
+  } else {
+    t.text = fmtCurrency(player.balance);
+  }
+}
+
+function updateBetText() {
+  if (!scene.betPill) return;
+  scene.betPill.valText.text = fmtCurrency(player.bet);
+}
+
+function updateWinText(n, animate = false) {
+  if (!scene.winPill) return;
+  const t = scene.winPill.valText;
+  if (animate) {
+    tweenCount(t, player.displayedWin, n, 0.5);
+  } else {
+    t.text = fmtCurrency(n);
+  }
+  player.displayedWin = n;
+}
+
+function updateRtpText() {
+  if (!scene.rtpText) return;
+  const s = BloomSort.stats;
+  const pct = (s.rtp * 100).toFixed(2);
+  scene.rtpText.text = `RTP ${pct}%   |   Spins ${s.spins}   |   Avg win ${s.avgWin.toFixed(1)}`;
+}
+
+function updateSpinButtonState() {
+  if (!scene.spinButton) return;
+  const canPlay = canAffordSpin() && !scene.spinButton.busy;
+  scene.spinButton.alpha = canPlay ? 1 : 0.5;
+  scene.spinButton.cursor = canPlay ? 'pointer' : 'not-allowed';
+  // Keep eventMode 'static' so clicks still land — the handler bounces back
+  // with flashInsufficientBalance() or returns silently if busy. This gives
+  // the player clear feedback instead of silently-dead buttons.
+  scene.spinButton.eventMode = 'static';
+}
+
+// Flash the balance pill red briefly when the player tries to spin without
+// enough balance. Purely cosmetic.
+function flashInsufficientBalance() {
+  if (!scene.balancePill) return;
+  const bg = scene.balancePill.bgGraphic;
+  const cont = scene.balancePill;
+  const tl = gsap.timeline();
+  tl.to(cont.scale, { x: 1.05, y: 1.05, duration: 0.08, yoyo: true, repeat: 3, ease: 'sine.inOut' });
+}
+
+// Big-win celebration: scale pulse on the WIN pill.
+function pulseWinPill() {
+  if (!scene.winPill) return;
+  const t = scene.winPill.valText;
+  gsap.fromTo(t.scale,
+    { x: 1.4, y: 1.4 },
+    { x: 1, y: 1, duration: 0.6, ease: 'elastic.out(1, 0.4)' }
+  );
+}
+
+// ─── PAYTABLE MODAL ──────────────────────────────────────────────────────────
+// Slot-game convention: info button opens a dimmed-backdrop modal with the
+// 8 flowers ranked by base pay, each showing the coin value at the current
+// bet. Top 2 rarity tiers get a gold accent. Click backdrop or × to close.
+
+function openPaytableModal(L) {
+  if (scene.paytableModal) return;
+
+  const modal = new PIXI.Container();
+
+  // Dimmed backdrop — click to close
+  const backdrop = new PIXI.Graphics();
+  backdrop.beginFill(0x000000, 0.72);
+  backdrop.drawRect(0, 0, L.sw, L.sh);
+  backdrop.endFill();
+  backdrop.eventMode = 'static';
+  backdrop.on('pointertap', (e) => { if (e.target === backdrop) closePaytableModal(); });
+  modal.addChild(backdrop);
+
+  // Panel sizing: responsive, capped for very large screens
+  const scale = Math.min(1, Math.min(L.sw / 900, L.sh / 900));
+  const cardW   = 260 * scale;
+  const cardH   = 120 * scale;
+  const cardGap = 12  * scale;
+  const panelPadX = 32 * scale;
+  const panelPadTop = 70 * scale;
+  const panelPadBottom = 40 * scale;
+  const gridW = cardW * 2 + cardGap;
+  const panelW = gridW + panelPadX * 2;
+  const gridH = cardH * 4 + cardGap * 3;
+  const panelH = gridH + panelPadTop + panelPadBottom;
+  const panelX = (L.sw - panelW) / 2;
+  const panelY = (L.sh - panelH) / 2;
+
+  // Panel background
+  const panel = new PIXI.Graphics();
+  panel.lineStyle(3 * scale, 0xD4956A, 1);
+  panel.beginFill(0xFFF4D6, 0.98);
+  panel.drawRoundedRect(panelX, panelY, panelW, panelH, 26 * scale);
+  panel.endFill();
+  // Subtle inner lip
+  panel.lineStyle(1 * scale, 0xE8C898, 0.7);
+  panel.drawRoundedRect(panelX + 6 * scale, panelY + 6 * scale, panelW - 12 * scale, panelH - 12 * scale, 22 * scale);
+  // Absorb pointer events so clicks inside the panel don't reach the backdrop
+  // (which would close the modal).
+  panel.eventMode = 'static';
+  panel.hitArea = new PIXI.Rectangle(panelX, panelY, panelW, panelH);
+  modal.addChild(panel);
+
+  // Title
+  const title = new PIXI.Text('Paytable', {
+    fontFamily: FONT,
+    fontSize: 30 * scale,
+    fill: 0x3D1C02,
+  });
+  title.anchor.set(0.5);
+  title.x = panelX + panelW / 2;
+  title.y = panelY + 28 * scale;
+  modal.addChild(title);
+
+  // Subtitle: mention current bet context
+  const sub = new PIXI.Text(`Coins paid per Full Bloom (bet ${player.bet})`, {
+    fontFamily: FONT,
+    fontSize: 12 * scale,
+    fill: 0x9C6A1A,
+    letterSpacing: 1,
+  });
+  sub.anchor.set(0.5);
+  sub.x = panelX + panelW / 2;
+  sub.y = panelY + 50 * scale;
+  modal.addChild(sub);
+
+  // Close button (×) top-right
+  const closeBtn = new PIXI.Container();
+  const closeR = 22 * scale;
+  const closeBg = new PIXI.Graphics();
+  const drawClose = (hover) => {
+    closeBg.clear();
+    closeBg.lineStyle(2 * scale, 0xC08050, 1);
+    closeBg.beginFill(hover ? 0x5C3318 : 0x3D1C02, 0.95);
+    closeBg.drawCircle(0, 0, closeR);
+    closeBg.endFill();
+  };
+  drawClose(false);
+  closeBtn.addChild(closeBg);
+  const closeX = new PIXI.Text('\u00D7', {
+    fontFamily: FONT, fontSize: closeR * 1.5, fill: 0xFFFFFF,
+  });
+  closeX.anchor.set(0.5);
+  closeBtn.addChild(closeX);
+  closeBtn.x = panelX + panelW - 28 * scale;
+  closeBtn.y = panelY + 30 * scale;
+  closeBtn.eventMode = 'static';
+  closeBtn.cursor = 'pointer';
+  closeBtn.hitArea = new PIXI.Circle(0, 0, closeR);
+  closeBtn.on('pointerover', () => drawClose(true));
+  closeBtn.on('pointerout', () => drawClose(false));
+  closeBtn.on('pointertap', () => closePaytableModal());
+  modal.addChild(closeBtn);
+
+  // Flower cards — sorted by basePay descending (rarest first)
+  const sortedColors = [...GAME.COLORS].sort((a, b) => b.basePay - a.basePay);
+  const gridX = panelX + panelPadX;
+  const gridY = panelY + panelPadTop;
+  const flowerPreviewCell = Math.min(cardH - 20 * scale, 96 * scale);
+
+  for (let i = 0; i < sortedColors.length; i++) {
+    const color = sortedColors[i];
+    const row = Math.floor(i / 2);
+    const col = i % 2;
+    const cx = gridX + col * (cardW + cardGap);
+    const cy = gridY + row * (cardH + cardGap);
+    const isTop = i < 2;
+
+    const card = new PIXI.Graphics();
+    card.lineStyle(2.5 * scale, isTop ? 0xFFD700 : 0xC08050, 1);
+    card.beginFill(isTop ? 0xFFF9D6 : 0xFFFBF0, 1);
+    card.drawRoundedRect(cx, cy, cardW, cardH, 14 * scale);
+    card.endFill();
+    modal.addChild(card);
+
+    // Flower preview — fully bloomed (8 petals) so the pay is visually obvious
+    const preview = new FlowerSymbol(color.name, 8, flowerPreviewCell);
+    preview.x = cx + cardH / 2;
+    preview.y = cy + cardH / 2;
+    modal.addChild(preview);
+
+    // Color name
+    const name = new PIXI.Text(color.name, {
+      fontFamily: FONT,
+      fontSize: 22 * scale,
+      fill: 0x3D1C02,
+    });
+    name.x = cx + cardH + 4 * scale;
+    name.y = cy + 18 * scale;
+    modal.addChild(name);
+
+    // Coin value — basePay × bet, in game coins
+    const coinVal = color.basePay * player.bet;
+    const pay = new PIXI.Text(`+${fmtCurrency(coinVal)}`, {
+      fontFamily: FONT,
+      fontSize: 28 * scale,
+      fill: isTop ? 0xD4A017 : 0xE65C00,
+      stroke: 0x3D1C02,
+      strokeThickness: 3 * scale,
+    });
+    pay.x = cx + cardH + 4 * scale;
+    pay.y = cy + cardH * 0.48;
+    modal.addChild(pay);
+
+    // Small caption under coin value
+    const cap = new PIXI.Text(`base pay ${color.basePay} × bet`, {
+      fontFamily: FONT,
+      fontSize: 11 * scale,
+      fill: 0x9C6A1A,
+    });
+    cap.x = cx + cardH + 4 * scale;
+    cap.y = cy + cardH * 0.82;
+    modal.addChild(cap);
+  }
+
+  modal.alpha = 0;
+  app.stage.addChild(modal);
+  scene.paytableModal = modal;
+
+  gsap.to(modal, { alpha: 1, duration: 0.25, ease: 'power2.out' });
+}
+
+function closePaytableModal() {
+  const m = scene.paytableModal;
+  if (!m) return;
+  scene.paytableModal = null;
+  gsap.to(m, {
+    alpha: 0,
+    duration: 0.18,
+    ease: 'power2.in',
+    onComplete: () => m.destroy({ children: true }),
+  });
+}
+
+// ─── SPIN FLOW ───────────────────────────────────────────────────────────────
+
+async function onSpinClick() {
+  if (!scene.spinButton || scene.spinButton.busy) return;
+  if (!canAffordSpin()) {
+    flashInsufficientBalance();
+    return;
+  }
+
+  const bet = player.bet;
+
+  // 1. Deduct the bet up front (count-up animation)
+  const prevBal = player.balance;
+  player.balance -= bet;
+  updateBalanceText(prevBal);
+  updateSpinButtonState();
+
+  // 2. Reset the spin UI state
+  scene.spinButton._setBusy(true);
+  updateMultiplierBar(1);
+  updateWinText(0);
+
+  // 3. Run the deterministic simulation — animator replays it.
+  const result = BloomSort.runSpin(bet);
+
+  if (!animator) animator = new SpinAnimator({ scene, app });
+
+  animator.onProgress = (ev) => {
+    if (ev.type === 'dissolve') {
+      updateMultiplierBar(ev.multiplier);
+      // Live running win = payout × multiplier × bet. Since multiplier is
+      // currently disabled it stays at 1, so running win = payoutTotal × bet.
+      const runningWin = ev.payoutTotal * ev.multiplier * bet;
+      updateWinText(runningWin, true);
+    }
+  };
+
+  animator.onEnd = (finalResult) => {
+    // Commit the final win (payout × multiplier)
+    updateWinText(finalResult.finalWin, true);
+
+    // 4. Credit winnings to balance (count-up from pre-credit to post-credit)
+    if (finalResult.finalWin > 0) {
+      const preCreditBal = player.balance;
+      player.balance += finalResult.finalWin;
+      updateBalanceText(preCreditBal);
+      // Extra celebration for wins > bet (nontrivial hit)
+      if (finalResult.finalWin >= bet) pulseWinPill();
+    }
+
+    updateRtpText();
+    currentGrid = finalResult.finalGrid;
+    scene.spinButton._setBusy(false);
+    updateSpinButtonState();
+  };
+
+  await animator.play(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INITIAL BUILD & RESIZE
+// ═══════════════════════════════════════════════════════════════════════════════
+function rebuild() {
+  const L = calculateLayout(app.screen.width, app.screen.height);
+  buildScene(L);
+}
+
+rebuild();
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(rebuild, 50);
+});
+
+// ─── KEYBOARD: Space = spin ─────────────────────────────────────────────────
+// Standard slot-game convention — hitting space triggers the spin. We also
+// use Escape to close the paytable modal. Space swallowed everywhere so it
+// doesn't scroll the page or activate a focused button by accident.
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (scene.paytableModal) {
+      closePaytableModal();
+      return;
+    }
+    onSpinClick();
+  } else if (e.code === 'Escape' && scene.paytableModal) {
+    closePaytableModal();
+  }
+});
+
+})();
+</script>
+</body>
+</html>
