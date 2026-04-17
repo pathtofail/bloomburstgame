@@ -24,14 +24,12 @@ await document.fonts.load('32px "Fredoka One"');
 const bgTexture           = await PIXI.Assets.load('assets/canvas_bg.jpg');
 const logoTexture         = await PIXI.Assets.load('assets/gameLogo.png');
 const frameTexture        = await PIXI.Assets.load('assets/frame.png');
-const multEmptyTexture    = await PIXI.Assets.load('assets/multiplier_empty.png');
-const multFullTexture     = await PIXI.Assets.load('assets/multiplier_full.png');
 
 // Symbol art — pot, middle (flower center), petals.
 const potTexture        = await PIXI.Assets.load('assets/pot.png');
 const middleTexture     = await PIXI.Assets.load('assets/middle.png');
 const spinButtonTexture = await PIXI.Assets.load('assets/spin_button.png');
-const infoButtonTexture = await PIXI.Assets.load('assets/info_button.png');
+const infoButtonTexture       = await PIXI.Assets.load('assets/info_button.png');
 
 // Per-colour petal sprites. Note: "Gold" uses petal_orange.png per art team.
 const PETAL_FILE_BY_COLOR = {
@@ -66,11 +64,12 @@ const GAME = {
   MAX_TRANSFER_PASSES: 50,
   MAX_CASCADES: 100,
 
-  // Temporarily disabled. Set to true to re-enable the +2×-per-empty rule.
-  // When false, the multiplier stays at 1 for every spin — empty dissolves
-  // still happen mechanically (cells still clear, cascades still refill),
-  // they just don't contribute to the win.
-  MULTIPLIER_ENABLED: false,
+  // Empty dissolves contribute +2× each to the running spin multiplier.
+  MULTIPLIER_ENABLED: true,
+
+  // Global payout knob. Every Full Bloom's coins are scaled by this before
+  // multiplier + bet are applied. Lower = tighter payouts (lower RTP).
+  PAY_MULTIPLIER: 0.25,
 
   COLORS: [
     { name: 'Scarlet', weight: 5,  basePay: 10, hex: '#D50000' },
@@ -335,7 +334,7 @@ function runSpin(bet = 1) {
     const { fullBlooms, emptyDissolves } = findDissolves(grid);
     if (fullBlooms.length === 0 && emptyDissolves.length === 0) break;
 
-    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay, 0);
+    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay * GAME.PAY_MULTIPLIER, 0);
     const multDelta   = GAME.MULTIPLIER_ENABLED ? emptyDissolves.length * 2 : 0;
     totalPayout += payoutDelta;
     multiplier  += multDelta;
@@ -1138,6 +1137,14 @@ class FlowerSymbol extends PIXI.Container {
 
     const petal = kids[bestIdx];
     this.petalLayer.removeChild(petal);
+    // Kill any in-progress tween (from the previous flight's scale-back, for
+    // example) and snap the petal to the flower's canonical scale. Without
+    // this, a petal reused rapidly across passes can get stuck at its pop
+    // scale (~1.18×) and appear oversized on the destination.
+    gsap.killTweensOf(petal);
+    gsap.killTweensOf(petal.scale);
+    petal.scale.set(this._scale);
+    petal.skew.x = 0;
     this.petalCount -= 1;
     this._reflowRemaining();
     return petal;
@@ -1163,6 +1170,13 @@ class FlowerSymbol extends PIXI.Container {
   // FX layer). Reparents while preserving world pose, then tweens into its
   // new slot. Returns a Promise that resolves when the petal has landed.
   adoptFlyingPetal(petalSprite) {
+    // Kill any tweens still playing on the incoming sprite — the scale-back
+    // tween from the flight, in particular, can leave scale mid-tween.
+    gsap.killTweensOf(petalSprite);
+    gsap.killTweensOf(petalSprite.scale);
+    petalSprite.scale.set(this._scale);
+    petalSprite.skew.x = 0;
+
     // Capture world pose
     const worldPos = petalSprite.getGlobalPosition();
     const worldRot = petalSprite.rotation;
@@ -1221,9 +1235,15 @@ class FlowerSymbol extends PIXI.Container {
   }
 
   // Kill any in-progress tweens on petals (used when the flower is destroyed
-  // mid-animation, e.g. during dissolve).
+  // mid-animation, e.g. during dissolve). Covers the petal object itself AND
+  // its .scale — gsap treats `petal` and `petal.scale` as separate targets
+  // so both must be cleared before destroy to avoid "cannot set property on
+  // null" errors on the next ticker frame.
   killPetalTweens() {
-    for (const p of this.petalLayer.children) gsap.killTweensOf(p);
+    for (const p of this.petalLayer.children) {
+      gsap.killTweensOf(p);
+      gsap.killTweensOf(p.scale);
+    }
   }
 }
 
@@ -1597,17 +1617,21 @@ class SpinAnimator {
   async _playTransferPass(ev) {
     if (ev.moves.length === 0) return;
 
-    // Parallel flights, but each is nudged by a small stagger so the pass
-    // reads as a natural flurry rather than a synchronous burst.
+    // Strictly parallel launch — no stagger at all. Every petal detaches on
+    // the same frame and they're all airborne together. Desynchronisation
+    // comes purely from each petal's speedMul + random arc wobble + random
+    // bend direction, so they don't all trace the same arc in lockstep.
     const promises = ev.moves.map((move, i) => {
-      const delay = T(0.025) * i + Math.random() * T(0.020);
-      return this._animateOneTransfer(move, delay);
+      const speedMul = Math.max(0.30, Math.pow(0.80, i));
+      return this._animateOneTransfer(move, 0, speedMul);
     });
     await Promise.all(promises);
-    await SpinAnimator._wait(T(110));
+    // Minimal inter-pass beat so the reflow is legible but the cascade
+    // feels continuous rather than pulsed.
+    await SpinAnimator._wait(T(20));
   }
 
-  async _animateOneTransfer(move, staggerDelay = 0) {
+  async _animateOneTransfer(move, staggerDelay = 0, speedMul = 1) {
     const src = this.scene.flowers[move.from.r][move.from.c];
     const dst = this.scene.flowers[move.to.r][move.to.c];
     if (!src || !dst) return;
@@ -1657,7 +1681,7 @@ class SpinAnimator {
       // if building tension before snapping free of the bulb.
       gsap.to(petal.scale, {
         x: startScale * 1.18, y: startScale * 1.18,
-        duration: T(0.16), ease: 'back.out(1.8)',
+        duration: T(0.16) * speedMul, ease: 'back.out(1.8)',
       });
 
       // Main flight. power3.inOut = slow launch (resistance), fast mid-flight,
@@ -1672,7 +1696,7 @@ class SpinAnimator {
 
       gsap.to(state, {
         t: 1,
-        duration: T(0.70),
+        duration: T(0.70) * speedMul,
         ease: 'power3.inOut',
         onUpdate: () => {
           const t = state.t;
@@ -1694,11 +1718,17 @@ class SpinAnimator {
           petal.skew.x = 0;
           gsap.to(petal.scale, {
             x: startScale, y: startScale,
-            duration: T(0.14), ease: 'sine.inOut',
+            duration: T(0.14) * speedMul, ease: 'sine.inOut',
           });
+          // Hand off to the target flower but DON'T await the reflow tween —
+          // resolve this flight's promise immediately so the next pass can
+          // start while the previous pass's reflow animations are still
+          // playing. This gives visible overlap of petals across passes.
           if (!dst.destroyed) {
-            await dst.adoptFlyingPetal(petal);
+            dst.adoptFlyingPetal(petal);
           } else {
+            gsap.killTweensOf(petal);
+            gsap.killTweensOf(petal.scale);
             petal.destroy();
           }
           resolve();
@@ -1711,7 +1741,9 @@ class SpinAnimator {
   async _playDissolve(ev) {
     const promises = [];
     for (const fb of ev.fullBlooms) promises.push(this._animateFullBloom(fb));
-    for (const ed of ev.emptyDissolves) promises.push(this._animateEmptyDissolve(ed));
+    ev.emptyDissolves.forEach((ed, i) => {
+      promises.push(this._animateEmptyDissolve(ed, i));
+    });
 
     // Notify UI so the multiplier bar + running payout update mid-animation.
     if (this.onProgress) this.onProgress(ev);
@@ -1731,15 +1763,21 @@ class SpinAnimator {
     spawnBurst(this.scene.fxLayer, fxPos.x, fxPos.y, colorHex, 18);
 
     // Payout text over the dissolving symbol — the coin value this Full Bloom
-    // contributed to the win (basePay × bet).
-    const payoutAmount = d.basePay * this.currentBet;
+    // contributed to the win (basePay × PAY_MULTIPLIER × bet).
+    const payoutAmount = d.basePay * GAME.PAY_MULTIPLIER * this.currentBet;
     spawnPayoutText(this.scene.fxLayer, fxPos.x, fxPos.y - 6, payoutAmount);
 
     flower.killPetalTweens();
 
     return new Promise(resolve => {
       const tl = gsap.timeline({
-        onComplete: () => { flower.destroy({ children: true }); resolve(); }
+        onComplete: () => {
+          gsap.killTweensOf(flower);
+          gsap.killTweensOf(flower.scale);
+          gsap.killTweensOf(flower.position);
+          flower.destroy({ children: true });
+          resolve();
+        }
       });
       tl.to(flower,       { rotation: Math.PI * 1.2, duration: T(0.45), ease: 'power2.inOut' }, 0);
       tl.to(flower.scale, { x: 1.35, y: 1.35, duration: T(0.30), ease: 'back.out(2)' }, 0);
@@ -1748,20 +1786,128 @@ class SpinAnimator {
     });
   }
 
-  async _animateEmptyDissolve(d) {
+  async _animateEmptyDissolve(d, index = 0) {
     const flower = this.scene.flowers[d.r][d.c];
     if (!flower) return;
     this.scene.flowers[d.r][d.c] = null;
-
     flower.killPetalTweens();
 
+    // Reparent the flower out of the grid-masked flowerLayer and into the
+    // un-masked fxLayer so it can fly all the way to the multiplier display.
+    const worldPos = flower.getGlobalPosition();
+    flower.parent && flower.parent.removeChild(flower);
+    this.scene.fxLayer.addChild(flower);
+    const startLocal = this.scene.fxLayer.toLocal(worldPos);
+    flower.x = startLocal.x;
+    flower.y = startLocal.y;
+
+    // STAGGER — each empty pot in the dissolve set launches a little later
+    // than the previous one so the stream reads as sequential rather than
+    // one simultaneous burst.
+    const staggerDelayMs = index * 130;  // ~130ms between launches
+    if (staggerDelayMs > 0) {
+      await new Promise(r => setTimeout(r, staggerDelayMs));
+    }
+    // Race guard — this flower might have been cleaned up by a resize etc.
+    if (flower.destroyed) return;
+
+    // Target: the MULTIPLIER half of the Win pill.
+    let targetX = startLocal.x;
+    let targetY = startLocal.y - this.cellSize * 3;
+    const winPill = this.scene.winPill;
+    if (winPill && winPill.rightValText) {
+      const targetGlobal = winPill.rightValText.getGlobalPosition();
+      const targetLocal = this.scene.fxLayer.toLocal(targetGlobal);
+      targetX = targetLocal.x;
+      targetY = targetLocal.y;
+    }
+
+    // Curved flight arc.
+    const midX = (startLocal.x + targetX) / 2 + (Math.random() - 0.5) * 60;
+    const midY = Math.min(startLocal.y, targetY) - this.cellSize * 0.8;
+
+    const baseScale = flower.scale.x;
+
     return new Promise(resolve => {
-      const tl = gsap.timeline({
-        onComplete: () => { flower.destroy({ children: true }); resolve(); }
+      const state = { t: 0 };
+      gsap.to(state, {
+        t: 1,
+        duration: T(0.65),
+        ease: 'power2.in',
+        onUpdate: () => {
+          const t = state.t, omt = 1 - t;
+          flower.x = omt * omt * startLocal.x + 2 * omt * t * midX + t * t * targetX;
+          flower.y = omt * omt * startLocal.y + 2 * omt * t * midY + t * t * targetY;
+        },
+        onComplete: () => {
+          // Capture arrival position before anything clears the flower.
+          const impactX = flower.x;
+          const impactY = flower.y;
+
+          // Dust puff at the landing point (stays in fxLayer so it's always
+          // on top — dust naturally reads above numbers).
+          spawnPuff(this.scene.fxLayer, impactX, impactY, 16);
+
+          // Re-home the pot into the Win pill so its z-depth becomes
+          // "panel bg → pot → multiplier text" during the fade-out. Added
+          // just BEFORE rightValText so the multiplier number always renders
+          // above it.
+          if (winPill && winPill.rightValText && !flower.destroyed) {
+            const worldPos = flower.getGlobalPosition();
+            flower.parent && flower.parent.removeChild(flower);
+            const insertIdx = winPill.getChildIndex(winPill.rightValText);
+            winPill.addChildAt(flower, insertIdx);
+            const local = winPill.toLocal(worldPos);
+            flower.x = local.x;
+            flower.y = local.y;
+          }
+
+          // Quick fade-out AFTER the pot has arrived — keeps the pot fully
+          // visible during the entire flight, then dissolves it at the end.
+          gsap.to(flower, {
+            alpha: 0,
+            duration: T(0.22),
+            ease: 'power2.in',
+            onComplete: () => {
+              gsap.killTweensOf(flower);
+              gsap.killTweensOf(flower.scale);
+              gsap.killTweensOf(flower.position);
+              if (!flower.destroyed) flower.destroy({ children: true });
+            },
+          });
+
+          // Bounce the MULTIPLIER value on landing — chunkier, with a longer
+          // elastic settle for better "just got added" feedback.
+          if (winPill && winPill.rightValText && winPill.isExpanded) {
+            gsap.killTweensOf(winPill.rightValText.scale);
+            gsap.timeline()
+              .to(winPill.rightValText.scale, {
+                x: 2.3, y: 2.3, duration: 0.32, ease: 'back.out(1.8)',
+              })
+              .to(winPill.rightValText.scale, {
+                x: 1, y: 1, duration: 0.95, ease: 'elastic.out(1, 0.32)',
+              });
+            gsap.fromTo(winPill.rightLabel,
+              { alpha: 1 },
+              { alpha: 0.65, duration: 0.22, yoyo: true, repeat: 1 });
+          }
+
+          resolve();
+        },
       });
-      tl.to(flower.scale, { x: 0.8, y: 0.8, duration: T(0.15), ease: 'sine.out' }, 0);
-      tl.to(flower.scale, { x: 0.1, y: 0.1, duration: T(0.30), ease: 'power2.in' }, T(0.15));
-      tl.to(flower,       { alpha: 0,       duration: T(0.35), ease: 'power2.in' }, T(0.10));
+
+      // Gentle shrink during flight — less aggressive than before so the pot
+      // stays clearly visible the whole way across.
+      gsap.to(flower.scale, {
+        x: baseScale * 0.55, y: baseScale * 0.55,
+        duration: T(0.65), ease: 'power2.in',
+      });
+
+      // Subtle spin — no alpha tween here; the pot stays opaque until arrival.
+      gsap.to(flower, {
+        rotation: flower.rotation + Math.PI * 0.6,
+        duration: T(0.65), ease: 'sine.inOut',
+      });
     });
   }
 
@@ -1946,10 +2092,6 @@ const scene = {
   bg: null,
   logoText: null,
   frame: null,
-  multiplier: null,
-  multiplierFill: null,
-  multiplierMask: null,
-  multiplierText: null,
   cells: [],
   flowers: [],
   flowerLayer: null,
@@ -1972,6 +2114,11 @@ let uiState = {
   multiplier: 1,
   multBarMaxEmpties: 10,
 };
+
+// The active gameScale — updated by buildScene each time. Kept at module
+// scope so helpers outside buildScene (e.g. animateMultiplication) can size
+// fonts/strokes consistently with the rest of the UI.
+let currentGameScale = 1;
 
 // ─── PLAYER STATE ───────────────────────────────────────────────────────────
 const player = {
@@ -2004,7 +2151,10 @@ function roundedRectGraphics(x, y, w, h, r, fill, strokeColor, strokeWidth) {
 
 // Design reference — game composition was authored at 1920×1080
 const DESIGN_W = 1920;
-const DESIGN_H = 1080;
+// Slightly taller than the 16:9 native so a 1080p viewport leaves enough
+// vertical room for the native-size multiplier holder + full-size spin button
+// below the frame. Only affects the vertical gameScale constraint.
+const DESIGN_H = 1120;
 
 function buildScene(L) {
   app.stage.removeChildren();
@@ -2031,25 +2181,24 @@ function buildScene(L) {
   // background becomes visible around the composition.
   // On smaller screens, everything scales down uniformly.
   const gameScale = Math.min(L.sw / DESIGN_W, L.sh / DESIGN_H, 1.0);
+  currentGameScale = gameScale;
 
   // Dimensions
   const frameW  = frameTexture.width * gameScale;
   const frameH  = frameTexture.height * gameScale;
-  const multW   = multEmptyTexture.width * gameScale;
-  const multH   = multEmptyTexture.height * gameScale;
   const logoScale = gameScale * 0.45;
   const logoW   = logoTexture.width * logoScale;
   const logoH   = logoTexture.height * logoScale;
-  const gapX    = 24 * gameScale; // gap between frame and right column
+  const gapX    = 24 * gameScale; // gap between frame and logo column
 
   // Frame is centered horizontally; vertically placed so there's enough room
   // below for the UI row (pills + spin button + RTP line) without overlap.
-  //   UI row budget at gameScale=1: 25 (gap) + 58 (pills) + 12 (gap) +
-  //                                 130 (spin btn) + 20 (rtp margin) = 245
+  //   UI budget at gameScale=1:  5 (gap) + 130 (holder) +  5 (gap) +
+  //                             130 (spin btn / row height) + 25 (rtp) = 295
   // Frame top margin fills whatever's left above.
-  const rightColW = Math.max(multW, logoW);
+  const rightColW = logoW;
   const compX     = (L.sw - frameW) / 2;
-  const UI_BELOW_BUDGET = 245 * gameScale;
+  const UI_BELOW_BUDGET = 295 * gameScale;
   const compY     = Math.max(
     10 * gameScale,
     Math.min(
@@ -2075,47 +2224,6 @@ function buildScene(L) {
   scene.logoText.x = rightColCX;
   scene.logoText.y = compY;
   app.stage.addChild(scene.logoText);
-
-  // ─── MULTIPLIER BAR ────────────────────────────────────────────────────────
-  // Empty bar sits first; the "full" overlay on top is revealed from the bottom
-  // up via a mask. Above it floats the current multiplier number.
-  scene.multiplier = new PIXI.Sprite(multEmptyTexture);
-  scene.multiplier.anchor.set(0.5, 0);
-  scene.multiplier.scale.set(gameScale);
-  scene.multiplier.x = rightColCX;
-  scene.multiplier.y = compY + logoH + 16 * gameScale;
-  app.stage.addChild(scene.multiplier);
-
-  const multBarH = multEmptyTexture.height * gameScale;
-  const multBarW = multEmptyTexture.width * gameScale;
-  const multBarX = scene.multiplier.x - multBarW / 2;
-  const multBarY = scene.multiplier.y;
-
-  scene.multiplierFill = new PIXI.Sprite(multFullTexture);
-  scene.multiplierFill.anchor.set(0.5, 0);
-  scene.multiplierFill.scale.set(gameScale);
-  scene.multiplierFill.x = scene.multiplier.x;
-  scene.multiplierFill.y = scene.multiplier.y;
-  app.stage.addChild(scene.multiplierFill);
-
-  // Mask that reveals the bottom portion of the fill sprite.
-  scene.multiplierMask = new PIXI.Graphics();
-  scene.multiplierMask.beginFill(0xFFFFFF);
-  scene.multiplierMask.drawRect(multBarX, multBarY + multBarH, multBarW, 0); // height 0 initially
-  scene.multiplierMask.endFill();
-  app.stage.addChild(scene.multiplierMask);
-  scene.multiplierFill.mask = scene.multiplierMask;
-
-  // Multiplier number text on top of the bar
-  scene.multiplierText = new PIXI.Text('1\u00D7', {
-    fontFamily: FONT,
-    fontSize: Math.max(14, 22 * gameScale),
-    fill: 0x3D1C02,
-  });
-  scene.multiplierText.anchor.set(0.5);
-  scene.multiplierText.x = scene.multiplier.x;
-  scene.multiplierText.y = multBarY + multBarH / 2;
-  app.stage.addChild(scene.multiplierText);
 
   // ─── CELLS (invisible hit areas for future interactivity) ──────────────────
   // The frame image has the cells baked in visually. We still compute their
@@ -2218,31 +2326,43 @@ function buildScene(L) {
   //
   // Pills are drawn inline with PIXI.Graphics + labels/values above/below.
   // The Bet pill is interactive — click cycles through betLevels.
-  const _pillW = 210 * gameScale;
-  const _pillH = 58 * gameScale;
-  const _pillGap = 14 * gameScale;
-  const _adjR   = _pillH * 0.38;                  // adjust button radius
-  const pillsCenterY = compY + frameH + 30 * gameScale;
-  // Row contents (left to right):
-  //   [Info btn] [Balance pill] [WIN pill (wider, centred)] [– Bet +]
-  // The – and + buttons are centred on the Bet pill's left/right edges so
-  // exactly half of each button sits inside the pill.
-  const _infoSize = _pillH * 1.05;              // info button visual size
-  const _winPillW = _pillW * 1.55;              // WIN pill is wider
-  const pillsTotalW =
-    _infoSize + _pillGap +
-    _pillW + _pillGap +
-    _winPillW + _pillGap +
-    _pillW + _adjR * 2;
-  const _rowStartX  = (L.sw - pillsTotalW) / 2;
+  const _pillW    = 210 * gameScale;
+  const _pillH    =  58 * gameScale;
+  const _pillGap  =  14 * gameScale;
+  const _adjR     = _pillH * 0.38;
+  const _infoSize = _pillH * 1.05;
+  const _winPillW = _pillW * 1.55;
+  const btnTargetSize = 130 * gameScale;
 
-  const infoCX    = _rowStartX + _infoSize / 2;
-  const balanceCX = infoCX     + _infoSize / 2 + _pillGap + _pillW / 2;
-  const winCX     = balanceCX  + _pillW / 2    + _pillGap + _winPillW / 2;
-  const betCX     = winCX      + _winPillW / 2 + _pillGap + _adjR + _pillW / 2;
+  // UI row, all BOTTOM-aligned:
+  //   [Info]  [Balance]  [WIN]  [– Bet +]  [Spin]
+  // The FIELD GROUP — Balance, Win, Bet (with ± buttons) — is centred on the
+  // canvas. Info sits to the left of Balance; Spin sits to the right of the
+  // Bet group. All with _pillGap outside gaps.
+  const _uiGapBelowGrid = 40 * gameScale;       // breathing room under the frame
+  const UI_UP_PX        = 110 * gameScale;      // additional upward shift
+  const pillsCenterY =
+    compY + frameH + _uiGapBelowGrid +
+    btnTargetSize - _pillH / 2 - UI_UP_PX;
+
+  // Field group = Balance + gap + Win + gap + (–) + Bet + (+)
+  const fieldGroupW =
+    _pillW + _pillGap + _winPillW + _pillGap + _adjR + _pillW + _adjR;
+  const fieldLeft  = (L.sw - fieldGroupW) / 2;
+  const fieldRight = fieldLeft + fieldGroupW;
+
+  const balanceCX = fieldLeft + _pillW / 2;
+  const winCX     = balanceCX + _pillW / 2    + _pillGap + _winPillW / 2;
+  const betCX     = winCX     + _winPillW / 2 + _pillGap + _adjR + _pillW / 2;
   const minusCX   = betCX - _pillW / 2;
   const plusCX    = betCX + _pillW / 2;
-  const pillsStartX = balanceCX; // kept for any legacy reference
+
+  const infoCX = fieldLeft  - _pillGap - _infoSize / 2;
+  const spinCX = fieldRight + _pillGap + btnTargetSize / 2;
+
+  const _rowStartX  = infoCX - _infoSize / 2;
+  const pillsTotalW = (spinCX + btnTargetSize / 2) - _rowStartX;
+  const pillsStartX = balanceCX;
 
   function makePill({ x, y, label, value, interactive, onClick, accent,
                       width, valueFontSize }) {
@@ -2300,6 +2420,117 @@ function buildScene(L) {
     cont.valText = val;
     cont.labelText = lbl;
     cont.redrawBg = drawBg;
+    return cont;
+  }
+
+  // Expandable pill: the left half (WIN) is always visible and centered while
+  // the pill is "collapsed". When .expand() is called, a divider slides in at
+  // the centre, the Win label/value slide to the left half, and the right
+  // half (MULTIPLIER) fades in. .collapse() reverses it.
+  function makeSplitPill({ x, y, width, leftLabel, rightLabel,
+                           leftValue, rightValue, leftAccent, rightAccent }) {
+    const cont = new PIXI.Container();
+    cont.x = x; cont.y = y;
+    const pw = width;
+
+    // Outer background + border
+    const bg = new PIXI.Graphics();
+    bg.lineStyle(2 * gameScale, 0xC08050, 0.95);
+    bg.beginFill(0x2A1808, 0.75);
+    bg.drawRoundedRect(-pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32);
+    bg.endFill();
+    cont.addChild(bg);
+
+    // Vertical divider (hidden when collapsed).
+    const divider = new PIXI.Graphics();
+    divider.lineStyle(1.5 * gameScale, 0xC08050, 0.55);
+    divider.moveTo(0, -_pillH * 0.34);
+    divider.lineTo(0,  _pillH * 0.34);
+    divider.alpha = 0;
+    cont.addChild(divider);
+
+    const COLLAPSED_LEFT_CX =  0;       // Win centred when collapsed
+    const EXPANDED_LEFT_CX  = -pw / 4;  // Win in left half when expanded
+    const EXPANDED_RIGHT_CX =  pw / 4;  // Mult in right half when expanded
+    const labelFs = Math.max(10, 12 * gameScale);
+    const valueFs = Math.max(16, 24 * gameScale);
+
+    function half(startX, label, value, accent, startAlpha) {
+      const lbl = new PIXI.Text(label, {
+        fontFamily: FONT, fontSize: labelFs,
+        fill: accent, letterSpacing: 1.2,
+      });
+      lbl.anchor.set(0.5);
+      lbl.x = startX; lbl.y = -_pillH * 0.25;
+      lbl.alpha = startAlpha;
+      cont.addChild(lbl);
+
+      const val = new PIXI.Text(value, {
+        fontFamily: FONT, fontSize: valueFs, fill: 0xFFECB3,
+      });
+      val.anchor.set(0.5);
+      val.x = startX; val.y = _pillH * 0.14;
+      val.alpha = startAlpha;
+      cont.addChild(val);
+      return { lbl, val };
+    }
+
+    const L = half(COLLAPSED_LEFT_CX,  leftLabel,  leftValue,  leftAccent  || 0xD4A017, 1);
+    const R = half(EXPANDED_RIGHT_CX,  rightLabel, rightValue, rightAccent || 0xD4A017, 0);
+
+    // Greeting message shown in place of "WIN 0" when the win value is 0.
+    // Starts hidden; the WIN label+value show by default. updateWinText()
+    // toggles between the two modes.
+    const greeting = new PIXI.Text('Good luck!', {
+      fontFamily: FONT,
+      fontSize: Math.max(18, 28 * gameScale),
+      fill: 0xFFECB3,
+      letterSpacing: 0.5,
+    });
+    greeting.anchor.set(0.5);
+    greeting.x = 0;
+    greeting.y = 0;
+    greeting.alpha = 0;
+    cont.addChild(greeting);
+
+    cont.leftLabel    = L.lbl;  cont.leftValText  = L.val;
+    cont.rightLabel   = R.lbl;  cont.rightValText = R.val;
+    cont.divider      = divider;
+    cont.greeting     = greeting;
+    cont.isExpanded   = false;
+
+    cont.expand = () => {
+      if (cont.isExpanded) return;
+      cont.isExpanded = true;
+      const dur = T(0.40);
+      gsap.to(L.lbl, { x: EXPANDED_LEFT_CX, duration: dur, ease: 'power2.out' });
+      gsap.to(L.val, { x: EXPANDED_LEFT_CX, duration: dur, ease: 'power2.out' });
+      gsap.to(divider, { alpha: 1, duration: T(0.30), ease: 'power2.out' });
+      // Right half: fade in with a tiny slide from further right for zing
+      gsap.fromTo(R.lbl,
+        { x: EXPANDED_RIGHT_CX + pw * 0.08, alpha: 0 },
+        { x: EXPANDED_RIGHT_CX, alpha: 1, duration: dur, delay: T(0.10), ease: 'back.out(1.6)' });
+      gsap.fromTo(R.val,
+        { x: EXPANDED_RIGHT_CX + pw * 0.08, alpha: 0 },
+        { x: EXPANDED_RIGHT_CX, alpha: 1, duration: dur, delay: T(0.10), ease: 'back.out(1.6)' });
+    };
+
+    cont.collapse = () => {
+      if (!cont.isExpanded) return;
+      cont.isExpanded = false;
+      const dur = T(0.35);
+      gsap.to(L.lbl, { x: COLLAPSED_LEFT_CX, duration: dur, ease: 'power2.out' });
+      gsap.to(L.val, { x: COLLAPSED_LEFT_CX, duration: dur, ease: 'power2.out' });
+      gsap.to(divider, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
+      gsap.to(R.lbl, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
+      gsap.to(R.val, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
+      // Once the pill has settled into the centred WIN-only layout, swap
+      // back to the "Good luck!" greeting if the current win is 0.
+      gsap.delayedCall(dur, () => {
+        if ((player.displayedWin || 0) <= 0) setGreetingVisible(true, true);
+      });
+    };
+
     return cont;
   }
 
@@ -2379,14 +2610,16 @@ function buildScene(L) {
   scene.betPlusBtn.y = pillsCenterY;
   app.stage.addChild(scene.betPlusBtn);
 
-  scene.winPill = makePill({
+  scene.winPill = makeSplitPill({
     x: winCX,
     y: pillsCenterY,
-    label: 'WIN',
-    value: fmtCurrency(0),
-    accent: 0x7FE080,
     width: _winPillW,
-    valueFontSize: Math.max(22, 34 * gameScale), // bigger, more prominent
+    leftLabel:  'WIN',
+    leftValue:  fmtCurrency(0),
+    leftAccent: 0x7FE080,        // green for the win side
+    rightLabel: 'MULTIPLIER',
+    rightValue: '1\u00D7',
+    rightAccent: 0xFFD700,       // gold for the multiplier side
   });
   app.stage.addChild(scene.winPill);
 
@@ -2403,10 +2636,11 @@ function buildScene(L) {
   app.stage.addChild(scene.rtpText);
 
   // ─── SPIN BUTTON ───────────────────────────────────────────────────────────
-  // Single asset (spin_button.png, 540×538). No text overlay, just the sprite.
-  const btnTargetSize = 130 * gameScale;
-  const btnX = L.sw / 2;
-  const btnY = pillsCenterY + _pillH / 2 + btnTargetSize / 2 + 12 * gameScale;
+  // In the same horizontal row as the UI pills, on the LEFT end. Its bottom
+  // aligns with the pill bottom; since the button is taller than the pills it
+  // extends upward into the holder gap.
+  const btnX = spinCX;
+  const btnY = pillsCenterY + _pillH / 2 - btnTargetSize / 2;
 
   const btn = new PIXI.Sprite(spinButtonTexture);
   btn.anchor.set(0.5);
@@ -2484,6 +2718,13 @@ function buildScene(L) {
   updateBetText();
   updateRtpText();
   updateSpinButtonState();
+
+  // Lift the FX layer to the top of the z-stack so in-flight petals, pot
+  // flights to the multiplier, and other effects always render above every
+  // UI element (pills, spin button, etc.).
+  if (scene.fxLayer && scene.fxLayer.parent === app.stage) {
+    app.stage.setChildIndex(scene.fxLayer, app.stage.children.length - 1);
+  }
 }
 
 // ─── UI HELPERS ──────────────────────────────────────────────────────────────
@@ -2512,21 +2753,25 @@ function tweenCount(textObj, fromVal, toVal, duration = 0.6, formatter = fmtCurr
 }
 
 function updateMultiplierBar(mult) {
+  const prev = uiState.multiplier;
   uiState.multiplier = mult;
-  if (scene.multiplierText) scene.multiplierText.text = `${mult}\u00D7`;
-  if (!scene.multiplierFill || !scene.multiplierMask) return;
-  const empties = Math.max(0, (mult - 1) / 2);
-  const frac = Math.min(1, empties / uiState.multBarMaxEmpties);
-  const barX = scene.multiplier.x - scene.multiplier.width / 2;
-  const barY = scene.multiplier.y;
-  const barW = scene.multiplier.width;
-  const barH = scene.multiplier.height;
-  const fillH = barH * frac;
-  const m = scene.multiplierMask;
-  m.clear();
-  m.beginFill(0xFFFFFF);
-  m.drawRect(barX, barY + barH - fillH, barW, fillH);
-  m.endFill();
+  if (!scene.winPill) return;
+
+  const wasBaseline = prev <= 1;
+  const isBaseline  = mult <= 1;
+
+  if (scene.winPill.rightValText) {
+    scene.winPill.rightValText.text = isBaseline ? '' : `${mult}\u00D7`;
+  }
+
+  if (wasBaseline && !isBaseline && scene.winPill.expand) {
+    // Multiplier just activated — expand the pill AND drop the greeting.
+    // The player should see WIN (even if still 0) alongside the multiplier.
+    scene.winPill.expand();
+    setGreetingVisible(false, true);
+  } else if (!wasBaseline && isBaseline && scene.winPill.collapse) {
+    scene.winPill.collapse();
+  }
 }
 
 function updateBalanceText(animateFrom) {
@@ -2544,13 +2789,46 @@ function updateBetText() {
   scene.betPill.valText.text = fmtCurrency(player.bet);
 }
 
+// Toggle between "Good luck!" greeting mode and WIN label/value mode.
+function setGreetingVisible(visible, animate = true) {
+  if (!scene.winPill) return;
+  const greet   = scene.winPill.greeting;
+  const label   = scene.winPill.leftLabel;
+  const valText = scene.winPill.leftValText;
+  const dur = animate ? 0.2 : 0;
+  if (greet)   gsap.to(greet,   { alpha: visible ? 1 : 0, duration: dur });
+  if (label)   gsap.to(label,   { alpha: visible ? 0 : 1, duration: dur });
+  if (valText) gsap.to(valText, { alpha: visible ? 0 : 1, duration: dur });
+}
+
 function updateWinText(n, animate = false) {
   if (!scene.winPill) return;
-  const t = scene.winPill.valText;
+  const valText = scene.winPill.leftValText;
+  if (!valText) return;
+
+  if (n <= 0) {
+    // Zero win: default to greeting mode UNLESS a multiplier is active (in
+    // which case the panel stays in WIN mode so the multiplier side can show).
+    const multActive = uiState.multiplier > 1;
+    // Only kill the count-up tween (if any). DO NOT killTweensOf(valText) —
+    // that would also cancel the x-slide from expand(), leaving the value
+    // pinned in the centre while the WIN label moves to the left half.
+    if (valText._countTween) { valText._countTween.kill(); valText._countTween = null; }
+    // Use a simple dash placeholder instead of "0" when showing the WIN label
+    // alongside an active multiplier — feels less like a literal zero score.
+    valText.text = multActive ? '-' : fmtCurrency(0);
+    setGreetingVisible(!multActive, animate);
+    player.displayedWin = 0;
+    return;
+  }
+
+  // Non-zero win: hide greeting, show WIN label + value.
+  setGreetingVisible(false, animate);
+
   if (animate) {
-    tweenCount(t, player.displayedWin, n, 0.5);
+    tweenCount(valText, player.displayedWin || 0, n, 0.5);
   } else {
-    t.text = fmtCurrency(n);
+    valText.text = fmtCurrency(n);
   }
   player.displayedWin = n;
 }
@@ -2583,10 +2861,107 @@ function flashInsufficientBalance() {
   tl.to(cont.scale, { x: 1.05, y: 1.05, duration: 0.08, yoyo: true, repeat: 3, ease: 'sine.inOut' });
 }
 
-// Big-win celebration: scale pulse on the WIN pill.
+// Multiplication reveal: a big × mark appears in the middle of the Win pill;
+// the WIN value slides in from the left and the MULTIPLIER value from the
+// right; they converge on the × which then bursts and vanishes; the WIN
+// value then counts up from `baseWin` to `finalWin`. Returns a promise that
+// resolves when the count-up completes.
+function animateMultiplication(baseWin, finalWin) {
+  return new Promise(resolve => {
+    const winPill = scene.winPill;
+    if (!winPill || !winPill.leftValText || !winPill.rightValText) {
+      resolve();
+      return;
+    }
+    const winVal    = winPill.leftValText;
+    const multVal   = winPill.rightValText;
+    const multLabel = winPill.rightLabel;
+    const divider   = winPill.divider;
+
+    // Kill any in-flight count-up on the win value so we control it here.
+    if (winVal._countTween) { winVal._countTween.kill(); winVal._countTween = null; }
+
+    // × mark at the pill's value-row Y.
+    const gs = currentGameScale;
+    const xMark = new PIXI.Text('\u00D7', {
+      fontFamily: FONT,
+      fontSize: Math.max(30, 56 * gs),
+      fill: 0xFFD700,
+      stroke: 0x3D1C02,
+      strokeThickness: 4 * gs,
+    });
+    xMark.anchor.set(0.5);
+    xMark.x = 0;
+    xMark.y = winVal.y;
+    xMark.alpha = 0;
+    xMark.scale.set(0.25);
+    winPill.addChild(xMark);
+
+    // One timeline for the visual choreography — but the promise's resolution
+    // is driven by an explicit setTimeout so a quirk in timeline duration
+    // computation (e.g. no-op trailing tween getting dropped) never hangs us.
+    const tl = gsap.timeline();
+    const winLabel = winPill.leftLabel;
+
+    // WIN + MULT slide to centre — BOTH the label ("WIN" / "MULTIPLIER")
+    // and the value move together so each pair reads as one unit.
+    tl.to(winVal,     { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(winLabel,   { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(multVal,    { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(multLabel,  { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
+    // × materialises in parallel
+    tl.to(xMark,       { alpha: 1,       duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(xMark.scale, { x: 1.3, y: 1.3, duration: 0.36, ease: 'back.out(2.2)' }, 0);
+    // Hold at centre for a beat so the "× collision" reads, then burst
+    tl.to(xMark.scale, { x: 2.6, y: 2.6, duration: 0.28, ease: 'power2.out' }, 0.60);
+    tl.to(xMark,       { alpha: 0,       duration: 0.28, ease: 'power2.out' }, 0.60);
+    // MULT side is consumed; WIN label stays visible (we keep the WIN text).
+    tl.to(multVal,     { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
+    tl.to(multLabel,   { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
+    tl.to(divider,     { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
+
+    // Count-up starts AFTER WIN has been centred (0.28s) and the burst has
+    // cleared (0.88s). Small extra buffer avoids overlap.
+    const COUNTUP_START_MS = 950;
+    const COUNTUP_MS       = 750;
+    const BUFFER_MS        = 150;
+
+    setTimeout(() => {
+      if (winPill.leftValText) {
+        tweenCount(winVal, baseWin, finalWin, COUNTUP_MS / 1000);
+        player.displayedWin = finalWin;
+        // Synchronised scale pulse: the value swells while it counts up, then
+        // elastically settles on the target when the count finishes.
+        gsap.killTweensOf(winVal.scale);
+        const countSec = COUNTUP_MS / 1000;
+        gsap.timeline()
+          .to(winVal.scale, {
+            x: 1.55, y: 1.55,
+            duration: countSec * 0.55,
+            ease: 'power2.out',
+          })
+          .to(winVal.scale, {
+            x: 1, y: 1,
+            duration: countSec * 0.55,
+            ease: 'elastic.out(1, 0.35)',
+          });
+      }
+    }, COUNTUP_START_MS);
+
+    // Resolve unconditionally after count-up + small buffer so onEnd always
+    // proceeds (no hang if the timeline auto-finalizes earlier).
+    setTimeout(() => {
+      if (xMark && !xMark.destroyed) xMark.destroy();
+      resolve();
+    }, COUNTUP_START_MS + COUNTUP_MS + BUFFER_MS);
+  });
+}
+
+// Big-win celebration: scale pulse on the WIN half of the Win/Mult pill.
 function pulseWinPill() {
   if (!scene.winPill) return;
-  const t = scene.winPill.valText;
+  const t = scene.winPill.leftValText;
+  if (!t) return;
   gsap.fromTo(t.scale,
     { x: 1.4, y: 1.4 },
     { x: 1, y: 1, duration: 0.6, ease: 'elastic.out(1, 0.4)' }
@@ -2612,13 +2987,13 @@ function openPaytableModal(L) {
   backdrop.on('pointertap', (e) => { if (e.target === backdrop) closePaytableModal(); });
   modal.addChild(backdrop);
 
-  // Panel sizing: responsive, capped for very large screens
+  // Responsive scaling for inner content
   const scale = Math.min(1, Math.min(L.sw / 900, L.sh / 900));
   const cardW   = 260 * scale;
   const cardH   = 120 * scale;
   const cardGap = 12  * scale;
   const panelPadX = 32 * scale;
-  const panelPadTop = 70 * scale;
+  const panelPadTop = 100 * scale;   // extra room for tab bar
   const panelPadBottom = 40 * scale;
   const gridW = cardW * 2 + cardGap;
   const panelW = gridW + panelPadX * 2;
@@ -2633,17 +3008,14 @@ function openPaytableModal(L) {
   panel.beginFill(0xFFF4D6, 0.98);
   panel.drawRoundedRect(panelX, panelY, panelW, panelH, 26 * scale);
   panel.endFill();
-  // Subtle inner lip
   panel.lineStyle(1 * scale, 0xE8C898, 0.7);
   panel.drawRoundedRect(panelX + 6 * scale, panelY + 6 * scale, panelW - 12 * scale, panelH - 12 * scale, 22 * scale);
-  // Absorb pointer events so clicks inside the panel don't reach the backdrop
-  // (which would close the modal).
   panel.eventMode = 'static';
   panel.hitArea = new PIXI.Rectangle(panelX, panelY, panelW, panelH);
   modal.addChild(panel);
 
   // Title
-  const title = new PIXI.Text('Paytable', {
+  const title = new PIXI.Text('Bloom Sort', {
     fontFamily: FONT,
     fontSize: 30 * scale,
     fill: 0x3D1C02,
@@ -2652,18 +3024,6 @@ function openPaytableModal(L) {
   title.x = panelX + panelW / 2;
   title.y = panelY + 28 * scale;
   modal.addChild(title);
-
-  // Subtitle: mention current bet context
-  const sub = new PIXI.Text(`Coins paid per Full Bloom (bet ${player.bet})`, {
-    fontFamily: FONT,
-    fontSize: 12 * scale,
-    fill: 0x9C6A1A,
-    letterSpacing: 1,
-  });
-  sub.anchor.set(0.5);
-  sub.x = panelX + panelW / 2;
-  sub.y = panelY + 50 * scale;
-  modal.addChild(sub);
 
   // Close button (×) top-right
   const closeBtn = new PIXI.Container();
@@ -2679,9 +3039,13 @@ function openPaytableModal(L) {
   drawClose(false);
   closeBtn.addChild(closeBg);
   const closeX = new PIXI.Text('\u00D7', {
-    fontFamily: FONT, fontSize: closeR * 1.5, fill: 0xFFFFFF,
+    fontFamily: 'Arial, sans-serif',
+    fontWeight: 'bold',
+    fontSize: closeR * 1.7,
+    fill: 0xFFFFFF,
   });
   closeX.anchor.set(0.5);
+  closeX.y = 0;
   closeBtn.addChild(closeX);
   closeBtn.x = panelX + panelW - 28 * scale;
   closeBtn.y = panelY + 30 * scale;
@@ -2693,7 +3057,82 @@ function openPaytableModal(L) {
   closeBtn.on('pointertap', () => closePaytableModal());
   modal.addChild(closeBtn);
 
-  // Flower cards — sorted by basePay descending (rarest first)
+  // ─── Tab bar ─────────────────────────────────────────────────────────────
+  const tabs = [
+    { key: 'paytable', label: 'Paytable' },
+    { key: 'rules',    label: 'Rules' },
+  ];
+  const tabBarY = panelY + 62 * scale;
+  const tabW    = 140 * scale;
+  const tabH    = 34  * scale;
+  const tabGap  = 10  * scale;
+  const tabsTotalW = tabs.length * tabW + (tabs.length - 1) * tabGap;
+  const tabsStartX = panelX + (panelW - tabsTotalW) / 2;
+
+  const tabSprites = [];
+  tabs.forEach((tab, idx) => {
+    const t = new PIXI.Container();
+    const tx = tabsStartX + idx * (tabW + tabGap) + tabW / 2;
+    t.x = tx;
+    t.y = tabBarY;
+
+    const bg = new PIXI.Graphics();
+    const draw = (active, hover) => {
+      bg.clear();
+      bg.lineStyle(2 * scale, 0xC08050, 1);
+      bg.beginFill(active ? 0xFFE0A0 : (hover ? 0xF3DFB8 : 0xFFF8E6), 1);
+      bg.drawRoundedRect(-tabW / 2, -tabH / 2, tabW, tabH, tabH * 0.4);
+      bg.endFill();
+    };
+    draw(idx === 0, false);
+    t.addChild(bg);
+
+    const lbl = new PIXI.Text(tab.label, {
+      fontFamily: FONT, fontSize: 16 * scale,
+      fill: idx === 0 ? 0x3D1C02 : 0x7C5332,
+    });
+    lbl.anchor.set(0.5);
+    t.addChild(lbl);
+
+    t.eventMode = 'static';
+    t.cursor = 'pointer';
+    t.hitArea = new PIXI.RoundedRectangle(-tabW / 2, -tabH / 2, tabW, tabH, tabH * 0.4);
+    t.on('pointerover', () => { if (!t.isActive) draw(false, true); });
+    t.on('pointerout',  () => { if (!t.isActive) draw(false, false); });
+    t.on('pointertap',  () => setActiveTab(idx));
+
+    t.isActive = (idx === 0);
+    t.draw = draw;
+    t.label = lbl;
+    t.key = tab.key;
+    tabSprites.push(t);
+    modal.addChild(t);
+  });
+
+  function setActiveTab(activeIdx) {
+    tabSprites.forEach((t, i) => {
+      const active = (i === activeIdx);
+      t.isActive = active;
+      t.draw(active, false);
+      t.label.style.fill = active ? 0x3D1C02 : 0x7C5332;
+    });
+    // Show / hide content containers
+    if (paytableContent) paytableContent.visible = (tabSprites[activeIdx].key === 'paytable');
+    if (rulesContent)    rulesContent.visible    = (tabSprites[activeIdx].key === 'rules');
+  }
+
+  // ─── Paytable content ────────────────────────────────────────────────────
+  const paytableContent = new PIXI.Container();
+  modal.addChild(paytableContent);
+
+  const sub = new PIXI.Text(`Coins paid per Full Bloom (bet ${player.bet})`, {
+    fontFamily: FONT, fontSize: 12 * scale, fill: 0x9C6A1A, letterSpacing: 1,
+  });
+  sub.anchor.set(0.5);
+  sub.x = panelX + panelW / 2;
+  sub.y = panelY + 88 * scale;
+  paytableContent.addChild(sub);
+
   const sortedColors = [...GAME.COLORS].sort((a, b) => b.basePay - a.basePay);
   const gridX = panelX + panelPadX;
   const gridY = panelY + panelPadTop;
@@ -2712,47 +3151,104 @@ function openPaytableModal(L) {
     card.beginFill(isTop ? 0xFFF9D6 : 0xFFFBF0, 1);
     card.drawRoundedRect(cx, cy, cardW, cardH, 14 * scale);
     card.endFill();
-    modal.addChild(card);
+    paytableContent.addChild(card);
 
-    // Flower preview — fully bloomed (8 petals) so the pay is visually obvious
     const preview = new FlowerSymbol(color.name, 8, flowerPreviewCell);
     preview.x = cx + cardH / 2;
     preview.y = cy + cardH / 2;
-    modal.addChild(preview);
+    paytableContent.addChild(preview);
 
-    // Color name
     const name = new PIXI.Text(color.name, {
-      fontFamily: FONT,
-      fontSize: 22 * scale,
-      fill: 0x3D1C02,
+      fontFamily: FONT, fontSize: 22 * scale, fill: 0x3D1C02,
     });
     name.x = cx + cardH + 4 * scale;
     name.y = cy + 18 * scale;
-    modal.addChild(name);
+    paytableContent.addChild(name);
 
-    // Coin value — basePay × bet, in game coins
-    const coinVal = color.basePay * player.bet;
+    const coinVal = color.basePay * GAME.PAY_MULTIPLIER * player.bet;
     const pay = new PIXI.Text(`+${fmtCurrency(coinVal)}`, {
-      fontFamily: FONT,
-      fontSize: 28 * scale,
+      fontFamily: FONT, fontSize: 28 * scale,
       fill: isTop ? 0xD4A017 : 0xE65C00,
-      stroke: 0x3D1C02,
-      strokeThickness: 3 * scale,
+      stroke: 0x3D1C02, strokeThickness: 3 * scale,
     });
     pay.x = cx + cardH + 4 * scale;
     pay.y = cy + cardH * 0.48;
-    modal.addChild(pay);
+    paytableContent.addChild(pay);
 
-    // Small caption under coin value
-    const cap = new PIXI.Text(`base pay ${color.basePay} × bet`, {
+    const cap = new PIXI.Text(
+      `base ${color.basePay} × ${GAME.PAY_MULTIPLIER} × bet`,
+      { fontFamily: FONT, fontSize: 11 * scale, fill: 0x9C6A1A }
+    );
+    cap.x = cx + cardH + 4 * scale;
+    cap.y = cy + cardH * 0.82;
+    paytableContent.addChild(cap);
+  }
+
+  // ─── Rules content ───────────────────────────────────────────────────────
+  const rulesContent = new PIXI.Container();
+  rulesContent.visible = false;
+  modal.addChild(rulesContent);
+
+  const rulesHeader = new PIXI.Text('How to Play', {
+    fontFamily: FONT, fontSize: 20 * scale, fill: 0x3D1C02,
+  });
+  rulesHeader.anchor.set(0.5);
+  rulesHeader.x = panelX + panelW / 2;
+  rulesHeader.y = panelY + 102 * scale;
+  rulesContent.addChild(rulesHeader);
+
+  const rulesText =
+`The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Each flower has a colour and starts with 1 – 4 petals.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• When a flower reaches 8 petals, it blooms and dissolves.
+• A Full Bloom pays its colour's base value × bet.
+
+Empty Dissolve
+• When a flower gives away all its petals, it dissolves.
+• Each Empty Dissolve adds +2× to the spin multiplier.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers.
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms or empties keep happening.
+
+Final Win
+• Final Win  =  Total Payout × Multiplier
+• Total Payout is the sum of every Full Bloom paid during the spin.`;
+
+  const rulesBody = new PIXI.Text(rulesText, {
+    fontFamily: 'Arial, sans-serif',
+    fontSize: 13 * scale,
+    fill: 0x3D1C02,
+    lineHeight: 18 * scale,
+    wordWrap: true,
+    wordWrapWidth: panelW - panelPadX * 2 - 20 * scale,
+  });
+  rulesBody.x = panelX + panelPadX + 10 * scale;
+  rulesBody.y = panelY + 130 * scale;
+  rulesContent.addChild(rulesBody);
+
+  // Tripwire values (colour weights etc.) for power users
+  const rulesFoot = new PIXI.Text(
+    'Colour weights & base pays are shown in the Paytable tab.',
+    {
       fontFamily: FONT,
       fontSize: 11 * scale,
       fill: 0x9C6A1A,
-    });
-    cap.x = cx + cardH + 4 * scale;
-    cap.y = cy + cardH * 0.82;
-    modal.addChild(cap);
-  }
+    }
+  );
+  rulesFoot.anchor.set(0.5);
+  rulesFoot.x = panelX + panelW / 2;
+  rulesFoot.y = panelY + panelH - 28 * scale;
+  rulesContent.addChild(rulesFoot);
 
   modal.alpha = 0;
   app.stage.addChild(modal);
@@ -2803,30 +3299,54 @@ async function onSpinClick() {
   animator.onProgress = (ev) => {
     if (ev.type === 'dissolve') {
       updateMultiplierBar(ev.multiplier);
-      // Live running win = payout × multiplier × bet. Since multiplier is
-      // currently disabled it stays at 1, so running win = payoutTotal × bet.
-      const runningWin = ev.payoutTotal * ev.multiplier * bet;
+      // Running win during the cascade is PRE-MULTIPLIER (just payout × bet).
+      // The multiplier is applied visually at the end of the spin.
+      const runningWin = ev.payoutTotal * bet;
       updateWinText(runningWin, true);
     }
   };
 
-  animator.onEnd = (finalResult) => {
-    // Commit the final win (payout × multiplier)
-    updateWinText(finalResult.finalWin, true);
+  animator.onEnd = async (finalResult) => {
+    try {
+      const mult = finalResult.multiplier;
+      const baseWin = finalResult.totalPayout * bet;   // pre-multiplier
+      const finalWin = finalResult.finalWin;           // post-multiplier
 
-    // 4. Credit winnings to balance (count-up from pre-credit to post-credit)
-    if (finalResult.finalWin > 0) {
-      const preCreditBal = player.balance;
-      player.balance += finalResult.finalWin;
-      updateBalanceText(preCreditBal);
-      // Extra celebration for wins > bet (nontrivial hit)
-      if (finalResult.finalWin >= bet) pulseWinPill();
+      if (finalWin > 0) {
+        const preCreditBal = player.balance;
+        player.balance += finalWin;
+        updateBalanceText(preCreditBal);
+      }
+
+      updateRtpText();
+      currentGrid = finalResult.finalGrid;
+
+      // Only run the × multiplication reveal if there's actually a win to
+      // multiply. When the spin ended with a multiplier but 0 payout, skip
+      // the animation — just gracefully slide the panel closed leaving
+      // "WIN 0" centred.
+      if (mult > 1 && finalWin > 0) {
+        await animateMultiplication(baseWin, finalWin);
+        if (finalWin >= bet) pulseWinPill();
+        if (scene.winPill && scene.winPill.collapse) scene.winPill.collapse();
+      } else {
+        updateWinText(finalWin, true);
+        if (finalWin > 0 && finalWin >= bet) pulseWinPill();
+        // Close the multiplier half (if it opened during the cascade) and
+        // leave only WIN with its final (0 or otherwise) value centered.
+        if (scene.winPill && scene.winPill.collapse) scene.winPill.collapse();
+      }
+      uiState.multiplier = 1;
+    } finally {
+      // Always re-enable the spin button, even if something threw above.
+      // The error (if any) still propagates to the console.
+      setTimeout(() => {
+        if (scene.spinButton) {
+          scene.spinButton._setBusy(false);
+          updateSpinButtonState();
+        }
+      }, 200);
     }
-
-    updateRtpText();
-    currentGrid = finalResult.finalGrid;
-    scene.spinButton._setBusy(false);
-    updateSpinButtonState();
   };
 
   await animator.play(result);
