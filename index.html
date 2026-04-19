@@ -21,7 +21,6 @@
 await document.fonts.load('32px "Fredoka One"');
 
 // Load textures
-const bgTexture           = await PIXI.Assets.load('assets/canvas_bg.jpg');
 const logoTexture         = await PIXI.Assets.load('assets/gameLogo.png');
 const frameTexture        = await PIXI.Assets.load('assets/frame.png');
 
@@ -49,9 +48,16 @@ await Promise.all(Object.entries(PETAL_FILE_BY_COLOR).map(async ([colorName, fil
 //   • i.i.d. weighted random for colour + starting petals (per spec)
 //   • Transfer pass: right first, then down, 1 petal per cell, simultaneous
 //     writes via a copy of the grid (copy rule)
-//   • Dissolves: petals ≥ MAX → Full Bloom (base pay), = 0 → Empty (+2× mult)
+//   • Dissolves: petals ≥ MAX → Full Bloom (base pay), = 0 → Empty (grows mult)
 //   • Cascades: gravity + refill + re-transfer until no dissolves
 //   • Final win = total payout × multiplier (mult starts at 1)
+//   • Multiplier tiers by running empty-dissolve count:
+//       0 empties → 1× (baseline, hidden)
+//       1 empty  → 2×
+//       3        → 3×
+//       6        → 5×
+//       10       → 10×
+//       +5 empties per +5× thereafter (15→15×, 20→20×, …)
 //
 // Every step appends a typed event to an events array so the view layer can
 // replay the spin as an animation sequence.
@@ -64,22 +70,35 @@ const GAME = {
   MAX_TRANSFER_PASSES: 50,
   MAX_CASCADES: 100,
 
-  // Empty dissolves contribute +2× each to the running spin multiplier.
+  // Empty dissolves grow the spin multiplier along a fixed tier ladder —
+  // see multForEmpties() below for the schedule.
   MULTIPLIER_ENABLED: true,
 
-  // Global payout knob. Every Full Bloom's coins are scaled by this before
-  // multiplier + bet are applied. Lower = tighter payouts (lower RTP).
-  PAY_MULTIPLIER: 0.25,
+  // Multiplier tier ladder keyed on the cumulative empty-dissolve count.
+  // Each entry = { at: emptiesRequired, mult: multiplierAtThatPoint }.
+  // Beyond the last explicit tier, every MULT_TIER_STEP_EMPTIES empties
+  // adds MULT_TIER_STEP_MULT× more.
+  MULT_TIERS: [
+    { at: 0,  mult: 1  },
+    { at: 1,  mult: 2  },
+    { at: 3,  mult: 3  },
+    { at: 6,  mult: 5  },
+    { at: 10, mult: 10 },
+  ],
+  MULT_TIER_STEP_EMPTIES: 5,
+  MULT_TIER_STEP_MULT:    5,
 
+  // basePay is the actual coins-per-bet-unit a Full Bloom pays out. Tune
+  // RTP by editing these values directly — no global multiplier in between.
   COLORS: [
-    { name: 'Scarlet', weight: 5,  basePay: 10, hex: '#D50000' },
-    { name: 'Indigo',  weight: 7,  basePay: 8,  hex: '#304FFE' },
-    { name: 'Magenta', weight: 9,  basePay: 6,  hex: '#C2185B' },
-    { name: 'Gold',    weight: 11, basePay: 6,  hex: '#FF6F00' },
-    { name: 'Teal',    weight: 13, basePay: 4,  hex: '#00796B' },
-    { name: 'Lime',    weight: 15, basePay: 3,  hex: '#558B2F' },
-    { name: 'Sky',     weight: 17, basePay: 2,  hex: '#0277BD' },
-    { name: 'Pearl',   weight: 20, basePay: 1,  hex: '#78909C' },
+    { name: 'Scarlet', weight: 5,  basePay: 2.5,  hex: '#D50000' },
+    { name: 'Indigo',  weight: 7,  basePay: 2,    hex: '#304FFE' },
+    { name: 'Magenta', weight: 9,  basePay: 1.5,  hex: '#C2185B' },
+    { name: 'Gold',    weight: 11, basePay: 1.5,  hex: '#FF6F00' },
+    { name: 'Teal',    weight: 13, basePay: 1,    hex: '#00796B' },
+    { name: 'Lime',    weight: 15, basePay: 0.75, hex: '#558B2F' },
+    { name: 'Sky',     weight: 17, basePay: 0.5,  hex: '#0277BD' },
+    { name: 'Pearl',   weight: 20, basePay: 0.25, hex: '#78909C' },
   ],
 
   PETAL_WEIGHTS: [
@@ -120,6 +139,59 @@ function spawnCell() {
   return {
     color: weightedPick(GAME.COLORS).name,
     petals: weightedPick(GAME.PETAL_WEIGHTS).count,
+  };
+}
+
+// Multiplier as a function of cumulative empty dissolves this spin. The curve
+// is a stepped ladder (GAME.MULT_TIERS) plus a linear tail: after the last
+// named tier, every GAME.MULT_TIER_STEP_EMPTIES empties adds another
+// GAME.MULT_TIER_STEP_MULT×.
+function multForEmpties(n) {
+  if (n <= 0) return 1;
+  const tiers = GAME.MULT_TIERS;
+  const last  = tiers[tiers.length - 1];
+  if (n >= last.at) {
+    const extra = Math.floor((n - last.at) / GAME.MULT_TIER_STEP_EMPTIES);
+    return last.mult + extra * GAME.MULT_TIER_STEP_MULT;
+  }
+  // n is somewhere between two named tiers — return the lower one's mult.
+  let m = tiers[0].mult;
+  for (const t of tiers) {
+    if (n >= t.at) m = t.mult; else break;
+  }
+  return m;
+}
+
+// Progress toward the NEXT multiplier tier, given a cumulative empty count.
+// Returns { mult, nextMult, progress, lowerAt, upperAt }. When the ladder has
+// been exhausted (past the last named tier), "next" uses the linear step.
+function multTierProgress(n) {
+  const tiers = GAME.MULT_TIERS;
+  const last  = tiers[tiers.length - 1];
+  let lowerAt, upperAt;
+  if (n >= last.at) {
+    const k = Math.floor((n - last.at) / GAME.MULT_TIER_STEP_EMPTIES);
+    lowerAt = last.at + k * GAME.MULT_TIER_STEP_EMPTIES;
+    upperAt = lowerAt + GAME.MULT_TIER_STEP_EMPTIES;
+  } else {
+    // Find the pair of tiers straddling n.
+    lowerAt = tiers[0].at;
+    upperAt = tiers[1].at;
+    for (let i = 0; i < tiers.length - 1; i++) {
+      if (n >= tiers[i].at && n < tiers[i + 1].at) {
+        lowerAt = tiers[i].at;
+        upperAt = tiers[i + 1].at;
+        break;
+      }
+    }
+  }
+  const span = upperAt - lowerAt;
+  const progress = span > 0 ? Math.min(1, Math.max(0, (n - lowerAt) / span)) : 0;
+  return {
+    mult:     multForEmpties(n),
+    nextMult: multForEmpties(upperAt),
+    progress,
+    lowerAt, upperAt,
   };
 }
 
@@ -312,13 +384,42 @@ function runSpin(bet = 1) {
   let grid = generateGrid();
   events.push({ type: 'spawn', grid: cloneGrid(grid) });
 
-  let totalPayout = 0;
-  let multiplier  = 1;
+  let totalPayout  = 0;
+  let emptyCount   = 0;   // cumulative empty dissolves — drives multiplier tier
+  let multiplier   = 1;
   let cascadeCount = 0;
 
   for (let cas = 0; cas < GAME.MAX_CASCADES; cas++) {
     // 1. Transfers until stable
     const { finalGrid, passes } = runTransfers(grid);
+
+    // Annotate each pass with `newEmpties` — cells that FIRST become empty
+    // (petals=0) in that pass and STAY empty through the rest of the cascade.
+    // Animator uses this to launch empty-dissolve flights the moment the pot
+    // visibly empties, rather than waiting for the dissolve step. A flower
+    // can theoretically bounce back (0 → receives a petal → 1), so we only
+    // commit cells that remain 0 in every subsequent pass's gridAfter.
+    for (const p of passes) p.newEmpties = [];
+    if (passes.length > 0) {
+      // Final-state empties are the source of truth — anything not 0 at the
+      // end of transfers won't be empty-dissolved, regardless of interim state.
+      for (let r = 0; r < GAME.ROWS; r++) {
+        for (let c = 0; c < GAME.COLS; c++) {
+          const finalCell = finalGrid[r][c];
+          if (!finalCell || finalCell.petals !== 0) continue;
+          // Walk backwards from the last pass, keeping track of the earliest
+          // pass for which gridAfter[r][c] was 0 consecutively through end.
+          let commitIdx = passes.length - 1;
+          for (let i = passes.length - 1; i >= 0; i--) {
+            const cell = passes[i].gridAfter[r][c];
+            if (cell && cell.petals === 0) commitIdx = i;
+            else break;
+          }
+          passes[commitIdx].newEmpties.push({ r, c, color: finalCell.color });
+        }
+      }
+    }
+
     for (const p of passes) {
       events.push({
         type: 'transferPass',
@@ -326,6 +427,7 @@ function runSpin(bet = 1) {
         passIndex: p.passIndex,
         moves: p.moves,
         gridAfter: p.gridAfter,
+        newEmpties: p.newEmpties,
       });
     }
     grid = finalGrid;
@@ -334,10 +436,16 @@ function runSpin(bet = 1) {
     const { fullBlooms, emptyDissolves } = findDissolves(grid);
     if (fullBlooms.length === 0 && emptyDissolves.length === 0) break;
 
-    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay * GAME.PAY_MULTIPLIER, 0);
-    const multDelta   = GAME.MULTIPLIER_ENABLED ? emptyDissolves.length * 2 : 0;
+    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay, 0);
+
+    const emptyCountBefore = emptyCount;
+    emptyCount += emptyDissolves.length;
+
+    const multBefore = multiplier;
+    multiplier = GAME.MULTIPLIER_ENABLED ? multForEmpties(emptyCount) : 1;
+    const multDelta = multiplier - multBefore;
+
     totalPayout += payoutDelta;
-    multiplier  += multDelta;
     cascadeCount++;
 
     events.push({
@@ -347,8 +455,10 @@ function runSpin(bet = 1) {
       emptyDissolves: emptyDissolves.map(x => ({ ...x })),
       payoutDelta,
       multDelta,
-      payoutTotal: totalPayout,
+      payoutTotal:      totalPayout,
       multiplier,
+      emptyCountBefore,
+      emptyCount,       // cumulative empties AFTER this dissolve
     });
 
     applyDissolves(grid, fullBlooms, emptyDissolves);
@@ -598,10 +708,10 @@ function runTests() {
     resetRng();
   });
 
-  // ── 12. Multiplier arithmetic: starts at 1, +2 per empty ──────────────────
+  // ── 12. Multiplier tier ladder from cumulative empty dissolves ────────────
   // Toggles MULTIPLIER_ENABLED on for this test so it still exercises the
   // math even while the flag is off in production.
-  test('Multiplier (when enabled) is additive: +2 per empty dissolve, starts at 1', () => {
+  test('Multiplier follows the tier ladder on cumulative empty dissolves', () => {
     const prev = GAME.MULTIPLIER_ENABLED;
     GAME.MULTIPLIER_ENABLED = true;
     setRng(makeSeededRng(7));
@@ -609,10 +719,27 @@ function runTests() {
     const emptyCount = r.events
       .filter(e => e.type === 'dissolve')
       .reduce((s, e) => s + e.emptyDissolves.length, 0);
-    assertEq(r.multiplier, 1 + 2 * emptyCount,
-      'multiplier should equal 1 + 2 × (total empty dissolves)');
+    assertEq(r.multiplier, multForEmpties(emptyCount),
+      'multiplier should equal multForEmpties(total empty dissolves)');
     resetRng();
     GAME.MULTIPLIER_ENABLED = prev;
+  });
+
+  test('multForEmpties hits the specified breakpoints', () => {
+    assertEq(multForEmpties(0),  1);
+    assertEq(multForEmpties(1),  2);
+    assertEq(multForEmpties(2),  2);
+    assertEq(multForEmpties(3),  3);
+    assertEq(multForEmpties(5),  3);
+    assertEq(multForEmpties(6),  5);
+    assertEq(multForEmpties(9),  5);
+    assertEq(multForEmpties(10), 10);
+    assertEq(multForEmpties(14), 10);
+    assertEq(multForEmpties(15), 15);
+    assertEq(multForEmpties(19), 15);
+    assertEq(multForEmpties(20), 20);
+    assertEq(multForEmpties(25), 25);
+    assertEq(multForEmpties(50), 50);
   });
 
   test('Multiplier stays 1 when MULTIPLIER_ENABLED is false', () => {
@@ -754,6 +881,7 @@ function runTests() {
 window.BloomSort = {
   GAME, runSpin, runManySpins, generateGrid, transferPass, runTransfers,
   findDissolves, applyGravity, refillGrid, spawnCell, cloneGrid,
+  multForEmpties, multTierProgress,
   setRng, resetRng, makeSeededRng, runTests,
   stats, resetStats,
 };
@@ -1251,11 +1379,14 @@ class FlowerSymbol extends PIXI.Container {
 // PARTICLE HELPERS — small transient graphics used for burst / puff effects
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function spawnBurst(container, x, y, color, count = 14) {
-  // Radial sparkle burst (used for Full Bloom dissolves).
+function spawnBurst(container, x, y, color, count = 14, reach = 70) {
+  // Radial sparkle burst (used for Full Bloom dissolves). `reach` is the
+  // maximum spread radius; particles scatter out between ~40% and 100% of it.
+  const minDist = reach * 0.35;
+  const maxDist = reach;
   for (let i = 0; i < count; i++) {
     const g = new PIXI.Graphics();
-    const size = 2 + Math.random() * 2.5;
+    const size = 2.5 + Math.random() * 3;
     g.beginFill(0xFFFFFF, 1);
     g.drawCircle(0, 0, size);
     g.endFill();
@@ -1268,14 +1399,53 @@ function spawnBurst(container, x, y, color, count = 14) {
     container.addChild(g);
 
     const angle = (i / count) * Math.PI * 2 + Math.random() * 0.4;
-    const dist = 30 + Math.random() * 40;
+    const dist = minDist + Math.random() * (maxDist - minDist);
     gsap.to(g, {
       x: x + Math.cos(angle) * dist,
       y: y + Math.sin(angle) * dist,
       alpha: 0,
-      duration: 0.55 + Math.random() * 0.2,
+      duration: 0.8 + Math.random() * 0.35,
       ease: 'power2.out',
       onComplete: () => g.destroy(),
+    });
+  }
+}
+
+// Ground-landing dust: a flat, sideways-biased puff used when a flower
+// thuds onto a grid cell (gravity fall or refill). Particles spread mostly
+// horizontally with a slight upward kick, then fade as they settle — reads
+// as a puff kicked up by the pot's impact, not a celebratory burst.
+function spawnLandingDust(container, x, y, cellSize = 60) {
+  const count = 8;
+  const spread = cellSize * 0.45;
+  for (let i = 0; i < count; i++) {
+    const g = new PIXI.Graphics();
+    const size = 2 + Math.random() * 2.5;
+    g.beginFill(0xD8C29A, 0.75);
+    g.drawCircle(0, 0, size);
+    g.endFill();
+    // Start clustered near the base of the cell, slightly staggered.
+    g.x = x + (Math.random() - 0.5) * cellSize * 0.25;
+    g.y = y + (Math.random() - 0.5) * 4;
+    container.addChild(g);
+
+    // Horizontal throw + small upward hop that quickly settles.
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const dx = side * (spread * (0.4 + Math.random() * 0.6));
+    const dyUp = -(4 + Math.random() * 8);
+    gsap.to(g, {
+      x: g.x + dx,
+      y: g.y + dyUp,
+      alpha: 0,
+      duration: 0.45 + Math.random() * 0.25,
+      ease: 'power2.out',
+      onComplete: () => g.destroy(),
+    });
+    // Slight scale-down as it disperses for softer tail.
+    gsap.to(g.scale, {
+      x: 0.5, y: 0.5,
+      duration: 0.45,
+      ease: 'sine.out',
     });
   }
 }
@@ -1615,38 +1785,161 @@ class SpinAnimator {
 
   // ─── TRANSFER PASS ───────────────────────────────────────────────────────
   async _playTransferPass(ev) {
-    if (ev.moves.length === 0) return;
+    const hasMoves    = ev.moves && ev.moves.length > 0;
+    const hasEmpties  = ev.newEmpties && ev.newEmpties.length > 0;
+    if (!hasMoves && !hasEmpties) return;
 
-    // Strictly parallel launch — no stagger at all. Every petal detaches on
-    // the same frame and they're all airborne together. Desynchronisation
-    // comes purely from each petal's speedMul + random arc wobble + random
-    // bend direction, so they don't all trace the same arc in lockstep.
-    const promises = ev.moves.map((move, i) => {
-      const speedMul = Math.max(0.30, Math.pow(0.80, i));
-      return this._animateOneTransfer(move, 0, speedMul);
+    // Every petal launches with a tiny stagger (30 ms) and the same flight
+    // speed — reads as a flurry rather than a march of individuals. Crucially
+    // we do NOT await the flights to finish: we fire and forget, yield
+    // control after a short beat, and let the next pass start while these
+    // petals are still airborne. Passes overlap visually — multiple waves
+    // of petals in motion at once — instead of playing one at a time.
+    // Petals within a single pass fire almost simultaneously — a 30 ms
+    // stagger is just enough to break lockstep but reads as "all at once".
+    const PETAL_STAGGER_S    = 0.03;
+    // Tiny beat between passes so cascades with one petal per pass still
+    // feel like a continuous flurry (the flight is ~437 ms; at 30 ms pass
+    // gap, ten chained passes all pile into the air within ~0.4 s).
+    const INTER_PASS_TAIL_MS = 30;
+    // Beat after a pot's last petal detaches before it takes off for the
+    // multiplier pill — gives the player time to register that the pot is
+    // actually empty before it flies away.
+    const EMPTY_REGISTER_MS  = 450;
+    if (!this._inFlightPetals) this._inFlightPetals = [];
+
+    // Track the actual moment each move's detach completes (NOT just its
+    // scheduled stagger time) so newEmpties can wait for it before flying.
+    // Otherwise: when a move's detach is delayed by the pending-adopt gate,
+    // the empty flight — scheduled on a fixed stagger-based clock — fires
+    // first, nulls scene.flowers[src], and when the delayed detach finally
+    // resumes its race guard sees null and silently returns. The move is
+    // skipped and its destination silently misses a petal, with no warning.
+    const detachDoneByCell = new Map();
+    (ev.moves || []).forEach((move, i) => {
+      const detachTimeS = i * PETAL_STAGGER_S;
+      const fromKey = `${move.from.r},${move.from.c}`;
+      let markDetached;
+      const detachDone = new Promise(r => { markDetached = r; });
+      detachDoneByCell.set(fromKey, detachDone);
+      this._inFlightPetals.push(
+        this._animateOneTransfer(move, detachTimeS, 1, markDetached)
+      );
     });
-    await Promise.all(promises);
-    // Minimal inter-pass beat so the reflow is legible but the cascade
-    // feels continuous rather than pulsed.
-    await SpinAnimator._wait(T(20));
+
+    // Empty-dissolve pots that committed this pass — each one waits until
+    // its last petal has visibly left before it takes off, so the player
+    // sees "pot → empty → fly away" rather than the pot leaving while its
+    // last petal is still attached mid-stagger.
+    if (hasEmpties) {
+      if (!this._launchedEmpties) this._launchedEmpties = new Set();
+      if (!this._inFlightEmpties) this._inFlightEmpties = [];
+      ev.newEmpties.forEach((ed, i) => {
+        const key = `${ed.r},${ed.c}`;
+        if (this._launchedEmpties.has(key)) return;
+        this._launchedEmpties.add(key);
+        const detachDone = detachDoneByCell.get(key); // may be undefined
+        // Await the ACTUAL detach (not a stagger-based estimate) + then
+        // hold EMPTY_REGISTER_MS so the player sees the pot sit empty before
+        // it flies away. If there's no outbound detach from this cell in
+        // this pass (e.g. it went empty via some other path), skip straight
+        // to the register beat.
+        const flight = (async () => {
+          if (detachDone) await detachDone;
+          await new Promise(r => setTimeout(r, EMPTY_REGISTER_MS));
+          if (!this.scene.flowers[ed.r][ed.c]) return;   // race guard
+          await this._animateEmptyDissolve(ed, 0);
+        })();
+        this._inFlightEmpties.push(flight);
+      });
+    }
+
+    // Wait until THIS pass's last pot has fired its petal (so pots from the
+    // next pass don't crash in while these pots are still taking turns).
+    // The next pass's first petal will still overlap the tail of this pass's
+    // final flight — passes can share the air, but pots within a pass can't.
+    const numMoves = (ev.moves || []).length;
+    const lastDetachMs = Math.max(0, (numMoves - 1)) * PETAL_STAGGER_S * 1000;
+    await SpinAnimator._wait(lastDetachMs + INTER_PASS_TAIL_MS);
   }
 
-  async _animateOneTransfer(move, staggerDelay = 0, speedMul = 1) {
+  async _animateOneTransfer(move, staggerDelay = 0, speedMul = 1, markDetached = null) {
+    // Always resolve markDetached when we finish (with or without a detach)
+    // so any newEmpty flight gating on it doesn't hang forever.
+    const finishDetached = () => { if (markDetached) markDetached(); };
     const src = this.scene.flowers[move.from.r][move.from.c];
     const dst = this.scene.flowers[move.to.r][move.to.c];
-    if (!src || !dst) return;
+    if (!src || !dst) { finishDetached(); return; }
 
     // Hold for the stagger so this petal's "tearing" starts a hair later than
     // its siblings — kills the uncanny synchronisation.
     if (staggerDelay > 0) {
       await new Promise(r => setTimeout(r, staggerDelay * 1000));
     }
-    if (!this.scene.flowers[move.from.r][move.from.c]) return; // race guard
+    if (!this.scene.flowers[move.from.r][move.from.c]) { finishDetached(); return; }
+
+    // Per-cell in-flight adopt tracking. We only wait for pending inbound
+    // flights to SRC if SRC actually has 0 petals right now — i.e. a detach
+    // would otherwise fail silently. If SRC already has one or more petals
+    // we can detach one immediately — pending inbound will still arrive
+    // later and bring SRC back to the model's expected count. This keeps
+    // the in-sync petal flurry intact within a pass.
+    //
+    // LOOP because: while we're awaiting a batch of pending adopts, NEW
+    // pending adopts can be registered (by other moves that fired during our
+    // wait). If the first batch resolves but SRC is still empty (e.g. the
+    // resolved adopt went to a destroyed branch and added no petal), we
+    // should wait for the new batch too. The loop exits when SRC has a
+    // petal OR no more pending adopts exist.
+    if (!this._pendingAdoptsByCell) this._pendingAdoptsByCell = new Map();
+    const srcKey = `${move.from.r},${move.from.c}`;
+    while (true) {
+      const hasPetals = src.petalLayer && src.petalLayer.children.length > 0;
+      if (hasPetals) break;
+      const incoming = this._pendingAdoptsByCell.get(srcKey);
+      if (!incoming || incoming.length === 0) break;
+      await Promise.all(incoming.slice());
+    }
+    if (!this.scene.flowers[move.from.r][move.from.c]) { finishDetached(); return; } // re-check
+
+    // Register this flight's pending adopt on the destination cell so that
+    // any LATER move that needs to send FROM the destination will wait for
+    // this adopt before detaching.
+    const dstKey = `${move.to.r},${move.to.c}`;
+    let markAdopted;
+    const adoptPromise = new Promise(r => { markAdopted = r; });
+    if (!this._pendingAdoptsByCell.has(dstKey)) this._pendingAdoptsByCell.set(dstKey, []);
+    this._pendingAdoptsByCell.get(dstKey).push(adoptPromise);
 
     // Detach a petal from source, aimed toward the target's bulb.
     const dstBulbWorld = dst.getBulbWorldPos();
     const petal = src.detachPetalToward(dstBulbWorld);
-    if (!petal) return;
+    if (!petal) {
+      // This should not happen — the pending-adopt gate above is supposed to
+      // ensure the source has the petal we expect. If it does, a petal is
+      // about to silently vanish (the move is a no-op). LOUD log so we can
+      // find the race instead of shipping a broken cascade.
+      const pendingAtSrc = this._pendingAdoptsByCell.get(srcKey);
+      console.warn(
+        `[petal-lost] detach failed at (${move.from.r},${move.from.c})→(${move.to.r},${move.to.c})` +
+        ` · src.children=${src.petalLayer ? src.petalLayer.children.length : 'n/a'}` +
+        ` · src.petalCount=${src.petalCount}` +
+        ` · src.destroyed=${src.destroyed}` +
+        ` · pending-in-src=${pendingAtSrc ? pendingAtSrc.length : 0}`
+      );
+      // Drop this adopt registration since no flight actually happens.
+      const list = this._pendingAdoptsByCell.get(dstKey);
+      if (list) {
+        const idx = list.indexOf(adoptPromise);
+        if (idx >= 0) list.splice(idx, 1);
+      }
+      markAdopted();
+      finishDetached();
+      return;
+    }
+    // The petal is physically detached — unblock any newEmpty flight waiting
+    // on this cell's detach so it can do its pre-flight register pause now.
+    finishDetached();
 
     // Reparent to fxLayer, preserving world pose.
     const worldPos = petal.parent
@@ -1731,6 +2024,14 @@ class SpinAnimator {
             gsap.killTweensOf(petal.scale);
             petal.destroy();
           }
+          // Clear the pending-adopt registration for this destination so
+          // any queued detach-from-dst move can proceed.
+          const list = this._pendingAdoptsByCell && this._pendingAdoptsByCell.get(dstKey);
+          if (list) {
+            const idx = list.indexOf(adoptPromise);
+            if (idx >= 0) list.splice(idx, 1);
+          }
+          markAdopted();
           resolve();
         },
       });
@@ -1739,16 +2040,57 @@ class SpinAnimator {
 
   // ─── DISSOLVE ────────────────────────────────────────────────────────────
   async _playDissolve(ev) {
+    // Transfer passes run fire-and-forget so they can overlap — but by the
+    // time we're dissolving, every petal flight must have landed/adopted so
+    // the grid state matches the model. Drain the in-flight petal queue.
+    if (this._inFlightPetals && this._inFlightPetals.length) {
+      const pending = this._inFlightPetals;
+      this._inFlightPetals = [];
+      await Promise.all(pending);
+    }
+
+    // Held beat so the player can see the pots at their post-transfer state
+    // (full blooms with all 8 petals, empties cleared) BEFORE the bloom
+    // animation starts and the payout text pops.
+    if (ev.fullBlooms.length > 0) {
+      // Sanity check — drain should have left every blooming flower at MAX
+      // petals. If not, something slipped through the pending-adopt guard.
+      for (const fb of ev.fullBlooms) {
+        const f = this.scene.flowers[fb.r][fb.c];
+        if (f && f.petalCount !== GAME.MAX_PETALS) {
+          console.warn(
+            `[bloom-sync] Flower at (${fb.r},${fb.c}) has ${f.petalCount} petals, expected ${GAME.MAX_PETALS}. ` +
+            `Model/view drift — a petal flight likely no-op'd.`
+          );
+        }
+      }
+      await SpinAnimator._wait(T(220));
+    }
+
     const promises = [];
     for (const fb of ev.fullBlooms) promises.push(this._animateFullBloom(fb));
-    ev.emptyDissolves.forEach((ed, i) => {
+
+    // Skip empties that already took off during an earlier transferPass — the
+    // animator launched them the moment they committed to empty, so their
+    // flight is already in progress (or landed).
+    const launched = this._launchedEmpties || new Set();
+    const remaining = ev.emptyDissolves.filter(ed => !launched.has(`${ed.r},${ed.c}`));
+    remaining.forEach((ed, i) => {
       promises.push(this._animateEmptyDissolve(ed, i));
     });
 
-    // Notify UI so the multiplier bar + running payout update mid-animation.
+    // Notify UI so the running payout updates mid-animation.
     if (this.onProgress) this.onProgress(ev);
 
+    // Include early-launched fire-and-forget empties so no pot lands AFTER
+    // the dissolve/cascade completes.
+    if (this._inFlightEmpties && this._inFlightEmpties.length) {
+      promises.push(...this._inFlightEmpties);
+      this._inFlightEmpties = [];
+    }
+
     await Promise.all(promises);
+    this._launchedEmpties = null;
     await SpinAnimator._wait(T(120));
   }
 
@@ -1760,16 +2102,23 @@ class SpinAnimator {
     const colorHex = hexToNumber(COLOR_BY_NAME[d.color].hex);
     const worldPos = flower.toGlobal(new PIXI.Point(0, flower._bulbY));
     const fxPos = this.scene.fxLayer.toLocal(worldPos);
-    spawnBurst(this.scene.fxLayer, fxPos.x, fxPos.y, colorHex, 18);
+
+    // Small radial sparkle burst — confined to roughly the flower's own cell
+    // so the effect stays local and doesn't feel like a screen-wide explosion.
+    spawnBurst(this.scene.fxLayer, fxPos.x, fxPos.y, colorHex, 16, this.cellSize * 0.7);
 
     // Payout text over the dissolving symbol — the coin value this Full Bloom
-    // contributed to the win (basePay × PAY_MULTIPLIER × bet).
-    const payoutAmount = d.basePay * GAME.PAY_MULTIPLIER * this.currentBet;
+    // contributed to the win (basePay × bet).
+    const payoutAmount = d.basePay * this.currentBet;
     spawnPayoutText(this.scene.fxLayer, fxPos.x, fxPos.y - 6, payoutAmount);
 
     flower.killPetalTweens();
 
     return new Promise(resolve => {
+      // Pump at peak so the bloom is LEGIBLE before collapsing. Timeline:
+      //   0.00 → 0.45   swell + begin rotation
+      //   0.45 → 0.70   hold big-and-spinning (read the bloom)
+      //   0.70 → 1.10   shrink + fade away
       const tl = gsap.timeline({
         onComplete: () => {
           gsap.killTweensOf(flower);
@@ -1779,10 +2128,15 @@ class SpinAnimator {
           resolve();
         }
       });
-      tl.to(flower,       { rotation: Math.PI * 1.2, duration: T(0.45), ease: 'power2.inOut' }, 0);
-      tl.to(flower.scale, { x: 1.35, y: 1.35, duration: T(0.30), ease: 'back.out(2)' }, 0);
-      tl.to(flower.scale, { x: 0.1,  y: 0.1,  duration: T(0.25), ease: 'power2.in' }, T(0.30));
-      tl.to(flower,       { alpha: 0,         duration: T(0.25), ease: 'power2.in' }, T(0.30));
+      // Gentle swell — stays within its cell.
+      tl.to(flower.scale, { x: 1.45, y: 1.45, duration: T(0.40), ease: 'back.out(2)' }, 0);
+      // Slow rotating spin over the whole animation.
+      tl.to(flower,       { rotation: Math.PI * 1.2, duration: T(1.00), ease: 'power1.inOut' }, 0);
+      // Hold briefly at peak so the player can register the bloom.
+      tl.to(flower.scale, { x: 1.4, y: 1.4, duration: T(0.20), ease: 'sine.inOut' }, T(0.45));
+      // Shrink + fade out.
+      tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(0.65));
+      tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(0.65));
     });
   }
 
@@ -1791,6 +2145,14 @@ class SpinAnimator {
     if (!flower) return;
     this.scene.flowers[d.r][d.c] = null;
     flower.killPetalTweens();
+
+    // Kick off the pill expansion NOW (on launch, not landing) so the right
+    // half is already visible by the time the pot arrives ~0.65s later. It's
+    // a no-op if the pill has already been expanded by a previous empty.
+    if (GAME.MULTIPLIER_ENABLED && scene.winPill && !scene.winPill.isExpanded && scene.winPill.expand) {
+      scene.winPill.expand();
+      setGreetingVisible(false, true);
+    }
 
     // Reparent the flower out of the grid-masked flowerLayer and into the
     // un-masked fxLayer so it can fly all the way to the multiplier display.
@@ -1844,6 +2206,12 @@ class SpinAnimator {
           const impactX = flower.x;
           const impactY = flower.y;
 
+          // Advance the multiplier UI the moment the pot hits — this is what
+          // fills the progress bar in lockstep with each landing. Returns
+          // true only when the tier actually advanced (value changed) so we
+          // can gate the number-bounce on real changes.
+          const multChanged = bumpMultiplierOnPotLanded();
+
           // Dust puff at the landing point (stays in fxLayer so it's always
           // on top — dust naturally reads above numbers).
           spawnPuff(this.scene.fxLayer, impactX, impactY, 16);
@@ -1877,8 +2245,10 @@ class SpinAnimator {
           });
 
           // Bounce the MULTIPLIER value on landing — chunkier, with a longer
-          // elastic settle for better "just got added" feedback.
-          if (winPill && winPill.rightValText && winPill.isExpanded) {
+          // elastic settle for better "just got added" feedback. Only fires
+          // when the value actually changed (tier advance) so consecutive
+          // pots within the same tier don't make the number jitter.
+          if (multChanged && winPill && winPill.rightValText && winPill.isExpanded) {
             gsap.killTweensOf(winPill.rightValText.scale);
             gsap.timeline()
               .to(winPill.rightValText.scale, {
@@ -1938,6 +2308,13 @@ class SpinAnimator {
           duration: T(0.22) + Math.min(distRows * T(0.06), T(0.24)),
           ease: 'power1.in',
           onComplete: () => {
+            // Landing dust at the base of the cell.
+            const dustWorld = this.scene.flowerLayer.toGlobal(
+              new PIXI.Point(targetRect.x + targetRect.w / 2,
+                             targetRect.y + targetRect.h * 0.88));
+            const dustLocal = this.scene.fxLayer.toLocal(dustWorld);
+            spawnLandingDust(this.scene.fxLayer, dustLocal.x, dustLocal.y, this.cellSize);
+
             gsap.timeline({ onComplete: resolve })
               .to(m.flower.scale, { y: 0.88, x: 1.08, duration: T(0.08), ease: 'sine.out' })
               .to(m.flower.scale, { y: 1,    x: 1,    duration: T(0.12), ease: 'sine.inOut' });
@@ -1976,6 +2353,12 @@ class SpinAnimator {
             ease: 'power1.in',
             delay: stackIdx * T(0.04),
             onComplete: () => {
+              // Landing dust at the base of the new flower's cell.
+              const dustWorld = this.scene.flowerLayer.toGlobal(
+                new PIXI.Point(rect.x + rect.w / 2, rect.y + rect.h * 0.88));
+              const dustLocal = this.scene.fxLayer.toLocal(dustWorld);
+              spawnLandingDust(this.scene.fxLayer, dustLocal.x, dustLocal.y, this.cellSize);
+
               gsap.timeline({ onComplete: resolve })
                 .to(flower.scale, { y: 0.86, x: 1.10, duration: T(0.08), ease: 'sine.out' })
                 .to(flower.scale, { y: 1,    x: 1,    duration: T(0.14), ease: 'sine.inOut' });
@@ -2077,7 +2460,7 @@ function calculateLayout(sw, sh) {
 // ═══════════════════════════════════════════════════════════════════════════════
 const app = new PIXI.Application({
   resizeTo: window,
-  backgroundColor: 0xCCCCCC,
+  backgroundColor: 0x7A6D57,
   antialias: true,
   resolution: window.devicePixelRatio || 1,
   autoDensity: true,
@@ -2112,6 +2495,7 @@ let animator = null;
 
 let uiState = {
   multiplier: 1,
+  emptyCount: 0,
   multBarMaxEmpties: 10,
 };
 
@@ -2162,18 +2546,9 @@ function buildScene(L) {
   scene.barItems = {};
 
   // ─── BACKGROUND ────────────────────────────────────────────────────────────
-  // Cover-width fit. The source image is portrait (2800×3600) with the pots
-  // composition sitting around source y=1800–2200. Position the bg so that
-  // this focal point lands near the bottom of the viewport at every window
-  // size — that keeps the pots visible below the grid frame.
-  scene.bg = new PIXI.Sprite(bgTexture);
-  const bgScale = L.sw / bgTexture.width;
-  scene.bg.scale.set(bgScale);
-  scene.bg.x = 0;
-  const BG_FOCAL_SOURCE_Y = 2200;      // bottom of the pot cluster in source
-  const BG_FOCAL_SCREEN_FRAC = 0.95;   // where that point should land on screen
-  scene.bg.y = L.sh * BG_FOCAL_SCREEN_FRAC - BG_FOCAL_SOURCE_Y * bgScale;
-  app.stage.addChild(scene.bg);
+  // Flat color wash — no image. Color is set on the PIXI app backgroundColor,
+  // which paints the whole canvas behind everything else. See the app init
+  // where `backgroundColor` is configured.
 
   // ─── GAME SCALE ────────────────────────────────────────────────────────────
   // Scale the game composition relative to 1920×1080 design reference.
@@ -2449,6 +2824,62 @@ function buildScene(L) {
     divider.alpha = 0;
     cont.addChild(divider);
 
+    // ── MULTIPLIER PROGRESS BAR ───────────────────────────────────────────
+    // Covers the entire right (MULTIPLIER) half of the pill with a soft,
+    // low-opacity fill that grows left → right as empty dissolves accumulate
+    // toward the next tier. Sits over the pill bg but under the label/value
+    // texts (and under flying pots, which reparent in front of rightValText).
+    // A mask clips the fill to the pill's rounded shape.
+    const barMask = new PIXI.Graphics();
+    barMask.beginFill(0xFFFFFF);
+    barMask.drawRoundedRect(-pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32);
+    barMask.endFill();
+    cont.addChild(barMask);
+
+    const barFill = new PIXI.Graphics();
+    barFill.mask = barMask;
+    barFill.alpha = 0; // hidden until pill expands
+    cont.addChild(barFill);
+
+    // barState carries three independently animated values:
+    //   p          — fill proportion (0–1), drives how wide the bar is
+    //   glow       — alpha of a brighter overlay on top of the fill region;
+    //                pulses on every pot-hit so each landing feels punchy
+    //   flash      — alpha of a full-right-half white flash; peaks at tier
+    //                advance moments to really sell the "just levelled up!"
+    const barState = { p: 0, glow: 0, flash: 0 };
+    const BAR_FILL_COLOR  = 0xFFE6A0;   // base warm amber
+    const BAR_FILL_ALPHA  = 0.22;       // low opacity wash (resting state)
+    const BAR_GLOW_COLOR  = 0xFFF2C2;   // brighter amber for the pulse
+    const BAR_FLASH_COLOR = 0xFFFFFF;   // pure white tier-advance flash
+    const redrawBar = () => {
+      barFill.clear();
+      const p = Math.max(0, Math.min(1, barState.p));
+      const w = (pw / 2) * p;
+      if (w > 0.5) {
+        // Base fill — the always-on soft wash.
+        barFill.beginFill(BAR_FILL_COLOR, BAR_FILL_ALPHA);
+        barFill.drawRect(0, -_pillH / 2, w, _pillH);
+        barFill.endFill();
+        // Glow overlay — a brighter layer on top of the fill that pulses
+        // briefly on each pot hit so the fill visibly "charges up".
+        if (barState.glow > 0.01) {
+          barFill.beginFill(BAR_GLOW_COLOR, barState.glow);
+          barFill.drawRect(0, -_pillH / 2, w, _pillH);
+          barFill.endFill();
+        }
+      }
+      // Full-right-half flash — covers the whole bar area regardless of
+      // current progress; used for tier-advance so the advancement reads
+      // as a big event, not just a bar-wipe.
+      if (barState.flash > 0.01) {
+        barFill.beginFill(BAR_FLASH_COLOR, barState.flash);
+        barFill.drawRect(0, -_pillH / 2, pw / 2, _pillH);
+        barFill.endFill();
+      }
+    };
+    redrawBar();
+
     const COLLAPSED_LEFT_CX =  0;       // Win centred when collapsed
     const EXPANDED_LEFT_CX  = -pw / 4;  // Win in left half when expanded
     const EXPANDED_RIGHT_CX =  pw / 4;  // Mult in right half when expanded
@@ -2498,6 +2929,116 @@ function buildScene(L) {
     cont.divider      = divider;
     cont.greeting     = greeting;
     cont.isExpanded   = false;
+    cont.multBar = { mask: barMask, fill: barFill, state: barState, redraw: redrawBar };
+
+    // Move the bar to a specific fill proportion (0–1).
+    //   default        — snap instantly (used on pot-landing inside a tier)
+    //   animate: true  — short ease (used on resets)
+    //   tierAdvance    — pot-landing that crossed a tier threshold: ease up
+    //                    to FULL first, hold, then snap to 0 and ease to the
+    //                    new (lower) progress. This avoids the visual pop
+    //                    where a near-full bar jumps "backwards" to low.
+    // Helper: pulse the glow overlay briefly. Peak amplitude controls the
+    // punch; the fall-off is always a quick ease-out.
+    const pulseGlow = (peak = 0.55, fallMs = 350) => {
+      if (cont._barGlowTween) { cont._barGlowTween.kill(); cont._barGlowTween = null; }
+      barState.glow = peak;
+      redrawBar();
+      cont._barGlowTween = gsap.to(barState, {
+        glow: 0,
+        duration: fallMs / 1000,
+        ease: 'power2.out',
+        onUpdate: redrawBar,
+        onComplete: () => { cont._barGlowTween = null; },
+      });
+    };
+
+    // Safety net: ensure no prior animation has left flash/glow/p in a
+    // partial state. Called at the top of every setMultiplierProgress so a
+    // killed tier-advance (which may have skipped its snap-to-0 and/or
+    // flash fade-out) can't paint the bar with a permanent white wash.
+    const cleanupBarAnimationState = ({ resetP = false } = {}) => {
+      barState.flash = 0;
+      barState.glow  = 0;
+      if (resetP) barState.p = 0;
+    };
+
+    cont.setMultiplierProgress = (progress, { animate = false, tierAdvance = false } = {}) => {
+      progress = Math.max(0, Math.min(1, progress || 0));
+      if (cont._barProgressTween) { cont._barProgressTween.kill(); cont._barProgressTween = null; }
+
+      if (tierAdvance) {
+        // Big choreographed advance: charge to 100% with rising glow, explode
+        // in a full white flash, reset, then ease into the new (low) progress.
+        if (cont._barGlowTween)  { cont._barGlowTween.kill();  cont._barGlowTween  = null; }
+        if (cont._barFlashTween) { cont._barFlashTween.kill(); cont._barFlashTween = null; }
+        const tl = gsap.timeline({
+          onUpdate: redrawBar,
+          onComplete: () => {
+            cont._barProgressTween = null;
+            cont._barGlowTween     = null;
+            cont._barFlashTween    = null;
+          },
+          // If the timeline is killed mid-flight (e.g. the next pot lands
+          // before we got to the snap-to-0 / flash fade-out), manually
+          // restore clean state — otherwise the bar stays painted white
+          // indefinitely because the interrupted tween never got to fade
+          // flash back to 0.
+          onInterrupt: () => {
+            barState.flash = 0;
+            barState.glow  = 0;
+            // If we were still in the fill phase (p hasn't snapped yet),
+            // force the reset the timeline was supposed to do. Otherwise
+            // leave p as-is — the caller's next action will set it.
+            if (barState.p > 0.05) barState.p = 0;
+            redrawBar();
+          },
+        });
+        // 1) Charge: sweep p to full, glow ramping from current to strong.
+        tl.to(barState, { p: 1,       duration: 0.24, ease: 'power2.out' }, 0);
+        tl.to(barState, { glow: 0.9,  duration: 0.24, ease: 'power2.out' }, 0);
+        // 2) Detonate: white flash peaks just as p hits 1.
+        tl.to(barState, { flash: 1.0, duration: 0.10, ease: 'power2.out' }, 0.22);
+        // 3) Snap p to 0 mid-flash (covered by the white wash so no visual pop).
+        tl.call(() => { barState.p = 0; redrawBar(); }, null, 0.30);
+        // 4) Decay the flash + glow while the bar begins filling to new level.
+        tl.to(barState, { flash: 0,   duration: 0.38, ease: 'power2.in'  }, 0.32);
+        tl.to(barState, { glow: 0,    duration: 0.32, ease: 'power2.in'  }, 0.32);
+        tl.to(barState, { p: progress, duration: 0.24, ease: 'power2.out' }, 0.36);
+        cont._barProgressTween = tl;
+      } else if (animate) {
+        cleanupBarAnimationState();
+        cont._barProgressTween = gsap.to(barState, {
+          p: progress, duration: 0.18, ease: 'power2.out',
+          onUpdate: redrawBar,
+          onComplete: () => { cont._barProgressTween = null; },
+        });
+      } else {
+        // Normal pot hit within a tier — snap the fill width, but pulse the
+        // glow overlay on top so each landing has visible impact instead of
+        // just a silent width change.
+        cleanupBarAnimationState();
+        barState.p = progress;
+        redrawBar();
+        pulseGlow(0.55, 380);
+      }
+    };
+
+    // Instantly hide the progress bar (used when the win + multiplier merge
+    // animation begins — the bar shouldn't compete with the merge visuals).
+    cont.hideMultiplierBar = (animate = false) => {
+      if (cont._barProgressTween) { cont._barProgressTween.kill(); cont._barProgressTween = null; }
+      if (cont._barGlowTween)     { cont._barGlowTween.kill();     cont._barGlowTween     = null; }
+      if (cont._barFlashTween)    { cont._barFlashTween.kill();    cont._barFlashTween    = null; }
+      barState.glow = 0;
+      barState.flash = 0;
+      if (animate) {
+        gsap.to(barFill, { alpha: 0, duration: 0.15, ease: 'power2.in' });
+      } else {
+        barFill.alpha = 0;
+      }
+      redrawBar();
+    };
 
     cont.expand = () => {
       if (cont.isExpanded) return;
@@ -2513,6 +3054,8 @@ function buildScene(L) {
       gsap.fromTo(R.val,
         { x: EXPANDED_RIGHT_CX + pw * 0.08, alpha: 0 },
         { x: EXPANDED_RIGHT_CX, alpha: 1, duration: dur, delay: T(0.10), ease: 'back.out(1.6)' });
+      // Multiplier progress bar fades in along with the right half.
+      gsap.to(barFill, { alpha: 1, duration: dur, delay: T(0.10), ease: 'power2.out' });
     };
 
     cont.collapse = () => {
@@ -2524,6 +3067,19 @@ function buildScene(L) {
       gsap.to(divider, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
       gsap.to(R.lbl, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
       gsap.to(R.val, { alpha: 0, duration: T(0.25), ease: 'power2.in' });
+      // Hide the progress bar when collapsing back to WIN-only.
+      gsap.to(barFill, { alpha: 0, duration: T(0.25), ease: 'power2.in',
+        onComplete: () => {
+          // Reset bar state so the next spin starts from empty.
+          if (cont._barProgressTween) { cont._barProgressTween.kill(); cont._barProgressTween = null; }
+          if (cont._barGlowTween)     { cont._barGlowTween.kill();     cont._barGlowTween     = null; }
+          if (cont._barFlashTween)    { cont._barFlashTween.kill();    cont._barFlashTween    = null; }
+          barState.p = 0;
+          barState.glow = 0;
+          barState.flash = 0;
+          redrawBar();
+        }
+      });
       // Once the pill has settled into the centred WIN-only layout, swap
       // back to the "Good luck!" greeting if the current win is 0.
       gsap.delayedCall(dur, () => {
@@ -2712,7 +3268,7 @@ function buildScene(L) {
   scene.infoButton = info;
 
   // Initial UI sync
-  updateMultiplierBar(1);
+  updateMultiplierBar(1, 0);
   updateWinText(0);
   updateBalanceText();
   updateBetText();
@@ -2730,10 +3286,14 @@ function buildScene(L) {
 // ─── UI HELPERS ──────────────────────────────────────────────────────────────
 
 function fmtCurrency(n) {
-  // Small integer amounts shown plainly, larger amounts with thousands sep.
-  n = Math.round(n);
-  if (n < 1000) return `${n}`;
-  return n.toLocaleString('en-US');
+  // European-style formatting: period as thousands separator, comma as
+  // decimal (e.g. 10.000,00). Always two decimal places — no rounding to
+  // integer, so small payouts at low bets still show their actual value.
+  const v = Number(n) || 0;
+  return v.toLocaleString('de-DE', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 // Smooth numeric count-up on a PIXI.Text, using a tween object.
@@ -2752,9 +3312,14 @@ function tweenCount(textObj, fromVal, toVal, duration = 0.6, formatter = fmtCurr
   });
 }
 
-function updateMultiplierBar(mult) {
+// Force a specific multiplier + empty-count state onto the UI. Used on spin
+// reset (mult=1, emptyCount=0) — during a spin, pot-landings drive the UI via
+// bumpMultiplierOnPotLanded() instead, so the bar visibly fills in the moment
+// the pot hits the pill.
+function updateMultiplierBar(mult, emptyCount) {
   const prev = uiState.multiplier;
   uiState.multiplier = mult;
+  uiState.emptyCount = emptyCount || 0;
   if (!scene.winPill) return;
 
   const wasBaseline = prev <= 1;
@@ -2765,13 +3330,60 @@ function updateMultiplierBar(mult) {
   }
 
   if (wasBaseline && !isBaseline && scene.winPill.expand) {
-    // Multiplier just activated — expand the pill AND drop the greeting.
-    // The player should see WIN (even if still 0) alongside the multiplier.
     scene.winPill.expand();
     setGreetingVisible(false, true);
   } else if (!wasBaseline && isBaseline && scene.winPill.collapse) {
     scene.winPill.collapse();
   }
+
+  if (scene.winPill.setMultiplierProgress) {
+    if (isBaseline) {
+      scene.winPill.setMultiplierProgress(0, { animate: false });
+    } else {
+      const info = multTierProgress(uiState.emptyCount);
+      scene.winPill.setMultiplierProgress(info.progress, { animate: false });
+    }
+  }
+}
+
+// Called the moment an empty-dissolve pot lands on the MULTIPLIER half of the
+// pill. Bumps the cumulative empty count by one, recomputes the multiplier
+// via the tier ladder, and snaps the progress bar to the new level. This is
+// the ONLY path that advances the multiplier UI during a live spin — the
+// model's dissolve event is used just to drive the WIN count-up.
+// Returns true when this pot's landing actually changed the multiplier value
+// (i.e. crossed a tier threshold), false when the bar just advanced within
+// the same tier. Callers use this to gate the number-bounce animation so the
+// × text only pops when the value visibly changed.
+function bumpMultiplierOnPotLanded() {
+  if (!scene.winPill) return false;
+  const prevMult = uiState.multiplier;
+  uiState.emptyCount = (uiState.emptyCount || 0) + 1;
+  const newMult = GAME.MULTIPLIER_ENABLED ? multForEmpties(uiState.emptyCount) : 1;
+  uiState.multiplier = newMult;
+
+  // First pot — expand the pill to reveal the MULTIPLIER half.
+  if (prevMult <= 1 && newMult > 1) {
+    if (scene.winPill.expand) scene.winPill.expand();
+    setGreetingVisible(false, true);
+  }
+
+  if (scene.winPill.rightValText) {
+    scene.winPill.rightValText.text = newMult <= 1 ? '' : `${newMult}\u00D7`;
+  }
+
+  if (scene.winPill.setMultiplierProgress) {
+    const info = multTierProgress(uiState.emptyCount);
+    // A tier threshold was crossed if the ACTUAL multiplier went up on this
+    // pot (and it wasn't the very first pot coming off baseline — the first
+    // pot starts the bar at 0, so there's no "jumping backward" to fix).
+    const tierAdvanced = newMult > prevMult && prevMult > 1;
+    scene.winPill.setMultiplierProgress(info.progress, {
+      tierAdvance: tierAdvanced,
+    });
+  }
+
+  return newMult !== prevMult;
 }
 
 function updateBalanceText(animateFrom) {
@@ -2861,11 +3473,12 @@ function flashInsufficientBalance() {
   tl.to(cont.scale, { x: 1.05, y: 1.05, duration: 0.08, yoyo: true, repeat: 3, ease: 'sine.inOut' });
 }
 
-// Multiplication reveal: a big × mark appears in the middle of the Win pill;
-// the WIN value slides in from the left and the MULTIPLIER value from the
-// right; they converge on the × which then bursts and vanishes; the WIN
-// value then counts up from `baseWin` to `finalWin`. Returns a promise that
-// resolves when the count-up completes.
+// Multiplication reveal: composed as a readable equation across the pill —
+// WIN value on the left · × in the centre · MULTIPLIER value on the right.
+// The × pops in, pulses, then bursts; the MULTIPLIER side fades away; the
+// WIN value then counts up from `baseWin` to `finalWin` right where it
+// already sits on the left. Returns a promise that resolves when the
+// count-up completes.
 function animateMultiplication(baseWin, finalWin) {
   return new Promise(resolve => {
     const winPill = scene.winPill;
@@ -2874,6 +3487,7 @@ function animateMultiplication(baseWin, finalWin) {
       return;
     }
     const winVal    = winPill.leftValText;
+    const winLabel  = winPill.leftLabel;
     const multVal   = winPill.rightValText;
     const multLabel = winPill.rightLabel;
     const divider   = winPill.divider;
@@ -2881,7 +3495,18 @@ function animateMultiplication(baseWin, finalWin) {
     // Kill any in-flight count-up on the win value so we control it here.
     if (winVal._countTween) { winVal._countTween.kill(); winVal._countTween = null; }
 
-    // × mark at the pill's value-row Y.
+    // Anticipation beat — let the player read the final WIN and MULTIPLIER
+    // side-by-side for a second before the × pops in between them.
+    const PRE_MERGE_HOLD_MS = 1000;
+    setTimeout(() => runMerge(), PRE_MERGE_HOLD_MS);
+
+    function runMerge() {
+
+    // Yank the multiplier progress bar the moment the merge begins — it
+    // shouldn't compete visually with the × reveal + count-up.
+    if (winPill.hideMultiplierBar) winPill.hideMultiplierBar(false);
+
+    // × mark at the pill's value-row Y, right between the two values.
     const gs = currentGameScale;
     const xMark = new PIXI.Text('\u00D7', {
       fontFamily: FONT,
@@ -2897,31 +3522,39 @@ function animateMultiplication(baseWin, finalWin) {
     xMark.scale.set(0.25);
     winPill.addChild(xMark);
 
-    // One timeline for the visual choreography — but the promise's resolution
-    // is driven by an explicit setTimeout so a quirk in timeline duration
+    // One timeline for the visual choreography — the promise's resolution is
+    // driven by an explicit setTimeout so a quirk in timeline duration
     // computation (e.g. no-op trailing tween getting dropped) never hangs us.
     const tl = gsap.timeline();
-    const winLabel = winPill.leftLabel;
 
-    // WIN + MULT slide to centre — BOTH the label ("WIN" / "MULTIPLIER")
-    // and the value move together so each pair reads as one unit.
-    tl.to(winVal,     { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
-    tl.to(winLabel,   { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
-    tl.to(multVal,    { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
-    tl.to(multLabel,  { x: 0, duration: 0.28, ease: 'power2.out' }, 0);
-    // × materialises in parallel
+    // Subtle "pull in" — nudge WIN and MULT slightly toward the centre so the
+    // equation reads tighter without stacking on top of each other. Uses the
+    // existing expanded positions as starting anchors so the motion is small
+    // and legible (WIN + MULT keep their labels where they are).
+    const PULL_IN_FRAC = 0.45;   // slide 45% of the way toward x=0
+    const winTargetX  = winVal.x  * (1 - PULL_IN_FRAC);
+    const multTargetX = multVal.x * (1 - PULL_IN_FRAC);
+    tl.to(winVal,    { x: winTargetX,  duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(winLabel,  { x: winTargetX,  duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(multVal,   { x: multTargetX, duration: 0.28, ease: 'power2.out' }, 0);
+    tl.to(multLabel, { x: multTargetX, duration: 0.28, ease: 'power2.out' }, 0);
+
+    // × materialises between them.
     tl.to(xMark,       { alpha: 1,       duration: 0.28, ease: 'power2.out' }, 0);
     tl.to(xMark.scale, { x: 1.3, y: 1.3, duration: 0.36, ease: 'back.out(2.2)' }, 0);
-    // Hold at centre for a beat so the "× collision" reads, then burst
+    // Hold at centre so the "A × B" equation reads, then burst the ×.
     tl.to(xMark.scale, { x: 2.6, y: 2.6, duration: 0.28, ease: 'power2.out' }, 0.60);
     tl.to(xMark,       { alpha: 0,       duration: 0.28, ease: 'power2.out' }, 0.60);
-    // MULT side is consumed; WIN label stays visible (we keep the WIN text).
+    // MULTIPLIER side is consumed — fade value + label + divider.
     tl.to(multVal,     { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
     tl.to(multLabel,   { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
     tl.to(divider,     { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
+    // WIN slides to centre as the × clears, so the count-up happens in the
+    // middle of the pill rather than off on the left.
+    tl.to(winVal,   { x: 0, duration: 0.30, ease: 'power2.out' }, 0.62);
+    tl.to(winLabel, { x: 0, duration: 0.30, ease: 'power2.out' }, 0.62);
 
-    // Count-up starts AFTER WIN has been centred (0.28s) and the burst has
-    // cleared (0.88s). Small extra buffer avoids overlap.
+    // Count-up begins once the × has burst AND WIN has settled at centre.
     const COUNTUP_START_MS = 950;
     const COUNTUP_MS       = 750;
     const BUFFER_MS        = 150;
@@ -2930,8 +3563,7 @@ function animateMultiplication(baseWin, finalWin) {
       if (winPill.leftValText) {
         tweenCount(winVal, baseWin, finalWin, COUNTUP_MS / 1000);
         player.displayedWin = finalWin;
-        // Synchronised scale pulse: the value swells while it counts up, then
-        // elastically settles on the target when the count finishes.
+        // Synchronised scale pulse on the WIN value during count-up.
         gsap.killTweensOf(winVal.scale);
         const countSec = COUNTUP_MS / 1000;
         gsap.timeline()
@@ -2954,6 +3586,8 @@ function animateMultiplication(baseWin, finalWin) {
       if (xMark && !xMark.destroyed) xMark.destroy();
       resolve();
     }, COUNTUP_START_MS + COUNTUP_MS + BUFFER_MS);
+
+    }  // end runMerge
   });
 }
 
@@ -3165,7 +3799,7 @@ function openPaytableModal(L) {
     name.y = cy + 18 * scale;
     paytableContent.addChild(name);
 
-    const coinVal = color.basePay * GAME.PAY_MULTIPLIER * player.bet;
+    const coinVal = color.basePay * player.bet;
     const pay = new PIXI.Text(`+${fmtCurrency(coinVal)}`, {
       fontFamily: FONT, fontSize: 28 * scale,
       fill: isTop ? 0xD4A017 : 0xE65C00,
@@ -3175,13 +3809,6 @@ function openPaytableModal(L) {
     pay.y = cy + cardH * 0.48;
     paytableContent.addChild(pay);
 
-    const cap = new PIXI.Text(
-      `base ${color.basePay} × ${GAME.PAY_MULTIPLIER} × bet`,
-      { fontFamily: FONT, fontSize: 11 * scale, fill: 0x9C6A1A }
-    );
-    cap.x = cx + cardH + 4 * scale;
-    cap.y = cy + cardH * 0.82;
-    paytableContent.addChild(cap);
   }
 
   // ─── Rules content ───────────────────────────────────────────────────────
@@ -3213,7 +3840,9 @@ Full Bloom
 
 Empty Dissolve
 • When a flower gives away all its petals, it dissolves.
-• Each Empty Dissolve adds +2× to the spin multiplier.
+• Empty Dissolves grow the spin multiplier along a tier ladder:
+    1 empty → 2×   3 empties → 3×   6 empties → 5×   10 empties → 10×
+    every +5 empties beyond that → +5× more
 
 Cascades
 • Dissolved cells are refilled from above with fresh random flowers.
@@ -3288,7 +3917,7 @@ async function onSpinClick() {
 
   // 2. Reset the spin UI state
   scene.spinButton._setBusy(true);
-  updateMultiplierBar(1);
+  updateMultiplierBar(1, 0);
   updateWinText(0);
 
   // 3. Run the deterministic simulation — animator replays it.
@@ -3298,9 +3927,9 @@ async function onSpinClick() {
 
   animator.onProgress = (ev) => {
     if (ev.type === 'dissolve') {
-      updateMultiplierBar(ev.multiplier);
-      // Running win during the cascade is PRE-MULTIPLIER (just payout × bet).
-      // The multiplier is applied visually at the end of the spin.
+      // The multiplier UI is now driven per-pot-landing (see
+      // bumpMultiplierOnPotLanded inside the empty-dissolve animation), so
+      // the dissolve event only updates the running WIN count-up here.
       const runningWin = ev.payoutTotal * bet;
       updateWinText(runningWin, true);
     }
@@ -3337,6 +3966,7 @@ async function onSpinClick() {
         if (scene.winPill && scene.winPill.collapse) scene.winPill.collapse();
       }
       uiState.multiplier = 1;
+      uiState.emptyCount = 0;
     } finally {
       // Always re-enable the spin button, even if something threw above.
       // The error (if any) still propagates to the console.
