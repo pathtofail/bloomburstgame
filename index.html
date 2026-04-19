@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Bloom Sort</title>
+  <title>Bloom Burst</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap" rel="stylesheet" />
@@ -2146,12 +2146,10 @@ class SpinAnimator {
     this.scene.flowers[d.r][d.c] = null;
     flower.killPetalTweens();
 
-    // Kick off the pill expansion NOW (on launch, not landing) so the right
-    // half is already visible by the time the pot arrives ~0.65s later. It's
-    // a no-op if the pill has already been expanded by a previous empty.
+    // The Avalanche pill is permanent — no expand needed. Legacy call kept
+    // as a safety net for non-permanent pills.
     if (GAME.MULTIPLIER_ENABLED && scene.winPill && !scene.winPill.isExpanded && scene.winPill.expand) {
       scene.winPill.expand();
-      setGreetingVisible(false, true);
     }
 
     // Reparent the flower out of the grid-masked flowerLayer and into the
@@ -2798,30 +2796,33 @@ function buildScene(L) {
     return cont;
   }
 
-  // Expandable pill: the left half (WIN) is always visible and centered while
-  // the pill is "collapsed". When .expand() is called, a divider slides in at
-  // the centre, the Win label/value slide to the left half, and the right
-  // half (MULTIPLIER) fades in. .collapse() reverses it.
-  function makeSplitPill({ x, y, width, leftLabel, rightLabel,
-                           leftValue, rightValue, leftAccent, rightAccent }) {
+  // Split pill with two halves (WIN / Avalanche and MULTIPLIER). Historically
+  // had an expand/collapse animation; the Avalanche pill at the top of the
+  // grid is created with `permanent: true` so both halves are always visible
+  // and the greeting sub-element is skipped.
+  function makeSplitPill({ x, y, width, height, leftLabel, rightLabel,
+                           leftValue, rightValue, leftAccent, rightAccent,
+                           permanent = false,
+                           valueFontSize, labelFontSize }) {
     const cont = new PIXI.Container();
     cont.x = x; cont.y = y;
     const pw = width;
+    const ph = height || _pillH;    // local pill height (may be overridden)
 
     // Outer background + border
     const bg = new PIXI.Graphics();
     bg.lineStyle(2 * gameScale, 0xC08050, 0.95);
     bg.beginFill(0x2A1808, 0.75);
-    bg.drawRoundedRect(-pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32);
+    bg.drawRoundedRect(-pw / 2, -ph / 2, pw, ph, ph * 0.32);
     bg.endFill();
     cont.addChild(bg);
 
-    // Vertical divider (hidden when collapsed).
+    // Vertical divider (visible when expanded).
     const divider = new PIXI.Graphics();
     divider.lineStyle(1.5 * gameScale, 0xC08050, 0.55);
-    divider.moveTo(0, -_pillH * 0.34);
-    divider.lineTo(0,  _pillH * 0.34);
-    divider.alpha = 0;
+    divider.moveTo(0, -ph * 0.34);
+    divider.lineTo(0,  ph * 0.34);
+    divider.alpha = permanent ? 1 : 0;
     cont.addChild(divider);
 
     // ── MULTIPLIER PROGRESS BAR ───────────────────────────────────────────
@@ -2832,13 +2833,13 @@ function buildScene(L) {
     // A mask clips the fill to the pill's rounded shape.
     const barMask = new PIXI.Graphics();
     barMask.beginFill(0xFFFFFF);
-    barMask.drawRoundedRect(-pw / 2, -_pillH / 2, pw, _pillH, _pillH * 0.32);
+    barMask.drawRoundedRect(-pw / 2, -ph / 2, pw, ph, ph * 0.32);
     barMask.endFill();
     cont.addChild(barMask);
 
     const barFill = new PIXI.Graphics();
     barFill.mask = barMask;
-    barFill.alpha = 0; // hidden until pill expands
+    barFill.alpha = permanent ? 1 : 0; // visible right away for permanent pill
     cont.addChild(barFill);
 
     // barState carries three independently animated values:
@@ -2859,13 +2860,13 @@ function buildScene(L) {
       if (w > 0.5) {
         // Base fill — the always-on soft wash.
         barFill.beginFill(BAR_FILL_COLOR, BAR_FILL_ALPHA);
-        barFill.drawRect(0, -_pillH / 2, w, _pillH);
+        barFill.drawRect(0, -ph / 2, w, ph);
         barFill.endFill();
         // Glow overlay — a brighter layer on top of the fill that pulses
         // briefly on each pot hit so the fill visibly "charges up".
         if (barState.glow > 0.01) {
           barFill.beginFill(BAR_GLOW_COLOR, barState.glow);
-          barFill.drawRect(0, -_pillH / 2, w, _pillH);
+          barFill.drawRect(0, -ph / 2, w, ph);
           barFill.endFill();
         }
       }
@@ -2874,7 +2875,7 @@ function buildScene(L) {
       // as a big event, not just a bar-wipe.
       if (barState.flash > 0.01) {
         barFill.beginFill(BAR_FLASH_COLOR, barState.flash);
-        barFill.drawRect(0, -_pillH / 2, pw / 2, _pillH);
+        barFill.drawRect(0, -ph / 2, pw / 2, ph);
         barFill.endFill();
       }
     };
@@ -2883,8 +2884,14 @@ function buildScene(L) {
     const COLLAPSED_LEFT_CX =  0;       // Win centred when collapsed
     const EXPANDED_LEFT_CX  = -pw / 4;  // Win in left half when expanded
     const EXPANDED_RIGHT_CX =  pw / 4;  // Mult in right half when expanded
-    const labelFs = Math.max(10, 12 * gameScale);
-    const valueFs = Math.max(16, 24 * gameScale);
+    const labelFs = labelFontSize || Math.max(10, 12 * gameScale);
+    const valueFs = valueFontSize || Math.max(16, 24 * gameScale);
+
+    // Starting x for each half: permanent pills open expanded; non-permanent
+    // start with WIN centred and MULTIPLIER tucked to the right (alpha 0).
+    const leftStartX  = permanent ? EXPANDED_LEFT_CX  : COLLAPSED_LEFT_CX;
+    const rightStartX = EXPANDED_RIGHT_CX;
+    const rightStartA = permanent ? 1 : 0;
 
     function half(startX, label, value, accent, startAlpha) {
       const lbl = new PIXI.Text(label, {
@@ -2892,7 +2899,7 @@ function buildScene(L) {
         fill: accent, letterSpacing: 1.2,
       });
       lbl.anchor.set(0.5);
-      lbl.x = startX; lbl.y = -_pillH * 0.25;
+      lbl.x = startX; lbl.y = -ph * 0.25;
       lbl.alpha = startAlpha;
       cont.addChild(lbl);
 
@@ -2900,35 +2907,38 @@ function buildScene(L) {
         fontFamily: FONT, fontSize: valueFs, fill: 0xFFECB3,
       });
       val.anchor.set(0.5);
-      val.x = startX; val.y = _pillH * 0.14;
+      val.x = startX; val.y = ph * 0.14;
       val.alpha = startAlpha;
       cont.addChild(val);
       return { lbl, val };
     }
 
-    const L = half(COLLAPSED_LEFT_CX,  leftLabel,  leftValue,  leftAccent  || 0xD4A017, 1);
-    const R = half(EXPANDED_RIGHT_CX,  rightLabel, rightValue, rightAccent || 0xD4A017, 0);
+    const L = half(leftStartX,  leftLabel,  leftValue,  leftAccent  || 0xD4A017, 1);
+    const R = half(rightStartX, rightLabel, rightValue, rightAccent || 0xD4A017, rightStartA);
 
-    // Greeting message shown in place of "WIN 0" when the win value is 0.
-    // Starts hidden; the WIN label+value show by default. updateWinText()
-    // toggles between the two modes.
-    const greeting = new PIXI.Text('Good luck!', {
-      fontFamily: FONT,
-      fontSize: Math.max(18, 28 * gameScale),
-      fill: 0xFFECB3,
-      letterSpacing: 0.5,
-    });
-    greeting.anchor.set(0.5);
-    greeting.x = 0;
-    greeting.y = 0;
-    greeting.alpha = 0;
-    cont.addChild(greeting);
+    // Legacy greeting element — only created for non-permanent pills. Code
+    // that references cont.greeting must tolerate null.
+    let greeting = null;
+    if (!permanent) {
+      greeting = new PIXI.Text('Good luck!', {
+        fontFamily: FONT,
+        fontSize: Math.max(18, 28 * gameScale),
+        fill: 0xFFECB3,
+        letterSpacing: 0.5,
+      });
+      greeting.anchor.set(0.5);
+      greeting.x = 0;
+      greeting.y = 0;
+      greeting.alpha = 0;
+      cont.addChild(greeting);
+    }
 
     cont.leftLabel    = L.lbl;  cont.leftValText  = L.val;
     cont.rightLabel   = R.lbl;  cont.rightValText = R.val;
     cont.divider      = divider;
     cont.greeting     = greeting;
-    cont.isExpanded   = false;
+    cont.isExpanded   = !!permanent;  // permanent pills start expanded
+    cont.permanent    = !!permanent;
     cont.multBar = { mask: barMask, fill: barFill, state: barState, redraw: redrawBar };
 
     // Move the bar to a specific fill proportion (0–1).
@@ -3058,7 +3068,39 @@ function buildScene(L) {
       gsap.to(barFill, { alpha: 1, duration: dur, delay: T(0.10), ease: 'power2.out' });
     };
 
+    // Restore the permanent pill to fresh-spin visuals: both halves fully
+    // visible at their expanded positions, divider on, bar reset. Used at
+    // the start of each spin to undo anything animateMultiplication did.
+    cont.resetPermanent = () => {
+      if (!permanent) return;
+      gsap.killTweensOf(L.lbl); gsap.killTweensOf(L.lbl.scale);
+      gsap.killTweensOf(L.val); gsap.killTweensOf(L.val.scale);
+      gsap.killTweensOf(R.lbl); gsap.killTweensOf(R.lbl.scale);
+      gsap.killTweensOf(R.val); gsap.killTweensOf(R.val.scale);
+      gsap.killTweensOf(divider);
+      gsap.killTweensOf(barFill);
+      // Restore the left label text — the merge animation shrinks it down
+      // to "WIN" once the multiplier has been consumed; fresh spins start
+      // with the full pre-merge label (e.g. "BLOOM WIN").
+      L.lbl.text = leftLabel;
+      L.lbl.x = EXPANDED_LEFT_CX;  L.lbl.alpha = 1; L.lbl.scale.set(1);
+      L.val.x = EXPANDED_LEFT_CX;  L.val.alpha = 1; L.val.scale.set(1);
+      R.lbl.x = EXPANDED_RIGHT_CX; R.lbl.alpha = 1; R.lbl.scale.set(1);
+      R.val.x = EXPANDED_RIGHT_CX; R.val.alpha = 1; R.val.scale.set(1);
+      divider.alpha = 1;
+      barFill.alpha = 1;
+      if (cont._barProgressTween) { cont._barProgressTween.kill(); cont._barProgressTween = null; }
+      if (cont._barGlowTween)     { cont._barGlowTween.kill();     cont._barGlowTween     = null; }
+      if (cont._barFlashTween)    { cont._barFlashTween.kill();    cont._barFlashTween    = null; }
+      barState.p = 0;
+      barState.glow = 0;
+      barState.flash = 0;
+      redrawBar();
+    };
+
     cont.collapse = () => {
+      // Permanent pills (Avalanche header) never collapse — skip silently.
+      if (permanent) return;
       if (!cont.isExpanded) return;
       cont.isExpanded = false;
       const dur = T(0.35);
@@ -3166,18 +3208,47 @@ function buildScene(L) {
   scene.betPlusBtn.y = pillsCenterY;
   app.stage.addChild(scene.betPlusBtn);
 
+  // ─── AVALANCHE PILL (top of grid, permanent) ────────────────────────────
+  // Large split pill that sits at the top of the grid, overlapping the grid
+  // by 25% of its own height. Shows running Avalanche total + multiplier
+  // across the whole spin. Stays visible permanently (both halves always on).
+  const avalanchePillW = Math.min(frameW * 0.78, 640 * gameScale);
+  const avalanchePillH = Math.max(36, 46 * gameScale) + 20 * gameScale;
+  // Pill center Y so the pill overlaps the grid by 25% of its own height:
+  //   pill bottom = gridTop + 0.25 * pillH
+  //   pill centerY = pill bottom - pillH/2 = gridTop - 0.25 * pillH
+  const avalancheCY = gridTop - 0.25 * avalanchePillH;
+  const avalancheCX = (gridLeft + gridRight) / 2;
   scene.winPill = makeSplitPill({
-    x: winCX,
-    y: pillsCenterY,
-    width: _winPillW,
-    leftLabel:  'WIN',
+    x: avalancheCX,
+    y: avalancheCY,
+    width: avalanchePillW,
+    height: avalanchePillH,
+    leftLabel:  'BLOOM WIN',
     leftValue:  fmtCurrency(0),
     leftAccent: 0x7FE080,        // green for the win side
     rightLabel: 'MULTIPLIER',
     rightValue: '1\u00D7',
     rightAccent: 0xFFD700,       // gold for the multiplier side
+    permanent:  true,
+    labelFontSize: Math.max(14, 17 * gameScale),
+    valueFontSize: Math.max(22, 34 * gameScale),
   });
   app.stage.addChild(scene.winPill);
+
+  // ─── STATUS TEXT (replaces the old WIN pill slot in the bottom UI row) ──
+  // Reads "Good luck!" before a spin; once a spin completes we swap the text
+  // to "WIN <amount>". Updated via updateStatusText(…).
+  scene.statusText = new PIXI.Text('Good luck!', {
+    fontFamily: FONT,
+    fontSize: Math.max(20, 32 * gameScale),
+    fill: 0xFFECB3,
+    letterSpacing: 0.6,
+  });
+  scene.statusText.anchor.set(0.5);
+  scene.statusText.x = winCX;
+  scene.statusText.y = pillsCenterY;
+  app.stage.addChild(scene.statusText);
 
   // Small RTP line — low-contrast, near the bottom of the viewport
   scene.rtpText = new PIXI.Text(`RTP 0.00%  |  Spins 0`, {
@@ -3274,6 +3345,7 @@ function buildScene(L) {
   updateBetText();
   updateRtpText();
   updateSpinButtonState();
+  updateStatusText('Good luck!');
 
   // Lift the FX layer to the top of the z-stack so in-flight petals, pot
   // flights to the multiplier, and other effects always render above every
@@ -3317,23 +3389,17 @@ function tweenCount(textObj, fromVal, toVal, duration = 0.6, formatter = fmtCurr
 // bumpMultiplierOnPotLanded() instead, so the bar visibly fills in the moment
 // the pot hits the pill.
 function updateMultiplierBar(mult, emptyCount) {
-  const prev = uiState.multiplier;
   uiState.multiplier = mult;
   uiState.emptyCount = emptyCount || 0;
   if (!scene.winPill) return;
 
-  const wasBaseline = prev <= 1;
-  const isBaseline  = mult <= 1;
+  const isBaseline = mult <= 1;
 
   if (scene.winPill.rightValText) {
-    scene.winPill.rightValText.text = isBaseline ? '' : `${mult}\u00D7`;
-  }
-
-  if (wasBaseline && !isBaseline && scene.winPill.expand) {
-    scene.winPill.expand();
-    setGreetingVisible(false, true);
-  } else if (!wasBaseline && isBaseline && scene.winPill.collapse) {
-    scene.winPill.collapse();
+    // Permanent pill always shows a value — default to "1×" at baseline
+    // rather than going blank (which only made sense for the old collapsed
+    // pill that hid the multiplier half).
+    scene.winPill.rightValText.text = `${mult}\u00D7`;
   }
 
   if (scene.winPill.setMultiplierProgress) {
@@ -3362,14 +3428,9 @@ function bumpMultiplierOnPotLanded() {
   const newMult = GAME.MULTIPLIER_ENABLED ? multForEmpties(uiState.emptyCount) : 1;
   uiState.multiplier = newMult;
 
-  // First pot — expand the pill to reveal the MULTIPLIER half.
-  if (prevMult <= 1 && newMult > 1) {
-    if (scene.winPill.expand) scene.winPill.expand();
-    setGreetingVisible(false, true);
-  }
-
   if (scene.winPill.rightValText) {
-    scene.winPill.rightValText.text = newMult <= 1 ? '' : `${newMult}\u00D7`;
+    // Permanent pill: always show a value, default "1×" at baseline.
+    scene.winPill.rightValText.text = `${newMult}\u00D7`;
   }
 
   if (scene.winPill.setMultiplierProgress) {
@@ -3401,14 +3462,24 @@ function updateBetText() {
   scene.betPill.valText.text = fmtCurrency(player.bet);
 }
 
-// Toggle between "Good luck!" greeting mode and WIN label/value mode.
+// Back-compat no-op. The old Avalanche pill had an in-pill "Good luck!"
+// overlay that we toggled on the WIN side; the new permanent pill never
+// shows a greeting and the bottom status text drives that messaging now.
+// Kept so lingering callers don't error out.
 function setGreetingVisible(visible, animate = true) {
   if (!scene.winPill) return;
   const greet   = scene.winPill.greeting;
   const label   = scene.winPill.leftLabel;
   const valText = scene.winPill.leftValText;
   const dur = animate ? 0.2 : 0;
-  if (greet)   gsap.to(greet,   { alpha: visible ? 1 : 0, duration: dur });
+  // If the pill has no greeting (permanent pill), keep label+value visible
+  // regardless of the requested mode.
+  if (!greet) {
+    if (label)   gsap.to(label,   { alpha: 1, duration: dur });
+    if (valText) gsap.to(valText, { alpha: 1, duration: dur });
+    return;
+  }
+  gsap.to(greet,   { alpha: visible ? 1 : 0, duration: dur });
   if (label)   gsap.to(label,   { alpha: visible ? 0 : 1, duration: dur });
   if (valText) gsap.to(valText, { alpha: visible ? 0 : 1, duration: dur });
 }
@@ -3419,23 +3490,11 @@ function updateWinText(n, animate = false) {
   if (!valText) return;
 
   if (n <= 0) {
-    // Zero win: default to greeting mode UNLESS a multiplier is active (in
-    // which case the panel stays in WIN mode so the multiplier side can show).
-    const multActive = uiState.multiplier > 1;
-    // Only kill the count-up tween (if any). DO NOT killTweensOf(valText) —
-    // that would also cancel the x-slide from expand(), leaving the value
-    // pinned in the centre while the WIN label moves to the left half.
     if (valText._countTween) { valText._countTween.kill(); valText._countTween = null; }
-    // Use a simple dash placeholder instead of "0" when showing the WIN label
-    // alongside an active multiplier — feels less like a literal zero score.
-    valText.text = multActive ? '-' : fmtCurrency(0);
-    setGreetingVisible(!multActive, animate);
+    valText.text = fmtCurrency(0);
     player.displayedWin = 0;
     return;
   }
-
-  // Non-zero win: hide greeting, show WIN label + value.
-  setGreetingVisible(false, animate);
 
   if (animate) {
     tweenCount(valText, player.displayedWin || 0, n, 0.5);
@@ -3443,6 +3502,17 @@ function updateWinText(n, animate = false) {
     valText.text = fmtCurrency(n);
   }
   player.displayedWin = n;
+}
+
+// Update the bottom status line. Shows "Good luck!" before a spin and
+// "WIN <amount>" once a spin has paid out.
+function updateStatusText(text) {
+  if (!scene.statusText) return;
+  scene.statusText.text = text;
+  // Small scale pulse on change so it reads as "updated".
+  gsap.fromTo(scene.statusText.scale,
+    { x: 0.92, y: 0.92 },
+    { x: 1, y: 1, duration: 0.28, ease: 'back.out(2)' });
 }
 
 function updateRtpText() {
@@ -3550,9 +3620,12 @@ function animateMultiplication(baseWin, finalWin) {
     tl.to(multLabel,   { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
     tl.to(divider,     { alpha: 0,       duration: 0.22, ease: 'power2.in'  }, 0.62);
     // WIN slides to centre as the × clears, so the count-up happens in the
-    // middle of the pill rather than off on the left.
+    // middle of the pill rather than off on the left. The pre-merge label
+    // ("BLOOM WIN") also shrinks down to just "WIN" at this moment — once
+    // the multiplier has been applied, the value is purely a win amount.
     tl.to(winVal,   { x: 0, duration: 0.30, ease: 'power2.out' }, 0.62);
     tl.to(winLabel, { x: 0, duration: 0.30, ease: 'power2.out' }, 0.62);
+    tl.call(() => { if (winLabel) winLabel.text = 'WIN'; }, null, 0.62);
 
     // Count-up begins once the × has burst AND WIN has settled at centre.
     const COUNTUP_START_MS = 950;
@@ -3649,7 +3722,7 @@ function openPaytableModal(L) {
   modal.addChild(panel);
 
   // Title
-  const title = new PIXI.Text('Bloom Sort', {
+  const title = new PIXI.Text('Bloom Burst', {
     fontFamily: FONT,
     fontSize: 30 * scale,
     fill: 0x3D1C02,
@@ -3917,8 +3990,12 @@ async function onSpinClick() {
 
   // 2. Reset the spin UI state
   scene.spinButton._setBusy(true);
+  if (scene.winPill && scene.winPill.resetPermanent) scene.winPill.resetPermanent();
   updateMultiplierBar(1, 0);
   updateWinText(0);
+  // Clear the bottom status line while the spin is running — the WIN /
+  // Good luck readout populates at the end, after the result is in.
+  updateStatusText('');
 
   // 3. Run the deterministic simulation — animator replays it.
   const result = BloomSort.runSpin(bet);
@@ -3952,19 +4029,24 @@ async function onSpinClick() {
 
       // Only run the × multiplication reveal if there's actually a win to
       // multiply. When the spin ended with a multiplier but 0 payout, skip
-      // the animation — just gracefully slide the panel closed leaving
-      // "WIN 0" centred.
+      // the animation — just settle on the final (0) WIN value.
       if (mult > 1 && finalWin > 0) {
         await animateMultiplication(baseWin, finalWin);
         if (finalWin >= bet) pulseWinPill();
-        if (scene.winPill && scene.winPill.collapse) scene.winPill.collapse();
       } else {
         updateWinText(finalWin, true);
         if (finalWin > 0 && finalWin >= bet) pulseWinPill();
-        // Close the multiplier half (if it opened during the cascade) and
-        // leave only WIN with its final (0 or otherwise) value centered.
-        if (scene.winPill && scene.winPill.collapse) scene.winPill.collapse();
       }
+
+      // Bottom status readout: "WIN <amount>" sticks around until the next
+      // spin starts if the player actually won something; otherwise fall
+      // back to "Good luck!" for dead spins.
+      if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+
       uiState.multiplier = 1;
       uiState.emptyCount = 0;
     } finally {
