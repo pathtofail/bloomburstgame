@@ -2,19 +2,66 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Bloom Burst</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap" rel="stylesheet" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #CCCCCC; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden; background: #CCCCCC;
+      /* Prevent iOS Safari rubber-band scroll & double-tap zoom */
+      position: fixed; inset: 0;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none; user-select: none;
+      overscroll-behavior: none;
+    }
+    canvas {
+      display: block;
+      touch-action: none;        /* let Pixi own all gestures */
+      -webkit-user-select: none;
+    }
+    /* Portrait warning overlay — Pixi composition is a landscape playfield;
+       on a portrait phone we ask the user to rotate. The canvas keeps
+       running underneath so resuming on rotation is instant. */
+    #rotate-prompt {
+      display: none;
+      position: fixed; inset: 0;
+      background: #1a1a1a;
+      color: #FFD54F; font-family: 'Fredoka One', sans-serif;
+      z-index: 9999;
+      align-items: center; justify-content: center;
+      flex-direction: column; gap: 18px;
+      padding: 24px; text-align: center;
+    }
+    #rotate-prompt .icon { font-size: 64px; animation: rot 1.6s ease-in-out infinite; }
+    #rotate-prompt h2 { font-size: 24px; margin: 0; }
+    #rotate-prompt p  { font-size: 16px; color: #FFECB3; margin: 0; max-width: 320px; }
+    @keyframes rot {
+      0%,100% { transform: rotate(0deg); }
+      50%     { transform: rotate(-90deg); }
+    }
+    /* Show the prompt only on small portrait viewports. Landscape phones,
+       tablets, and desktops never see it. */
+    @media (max-width: 900px) and (orientation: portrait) {
+      #rotate-prompt { display: flex; }
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.x/dist/pixi.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
 </head>
 <body>
+<div id="rotate-prompt">
+  <div class="icon">📱</div>
+  <h2>Please rotate your device</h2>
+  <p>Bloom Burst plays best in landscape. Turn your phone sideways to continue.</p>
+</div>
 <script>
 (async function () {
 
@@ -23,6 +70,24 @@ await document.fonts.load('32px "Fredoka One"');
 // Load textures
 const logoTexture         = await PIXI.Assets.load('assets/gameLogo.png');
 const frameTexture        = await PIXI.Assets.load('assets/frame.png');
+// Alt-3 (Expanding Reels) frames, one per grid size.
+const frameTexturesBySize = {
+  4: await PIXI.Assets.load('assets/frame4X4.png'),
+  5: await PIXI.Assets.load('assets/frame5X5.png'),
+  6: await PIXI.Assets.load('assets/frame6X6.png'),
+};
+// Lock the OUTER pixel footprint of every alt-3 frame to the 4×4 frame's
+// natural size — bigger grids render with their textures scaled DOWN so
+// the playfield occupies the same screen rectangle regardless of grid
+// count. Cells inside the frame naturally shrink as the count grows.
+// `alt3FrameScale(size)` returns the multiplier we apply on top of
+// `gameScale` to achieve a constant rendered width across sizes.
+const alt3FrameRefW = frameTexturesBySize[4].width;
+const alt3FrameRefH = frameTexturesBySize[4].height;
+function alt3FrameScale(size) {
+  const tex = frameTexturesBySize[size] || frameTexturesBySize[4];
+  return alt3FrameRefW / tex.width;
+}
 
 // Symbol art — pot, middle (flower center), petals.
 const potTexture        = await PIXI.Assets.load('assets/pot.png');
@@ -64,11 +129,19 @@ await Promise.all(Object.entries(PETAL_FILE_BY_COLOR).map(async ([colorName, fil
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const GAME = {
+  // ROWS/COLS/MAX_PETALS are mutable in alt-3 (Expanding Reels).
+  // Defaults are the alt-1/alt-2 values.
   ROWS: 4,
   COLS: 5,
   MAX_PETALS: 8,
   MAX_TRANSFER_PASSES: 50,
   MAX_CASCADES: 100,
+
+  // Alt-3 grid progression: spins start at 4×4, grow on each winning
+  // cascade up to 6×6 max. Flowers in alt-3 bloom at 6 petals instead
+  // of 8 (grid is smaller + fewer petals → snappier feedback).
+  ALT3_SIZES:      [4, 5, 6],
+  ALT3_MAX_PETALS: 6,
 
   // Empty dissolves grow the spin multiplier along a fixed tier ladder —
   // see multForEmpties() below for the schedule.
@@ -109,7 +182,7 @@ const GAME = {
   COLORS: [
     { name: 'Scarlet', weight: 5,  basePay: 2.5,  hex: '#D50000' },
     { name: 'Indigo',  weight: 7,  basePay: 2,    hex: '#304FFE' },
-    { name: 'Magenta', weight: 9,  basePay: 1.5,  hex: '#C2185B' },
+    { name: 'Magenta', weight: 9,  basePay: 1.75, hex: '#C2185B' },
     { name: 'Gold',    weight: 11, basePay: 1.5,  hex: '#FF6F00' },
     { name: 'Teal',    weight: 13, basePay: 1,    hex: '#00796B' },
     { name: 'Lime',    weight: 15, basePay: 0.75, hex: '#558B2F' },
@@ -117,15 +190,71 @@ const GAME = {
     { name: 'Pearl',   weight: 20, basePay: 0.25, hex: '#78909C' },
   ],
 
+  // Drop weights for alt-1 (Chain) and alt-2 (Tile). Total = 100, so each
+  // weight equals its drop percentage. 3- and 4-petal cells are rare so
+  // the grid mostly starts low and the player has time to read transfers.
+  //   1 petal  → 44%
+  //   2 petals → 39%
+  //   3 petals → 12%
+  //   4 petals →  5%
   PETAL_WEIGHTS: [
-    { count: 1, weight: 40 },
-    { count: 2, weight: 35 },
-    { count: 3, weight: 18 },
-    { count: 4, weight: 7 },
+    { count: 1, weight: 44 },
+    { count: 2, weight: 39 },
+    { count: 3, weight: 12 },
+    { count: 4, weight:  5 },
   ],
 };
 
 const COLOR_BY_NAME = Object.fromEntries(GAME.COLORS.map(c => [c.name, c]));
+
+// ─── Alt-3 Expanding Reels — runtime dim tracking ────────────────────────────
+// In alt-3 the grid grows from 4×4 → 5×5 → 6×6 across a single spin (one
+// step per winning cascade). currentGridSize is the live size; on every
+// change we mirror it into GAME.ROWS/GAME.COLS so the rest of the model
+// (transfer, gravity, refill, tests, animator loops) keeps working unchanged.
+// Outside alt-3 the dims default to 4×5 with MAX_PETALS=8.
+let currentGridSize = 4;
+function syncGameDimsForMode() {
+  if (ALT_MODE === 'alt3') {
+    GAME.ROWS       = currentGridSize;
+    GAME.COLS       = currentGridSize;
+    GAME.MAX_PETALS = GAME.ALT3_MAX_PETALS;
+  } else {
+    GAME.ROWS       = 4;
+    GAME.COLS       = 5;
+    GAME.MAX_PETALS = 8;
+  }
+}
+
+// Grow an alt-3 grid from oldSize×oldSize to newSize×newSize, anchoring
+// existing flowers at the BOTTOM-LEFT. Freshly-revealed cells (top row(s)
+// and right column(s)) are left as NULL so the subsequent refill step
+// can drop them in from above alongside any bloom/empty gaps in one
+// unified animation. The bottom-left corner of the playfield stays
+// pinned during expansion — the grid visually grows up and to the right.
+function expandGrid(oldGrid, newSize) {
+  const oldSize = oldGrid.length;
+  const rowOffset = newSize - oldSize;   // existing rows shift DOWN by this
+  const next = [];
+  for (let r = 0; r < newSize; r++) {
+    const row = [];
+    for (let c = 0; c < newSize; c++) {
+      // Existing flower (incl. nulls from prior dissolves) maps in from
+      // the bottom-left oldSize×oldSize block. Everything else (the
+      // new top rows and right columns) is null — refill will fill it.
+      const oldR = r - rowOffset;
+      const oldC = c;
+      if (oldR >= 0 && oldR < oldSize && oldC < oldSize
+          && oldGrid[oldR]) {
+        row.push(oldGrid[oldR][oldC] ? { ...oldGrid[oldR][oldC] } : null);
+      } else {
+        row.push(null);
+      }
+    }
+    next.push(row);
+  }
+  return next;
+}
 
 // Swappable RNG — tests replace this with a seeded PRNG for determinism.
 let _rng = Math.random;
@@ -152,9 +281,24 @@ function weightedPick(items) {
 }
 
 function spawnCell() {
+  // Alt-3 (Expanding Reels) blooms at 6 petals — cap initial petal counts
+  // at 3 AND lock the 3-petal share at 10% (so a freshly-spawned half-
+  // bloom is rare). The remaining 90% is split between 1 and 2 in the
+  // same 40:35 (≈ 8:7) ratio as the base game.
+  //   3 petals → 10  → 10%
+  //   2 petals → 42  → 42%
+  //   1 petal  → 48  → 48%
+  let petalWeights = GAME.PETAL_WEIGHTS;
+  if (ALT_MODE === 'alt3') {
+    petalWeights = [
+      { count: 1, weight: 48 },
+      { count: 2, weight: 42 },
+      { count: 3, weight: 10 },
+    ];
+  }
   return {
-    color: weightedPick(GAME.COLORS).name,
-    petals: weightedPick(GAME.PETAL_WEIGHTS).count,
+    color:  weightedPick(GAME.COLORS).name,
+    petals: weightedPick(petalWeights).count,
   };
 }
 
@@ -222,15 +366,22 @@ const ALT_MODE_KEY = 'bloom_burst_alt_mode';
 let ALT_MODE = (() => {
   try {
     const v = localStorage.getItem(ALT_MODE_KEY);
-    if (v === 'alt1' || v === 'alt2') return v;
+    if (v === 'alt1' || v === 'alt2' || v === 'alt3') return v;
   } catch (_) {}
   return 'alt1';
 })();
 function setAltMode(m) {
-  if (m !== 'alt1' && m !== 'alt2') return;
+  if (m !== 'alt1' && m !== 'alt2' && m !== 'alt3') return;
   ALT_MODE = m;
+  // Reset alt-3 grid back to 4×4 whenever we (re-)enter alt-3 from another
+  // mode. Mirror the new dims into GAME.* so model + tests + scene agree.
+  if (m === 'alt3') currentGridSize = GAME.ALT3_SIZES[0];
+  syncGameDimsForMode();
   try { localStorage.setItem(ALT_MODE_KEY, m); } catch (_) {}
 }
+// Boot-time sync — if ALT_MODE was restored as 'alt3' from localStorage,
+// the GAME dims must be resized BEFORE buildScene runs.
+syncGameDimsForMode();
 
 // Pick a tile-multiplier value using the weighted distribution in
 // GAME.MULT_TILE_WEIGHTS. Returns an integer like 4, 8, 50 etc.
@@ -435,8 +586,20 @@ function runManySpins(n, bet = 1) {
 //   { events, finalGrid, totalPayout, multiplier, finalWin, cascadeCount, bet, rtp }
 function runSpin(bet = 1, opts = {}) {
   const events = [];
+  // Alt-3: every spin starts on the smallest grid (4×4) — UNLESS the
+  // caller passed `opts.gridSizeStart`, which the alt-3 free-spin feature
+  // uses to RESUME at the previous spin's grid size (no reset between
+  // free spins).
+  if (ALT_MODE === 'alt3') {
+    const start = (opts && typeof opts.gridSizeStart === 'number')
+      ? Math.min(opts.gridSizeStart,
+                 GAME.ALT3_SIZES[GAME.ALT3_SIZES.length - 1])
+      : GAME.ALT3_SIZES[0];
+    currentGridSize = start;
+    syncGameDimsForMode();
+  }
   let grid = generateGrid();
-  events.push({ type: 'spawn', grid: cloneGrid(grid) });
+  events.push({ type: 'spawn', grid: cloneGrid(grid), gridSize: GAME.ROWS });
 
   let totalPayout  = 0;
   // Alt-1 feature seeds emptyCount from the carry-over so the tier ladder
@@ -447,6 +610,17 @@ function runSpin(bet = 1, opts = {}) {
   let multiplier   = (GAME.MULTIPLIER_ENABLED && ALT_MODE === 'alt1')
                        ? multForEmpties(emptyCount)
                        : 1;
+  // Alt-3 feature: a global bloom multiplier seeded by the caller. +1×
+  // per Full Bloom this spin; resulting value is what the caller carries
+  // into the NEXT free spin. ONLY active when the caller explicitly opts
+  // in with `opts.alt3FeatureActive` — in regular base-game spins the
+  // multiplier stays at 1 and never increments, so it has zero effect on
+  // base-game payouts.
+  const alt3FeatureActive = !!(ALT_MODE === 'alt3' && opts && opts.alt3FeatureActive);
+  let alt3BloomMult = (alt3FeatureActive && typeof opts.alt3BloomMultStart === 'number')
+                       ? opts.alt3BloomMultStart
+                       : 1;
+  let alt3BloomCount = 0;
   let cascadeCount = 0;
 
   // Alt-2 per-cell multipliers. Unused in alt1. Normally fresh per spin, but
@@ -519,14 +693,32 @@ function runSpin(bet = 1, opts = {}) {
     // Per-bloom payout uses each cell's multiplier BEFORE this bloom drops
     // its own tile. A "virgin" cell pays base; a cell already boosted by a
     // neighbour's previous bloom gets the accumulated multiplier.
+    // Alt-3 free-spin feature applies an additional GLOBAL bloom multiplier
+    // that sits on top of basePay. It starts at 2× and bumps +1× for
+    // every Full Bloom for the rest of the feature (this spin's blooms
+    // included — the FIRST bloom this spin still pays at the multiplier
+    // value the spin started with).
     const perBloomInfo = fullBlooms.map(fb => {
       const cellMult = (ALT_MODE === 'alt2') ? (cellMults[fb.r][fb.c] || 0) : 0;
       const effectiveMult = cellMult > 0 ? cellMult : 1;
+      // Snapshot the alt-3 multiplier BEFORE we increment for this bloom
+      // so the bloom is paid at the rate that was visible before it
+      // landed; the increment then applies to the NEXT bloom. The bump
+      // only happens INSIDE the feature — base-game spins keep the
+      // multiplier permanently at 1.
+      const alt3Mult = alt3FeatureActive ? alt3BloomMult : 1;
+      const pay = fb.basePay * effectiveMult * alt3Mult;
+      if (alt3FeatureActive) {
+        alt3BloomCount += 1;
+        alt3BloomMult  += ALT3_FEATURE_MULT_STEP;  // +1× per bloom
+      }
       return {
         ...fb,
         cellMult,
         effectiveMult,
-        pay: fb.basePay * effectiveMult,
+        alt3Mult,
+        alt3MultAfter: alt3FeatureActive ? alt3BloomMult : 1,
+        pay,
       };
     });
     const payoutDelta = perBloomInfo.reduce((s, f) => s + f.pay, 0);
@@ -591,6 +783,10 @@ function runSpin(bet = 1, opts = {}) {
       multiplier,
       emptyCountBefore,
       emptyCount,       // cumulative empties AFTER this dissolve
+      // Alt-3 free-spin multiplier (current cumulative value AFTER all
+      // blooms in this dissolve have applied their +1× increments). The
+      // animator reads this to update the top-of-screen multiplier pill.
+      alt3BloomMult,
     });
 
     applyDissolves(grid, fullBlooms, emptyDissolves);
@@ -601,7 +797,38 @@ function runSpin(bet = 1, opts = {}) {
       events.push({ type: 'gravity', cascadeIndex: cas, falls });
     }
 
-    // 4. Refill
+    // 4. Alt-3 cascade tail: grow grid first (if a Full Bloom landed),
+    //    then refill the unified set of empty cells (bloom/empty gaps +
+    //    freshly-revealed top row / right column). On a no-win cascade
+    //    we DO NOT refill and break out — the spin ends here, leaving
+    //    any empty pots visible until the next spin resets to 4×4.
+    //
+    //    For alt-1 / alt-2 the original behaviour stands: refill always
+    //    runs (no grow), and the cascade loop continues if anything
+    //    dissolved this round.
+    // Alt-3 grow is GATED on a Full Bloom this cascade. Refill always
+    // runs regardless — empties without a bloom still need to fill in
+    // and let the cascade continue. The cascade naturally ends when a
+    // round produces no dissolves (the early-break above the dissolve
+    // event handles that).
+    if (ALT_MODE === 'alt3' && fullBlooms.length > 0) {
+      const sizes = GAME.ALT3_SIZES;
+      const maxSz = sizes[sizes.length - 1];
+      if (currentGridSize < maxSz) {
+        const oldSize = currentGridSize;
+        const newSize = currentGridSize + 1;
+        grid = expandGrid(grid, newSize);   // null in new cells
+        currentGridSize = newSize;
+        syncGameDimsForMode();
+        events.push({
+          type: 'gridExpand',
+          cascadeIndex: cas,
+          oldSize,
+          newSize,
+          gridAfter: cloneGrid(grid),
+        });
+      }
+    }
     const newCells = refillGrid(grid);
     events.push({
       type: 'refill',
@@ -648,6 +875,10 @@ function runSpin(bet = 1, opts = {}) {
     bet,
     cellMults,            // final per-cell multipliers (alt-2 feature carry)
     emptyCount,           // cumulative empties this spin (alt-1 feature carry)
+    // Alt-3 free-spin carries — what the next free spin should resume at.
+    alt3GridSizeEnd: (ALT_MODE === 'alt3') ? currentGridSize : null,
+    alt3BloomMultEnd: (ALT_MODE === 'alt3') ? alt3BloomMult : 1,
+    alt3BloomCount,
     rtp: stats.rtp,
     spinCount: stats.spins,
   };
@@ -1303,6 +1534,14 @@ class FlowerSymbol extends PIXI.Container {
     // ONE scale factor applied uniformly to pot, middle, and petals.
     this._scale = cellSize / ASSET_DESIGN_CELL;
 
+    // Alt-3 (Expanding Reels) blooms at 6 petals instead of 8 — to keep the
+    // flower visually FULL at maximum bloom we lay petals out every 60°
+    // instead of every 45° AND stretch each petal sideways so adjacent
+    // petals meet edge-to-edge. Y-scale stays canonical; only X widens.
+    // 60° / 45° ≈ 1.33 — chosen to match the widened arc.
+    this._isSixMode    = (GAME.MAX_PETALS === 6);
+    this._petalScaleX  = this._isSixMode ? this._scale * 1.33 : this._scale;
+
     // "Bulb Y" = the pivot point around which petals rotate. Radial layout
     // centers everything at (0,0), so bulb Y is 0.
     this._bulbY = 0;
@@ -1345,25 +1584,41 @@ class FlowerSymbol extends PIXI.Container {
     this.addChild(s);
   }
 
+  // Angle table for the current bloom mode. In 8-petal mode every petal
+  // sits at i × 45°; in 6-petal mode every petal sits at i × 60° so a
+  // full bloom spans the full 360°.
+  _anglesFor(n) {
+    if (n <= 0) return [];
+    if (this._isSixMode) {
+      const out = [];
+      for (let i = 0; i < n; i++) out.push(i * Math.PI / 3);
+      return out;
+    }
+    return PETAL_ANGLES[n] || [];
+  }
+
   _layoutPetals() {
     this.petalLayer.removeChildren();
     const n = this.petalCount;
-    if (n <= 0 || n > 8) return;
+    if (n <= 0) return;
+    if (!this._isSixMode && n > 8) return;
+    if ( this._isSixMode && n > 6) return;
 
     const tex = petalTextures[this.colorName];
-    const angles = PETAL_ANGLES[n];
+    const angles = this._anglesFor(n);
     for (const angle of angles) {
       const p = new PIXI.Sprite(tex);
       // Anchor near the base tab so the petal pivots at the flower's center.
       p.anchor.set(0.5, 0.95);
-      p.scale.set(this._scale);
+      p.scale.set(this._petalScaleX, this._scale);
       p.rotation = angle;
       this.petalLayer.addChild(p);
     }
   }
 
   setPetalCount(n) {
-    this.petalCount = Math.max(0, Math.min(GAME.MAX_PETALS, n));
+    const cap = this._isSixMode ? 6 : 8;
+    this.petalCount = Math.max(0, Math.min(cap, n));
     this._layoutPetals();
   }
 
@@ -1412,7 +1667,7 @@ class FlowerSymbol extends PIXI.Container {
     // scale (~1.18×) and appear oversized on the destination.
     gsap.killTweensOf(petal);
     gsap.killTweensOf(petal.scale);
-    petal.scale.set(this._scale);
+    petal.scale.set(this._petalScaleX, this._scale);
     petal.skew.x = 0;
     this.petalCount -= 1;
     if (this.petalCount !== this.petalLayer.children.length) {
@@ -1428,10 +1683,9 @@ class FlowerSymbol extends PIXI.Container {
   // Re-flow existing petals to the current N-count layout (sort by rotation
   // so they move to the nearest slot, preserving visual ordering).
   _reflowRemaining(duration = T(0.28)) {
-    const angles = PETAL_ANGLES[this.petalCount] || [];
+    const angles = this._anglesFor(this.petalCount);
     const kids = this.petalLayer.children.slice();
     kids.sort((a, b) => a.rotation - b.rotation);
-    const canonicalScale = this._scale;
     kids.forEach((p, i) => {
       // Defensive: any stale alpha/scale/visibility from an interrupted
       // flight or tween chain gets normalised here so the petal is
@@ -1441,7 +1695,7 @@ class FlowerSymbol extends PIXI.Container {
       p.alpha = 1;
       p.visible = true;
       p.renderable = true;
-      p.scale.set(canonicalScale);
+      p.scale.set(this._petalScaleX, this._scale);
       p.skew.x = 0;
       gsap.to(p, {
         rotation: angles[i] ?? 0,
@@ -1460,7 +1714,7 @@ class FlowerSymbol extends PIXI.Container {
     // tween from the flight, in particular, can leave scale mid-tween.
     gsap.killTweensOf(petalSprite);
     gsap.killTweensOf(petalSprite.scale);
-    petalSprite.scale.set(this._scale);
+    petalSprite.scale.set(this._petalScaleX, this._scale);
     petalSprite.skew.x = 0;
 
     // Capture world pose
@@ -1809,12 +2063,15 @@ function spawnPayoutText(container, x, y, amount) {
   txt.scale.set(0.5);
   container.addChild(txt);
 
+  // 2× duration on the payout text — keeps it on screen long enough to
+  // match the slowed-down bloom spin/win animation.
+  const S = 2;
   const tl = gsap.timeline({ onComplete: () => txt.destroy() });
-  tl.to(txt,       { alpha: 1,   duration: 0.15, ease: 'power2.out' }, 0);
-  tl.to(txt.scale, { x: 1.25, y: 1.25, duration: 0.25, ease: 'back.out(2.2)' }, 0);
-  tl.to(txt.scale, { x: 1, y: 1, duration: 0.15 }, 0.25);
-  tl.to(txt,       { y: y - 50, duration: 0.95, ease: 'power2.out' }, 0);
-  tl.to(txt,       { alpha: 0,  duration: 0.4,  ease: 'power2.in' }, 0.55);
+  tl.to(txt,       { alpha: 1,   duration: 0.15 * S, ease: 'power2.out' }, 0);
+  tl.to(txt.scale, { x: 1.25, y: 1.25, duration: 0.25 * S, ease: 'back.out(2.2)' }, 0);
+  tl.to(txt.scale, { x: 1, y: 1, duration: 0.15 * S }, 0.25 * S);
+  tl.to(txt,       { y: y - 50, duration: 0.95 * S, ease: 'power2.out' }, 0);
+  tl.to(txt,       { alpha: 0,  duration: 0.4 * S,  ease: 'power2.in' }, 0.55 * S);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1876,6 +2133,7 @@ class SpinAnimator {
       case 'dissolve':      return this._playDissolve(ev);
       case 'gravity':       return this._playGravity(ev);
       case 'refill':        return this._playRefill(ev);
+      case 'gridExpand':    return this._playGridExpand(ev);
       case 'end':           return;
     }
   }
@@ -1887,16 +2145,36 @@ class SpinAnimator {
   // colours and rule violations (e.g. mixed-colour pots after a cross-colour
   // cell swap).
   async _playSpawn(ev) {
+    // Alt-3: if the model has reset to a smaller grid (start of a new spin
+    // after a previous expansion), we run the OLD flowers' fall-out FIRST
+    // (in their old large-grid positions), THEN play the shrink animation
+    // on the empty frame, THEN run the drop-in. Doing the resize before
+    // fall-out would teleport the old flowers into the smaller grid before
+    // the player's eye registers them, which feels broken.
+    const expectedSize  = ev.grid.length;
+    const sceneSize     = this.scene.flowers.length;
+    const needsShrink   = (ALT_MODE === 'alt3' && expectedSize !== sceneSize);
+
     const bounds = this.scene.gridBounds;
     const cellH = this.scene.cells[0][0].h;
     const cellW = this.scene.cells[0][0].w;
     const cellGap = (this.scene.cells[0][1] && this.scene.cells[0][1].x - this.scene.cells[0][0].x - cellW) || 0;
 
+    // Use authoritative dims from the SCENE for tear-down (matches the live
+    // sprite arrays) and from the EVENT's grid for spawn-in. Reading
+    // GAME.ROWS/COLS here is unsafe — by the time the animator runs, those
+    // globals reflect the FINAL state of the spin, which in alt-3 may have
+    // grown beyond the current scene size.
+    const sceneRows = this.scene.flowers.length;
+    const sceneCols = (this.scene.flowers[0] || []).length;
+    const evRows    = ev.grid.length;
+    const evCols    = (ev.grid[0] || []).length;
+
     // ── Phase 1: drop old flowers down and out of the grid ─────────────────
     // With the grid mask, anything past the grid bottom is hidden.
     const fallPromises = [];
-    for (let r = 0; r < GAME.ROWS; r++) {
-      for (let c = 0; c < GAME.COLS; c++) {
+    for (let r = 0; r < sceneRows; r++) {
+      for (let c = 0; c < sceneCols; c++) {
         const f = this.scene.flowers[r] && this.scene.flowers[r][c];
         if (!f || f.destroyed) continue;
         const fallTo = bounds.bottom + cellH * 2; // well past the mask
@@ -1919,27 +2197,50 @@ class SpinAnimator {
     }
     await Promise.all(fallPromises);
 
+    // ── Optional Phase 1.5: shrink the frame down to the new spin's size,
+    //    with the same dramatic dust + shake treatment we use on grow.
+    if (needsShrink) {
+      const blank = [];
+      for (let r = 0; r < expectedSize; r++) {
+        const row = [];
+        for (let c = 0; c < expectedSize; c++) row.push(null);
+        blank.push(row);
+      }
+      await this._playGridExpand({
+        oldSize: sceneSize,
+        newSize: expectedSize,
+        gridAfter: blank,
+      });
+    }
+
+    // After shrink (if any), grid bounds + cells were updated — recapture.
+    const bounds2  = this.scene.gridBounds;
+    const cellH2   = this.scene.cells[0][0].h;
+    const cellW2   = this.scene.cells[0][0].w;
+    const cellGap2 = (this.scene.cells[0][1] && this.scene.cells[0][1].x - this.scene.cells[0][0].x - cellW2) || 0;
+
     // ── Phase 2: drop new flowers in from above the grid ───────────────────
     // New flowers are created ABOVE the top of the mask (stacked by row), so
     // they're invisible until they fall into the grid area.
     const dropPromises = [];
-    for (let c = 0; c < GAME.COLS; c++) {
-      for (let r = 0; r < GAME.ROWS; r++) {
+    for (let c = 0; c < evCols; c++) {
+      for (let r = 0; r < evRows; r++) {
         const data = ev.grid[r][c];
         if (!data) continue;
         const flower = new FlowerSymbol(data.color, data.petals, this.cellSize);
         flower._debugTag = `(${r},${c})@spawn`;
         const rect = this.scene.cells[r][c];
         flower.x = rect.x + rect.w / 2;
-        // Stack the 4 flowers for this column above the grid so they fall in
+        // Stack the rows for this column above the grid so they fall in
         // in order. Top-row flower (r=0) is highest above.
-        flower.y = bounds.top - (cellH + cellGap) * (GAME.ROWS - r);
+        flower.y = bounds2.top - (cellH2 + cellGap2) * (evRows - r);
+        // (rest of original drop loop continues below)
         this.scene.flowerLayer.addChild(flower);
         this.scene.flowers[r][c] = flower;
 
         const targetY = rect.y + rect.h / 2;
         const colDelay = c * T(0.045);
-        const rowDelay = (GAME.ROWS - 1 - r) * T(0.05);
+        const rowDelay = (evRows - 1 - r) * T(0.05);
         dropPromises.push(new Promise(resolve => {
           gsap.to(flower, {
             y: targetY,
@@ -2048,10 +2349,16 @@ class SpinAnimator {
         await Promise.all(pending);
       }
       const canonicalAlpha = 1;
-      for (let r = 0; r < GAME.ROWS; r++) {
-        for (let c = 0; c < GAME.COLS; c++) {
+      // Walk the AUTHORITATIVE grid snapshot, not GAME.ROWS/COLS — in alt-3
+      // the globals reflect the spin's FINAL size, which can be larger than
+      // the size at this cascade's end. Iterating off-grid would crash on
+      // ev.gridAtCascadeEnd[r] === undefined.
+      const gaceRows = ev.gridAtCascadeEnd.length;
+      const gaceCols = (ev.gridAtCascadeEnd[0] || []).length;
+      for (let r = 0; r < gaceRows; r++) {
+        for (let c = 0; c < gaceCols; c++) {
           const expected = ev.gridAtCascadeEnd[r][c];
-          const f = this.scene.flowers[r][c];
+          const f = this.scene.flowers[r] && this.scene.flowers[r][c];
           if (!expected || !f || f.destroyed) continue;
 
           // Count drift — hard case: model and animator disagree.
@@ -2368,10 +2675,14 @@ class SpinAnimator {
     // I haven't tracked), the pot visibly snaps to the right count rather
     // than triggering downstream [petal-lost] cascades.
     if (ev.gridAtDissolve) {
-      for (let r = 0; r < GAME.ROWS; r++) {
-        for (let c = 0; c < GAME.COLS; c++) {
+      // Iterate the snapshot's own dims — GAME.ROWS/COLS may have been
+      // mutated past this cascade's size by a later alt-3 expansion.
+      const gadRows = ev.gridAtDissolve.length;
+      const gadCols = (ev.gridAtDissolve[0] || []).length;
+      for (let r = 0; r < gadRows; r++) {
+        for (let c = 0; c < gadCols; c++) {
           const expected = ev.gridAtDissolve[r][c];
-          const f = this.scene.flowers[r][c];
+          const f = this.scene.flowers[r] && this.scene.flowers[r][c];
           if (!expected || !f || f.destroyed) continue;
           if (f.petalCount !== expected.petals) {
             console.warn(
@@ -2464,11 +2775,32 @@ class SpinAnimator {
 
     flower.killPetalTweens();
 
+    // Reparent the blooming flower out of the masked flowerLayer and into
+    // the un-masked fxLayer so the swell + spin renders ON TOP of every
+    // other flower / tile / badge — the win moment must never be hidden
+    // behind a neighbouring pot or a refilled symbol falling in. We
+    // preserve world pose during the reparent so there's no visual jump.
+    {
+      const worldPos = flower.getGlobalPosition();
+      const worldRot = flower.rotation;
+      flower.parent && flower.parent.removeChild(flower);
+      this.scene.fxLayer.addChild(flower);              // last child = top
+      const local = this.scene.fxLayer.toLocal(worldPos);
+      flower.x = local.x;
+      flower.y = local.y;
+      flower.rotation = worldRot;
+    }
+
     return new Promise(resolve => {
-      // Pump at peak so the bloom is LEGIBLE before collapsing. Timeline:
-      //   0.00 → 0.45   swell + begin rotation
-      //   0.45 → 0.70   hold big-and-spinning (read the bloom)
-      //   0.70 → 1.10   shrink + fade away
+      // Win moment is ~2× as long as it used to be, but every individual
+      // motion plays at its ORIGINAL speed — we just give the flower more
+      // distance and time to dwell:
+      //   • swell      : original duration, original speed
+      //   • spin       : same angular speed, but rotates 2× as far
+      //                  (Math.PI * 2.4 over T(2.00)) so it keeps
+      //                  spinning through the whole longer timeline
+      //   • hold       : doubled so the player has time to read the bloom
+      //   • shrink/fade: original duration, original speed
       const tl = gsap.timeline({
         onComplete: () => {
           // Kill petal tweens BEFORE destroy — destroy({children:true})
@@ -2482,15 +2814,23 @@ class SpinAnimator {
           resolve();
         }
       });
-      // Gentle swell — stays within its cell.
+      // Gentle swell — stays within its cell. Original speed.
       tl.to(flower.scale, { x: 1.45, y: 1.45, duration: T(0.40), ease: 'back.out(2)' }, 0);
-      // Slow rotating spin over the whole animation.
-      tl.to(flower,       { rotation: Math.PI * 1.2, duration: T(1.00), ease: 'power1.inOut' }, 0);
-      // Hold briefly at peak so the player can register the bloom.
-      tl.to(flower.scale, { x: 1.4, y: 1.4, duration: T(0.20), ease: 'sine.inOut' }, T(0.45));
-      // Shrink + fade out.
-      tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(0.65));
-      tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(0.65));
+      // Spin: rotate ONLY the bloom (petals + bulb middle), NOT the pot.
+      // The pot sprite has a baked-in shadow; rotating it makes the shadow
+      // spin along which looks broken. Rotating the petalLayer + bulb
+      // independently keeps the shadow planted firmly under the pot.
+      // Same angular speed as before (Math.PI * 1.2 / T(1.00)) but covering
+      // 2× the angle over 2× the duration → keeps spinning throughout
+      // the extended hold.
+      const spinTargets = [flower.petalLayer, flower.bulbSprite].filter(Boolean);
+      tl.to(spinTargets,  { rotation: Math.PI * 2.4, duration: T(2.00), ease: 'power1.inOut' }, 0);
+      // Hold at peak — doubled so the bloom is fully readable.
+      tl.to(flower.scale, { x: 1.4, y: 1.4, duration: T(0.40), ease: 'sine.inOut' }, T(0.45));
+      // Shrink + fade out at original speed, just deferred so the longer
+      // spin can play out first.
+      tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(1.65));
+      tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(1.65));
     }).then(() => {
       // Alt-2: after the bloom animates away, drop its multiplier tile
       // (big reveal at cell centre → shrink to corner) plus half-value
@@ -2749,6 +3089,41 @@ class SpinAnimator {
     this.scene.flowers[d.r][d.c] = null;
     flower.killPetalTweens();
 
+    // Alt-3 (Expanding Reels): empty pots just POOF in place. No flying,
+    // no falling — a puff of smoke and they're gone.
+    if (ALT_MODE === 'alt3') {
+      return new Promise(resolve => {
+        const rect = this.scene.cells[d.r] && this.scene.cells[d.r][d.c];
+        if (rect) {
+          const cx = rect.x + rect.w / 2;
+          const cy = rect.y + rect.h / 2;
+          const worldPos = this.scene.flowerLayer.toGlobal(new PIXI.Point(cx, cy));
+          const fxPos    = this.scene.fxLayer.toLocal(worldPos);
+          spawnPuff(this.scene.fxLayer, fxPos.x, fxPos.y, 18);
+        }
+        const fromX = flower.scale.x;
+        const fromY = flower.scale.y;
+        gsap.to(flower.scale, {
+          x: fromX * 0.05,
+          y: fromY * 0.05,
+          duration: T(0.30),
+          ease: 'back.in(1.4)',
+        });
+        gsap.to(flower, {
+          alpha: 0,
+          duration: T(0.30),
+          ease: 'power2.in',
+          onComplete: () => {
+            flower.killPetalTweens();
+            gsap.killTweensOf(flower);
+            gsap.killTweensOf(flower.scale);
+            if (!flower.destroyed) flower.destroy({ children: true });
+            resolve();
+          },
+        });
+      });
+    }
+
     // Alt-2 empties don't drop multipliers — the pot just poofs in place.
     // Blooms are what place tiles (see _animateFullBloom for the reveal).
     if (ALT_MODE === 'alt2') {
@@ -2997,7 +3372,17 @@ class SpinAnimator {
               const dustLocal = this.scene.fxLayer.toLocal(dustWorld);
               spawnLandingDust(this.scene.fxLayer, dustLocal.x, dustLocal.y, this.cellSize);
 
-              gsap.timeline({ onComplete: resolve })
+              gsap.timeline({
+                onComplete: () => {
+                  // Hard-snap to canonical scale on landing — prevents
+                  // any squash/stretch overshoot from leaving the new
+                  // refilled flower at an oversized scale (the
+                  // "pots become bigger when they drop down after a
+                  // size change" bug).
+                  if (!flower.destroyed) flower.scale.set(1, 1);
+                  resolve();
+                },
+              })
                 .to(flower.scale, { y: 0.86, x: 1.10, duration: T(0.08), ease: 'sine.out' })
                 .to(flower.scale, { y: 1,    x: 1,    duration: T(0.14), ease: 'sine.inOut' });
             },
@@ -3006,7 +3391,493 @@ class SpinAnimator {
       });
     }
     await Promise.all(promises);
+
+    // Defensive scale + position sweep — every flower in the scene gets
+    // hard-snapped to its canonical size for the current grid. Catches
+    // any flower whose squash/stretch landing tween was interrupted (e.g.
+    // by a quick mode switch or a back-to-back grow) and left at an
+    // oversized scale.
+    for (let r = 0; r < this.scene.flowers.length; r++) {
+      const row = this.scene.flowers[r];
+      if (!row) continue;
+      for (let c = 0; c < row.length; c++) {
+        const f = row[c];
+        if (!f || f.destroyed) continue;
+        const rect = this.scene.cells[r] && this.scene.cells[r][c];
+        if (!rect) continue;
+        const targetScale = (f.cellSize > 0)
+          ? (this.cellSize / f.cellSize)
+          : 1;
+        gsap.killTweensOf(f.scale);
+        f.scale.set(targetScale, targetScale);
+        f.x = rect.x + rect.w / 2;
+        f.y = rect.y + rect.h / 2;
+        f.alpha = 1;
+      }
+    }
+
     await SpinAnimator._wait(T(80));
+  }
+
+  // ─── ALT-3 GRID EXPAND ────────────────────────────────────────────────────
+  // The grid grew one tier (e.g. 4×4 → 5×5). The bottom-left corner of the
+  // playfield stays PINNED — the frame and grid extend up and to the right.
+  // Existing flowers (already in the bottom-left oldSize×oldSize block of
+  // the new grid per expandGrid()) keep their sprite identity and tween to
+  // their new logical positions; freshly-revealed cells (the new top row(s)
+  // and right column(s)) slide in from above / from the right.
+  //
+  // Special case: when called from _playSpawn with newSize < oldSize (a new
+  // spin starting fresh after a previous expansion), there is nothing to
+  // animate — we just snap the layout. We branch on (newSize > oldSize).
+  async _playGridExpand(ev) {
+    const newSize = ev.newSize;
+    const oldSize = ev.oldSize;
+    const newTex  = frameTexturesBySize[newSize] || frameTexturesBySize[4];
+    const isGrow  = newSize > oldSize;
+
+    // Drain any in-flight petals/empties so we don't tween onto sprites we're
+    // about to destroy or move.
+    if (this._inFlightPetals && this._inFlightPetals.length) {
+      const pending = this._inFlightPetals;
+      this._inFlightPetals = [];
+      try { await Promise.all(pending); } catch (_) {}
+    }
+    if (this._inFlightEmpties && this._inFlightEmpties.length) {
+      const pending = this._inFlightEmpties;
+      this._inFlightEmpties = [];
+      try { await Promise.all(pending); } catch (_) {}
+    }
+    if (this._launchedEmpties) this._launchedEmpties.clear();
+    if (this._pendingAdoptsByCell) this._pendingAdoptsByCell.clear();
+
+    // ── Snapshot OLD bottom-left corner so we can pin it across the rebuild.
+    // Falls back to centred placement when there's no usable old layout
+    // (first-time scene shrink during _playSpawn etc.).
+    let oldBL_x = null, oldBL_yBottom = null;
+    if (this.scene.cells.length > 0 && this.scene.cells[oldSize - 1]) {
+      const oldBLcell = this.scene.cells[oldSize - 1][0];
+      if (oldBLcell) {
+        oldBL_x       = oldBLcell.x;
+        oldBL_yBottom = oldBLcell.y + oldBLcell.h;
+      }
+    }
+
+    // ── Snapshot existing flowers BEFORE we destroy/rebuild scene arrays.
+    // Only used in the GROW path so we can keep their sprite identity and
+    // tween them into their new positions.
+    const carriedFlowers = [];   // [{ flower, oldR, oldC, newR, newC }]
+    if (isGrow) {
+      const rowOffset = newSize - oldSize;   // existing rows shift DOWN
+      for (let r = 0; r < oldSize; r++) {
+        const row = this.scene.flowers[r];
+        if (!row) continue;
+        for (let c = 0; c < oldSize; c++) {
+          const f = row[c];
+          if (!f || f.destroyed) continue;
+          carriedFlowers.push({
+            flower: f,
+            oldR: r, oldC: c,
+            newR: r + rowOffset,
+            newC: c,
+          });
+          this.scene.flowers[r][c] = null;
+        }
+      }
+    }
+
+    // ── In the SHRINK path (alt-3 spawn-time reset) just tear everything down.
+    if (!isGrow) {
+      for (let r = 0; r < this.scene.flowers.length; r++) {
+        const row = this.scene.flowers[r];
+        if (!row) continue;
+        for (let c = 0; c < row.length; c++) {
+          const f = row[c];
+          if (f && !f.destroyed) {
+            if (f.killPetalTweens) f.killPetalTweens();
+            f.destroy({ children: true });
+          }
+        }
+      }
+    }
+
+    // ── Compute the new frame + grid layout, anchored at the old BL corner.
+    // Use the alt-3 per-texture rescale so the rendered frame footprint is
+    // constant across grid sizes — bigger grids ⇒ proportionally smaller
+    // cells inside the same outer rectangle.
+    const gameScale     = currentGameScale;
+    const frameTexScale = alt3FrameScale(newSize);
+    const effectiveScale = gameScale * frameTexScale;
+    const frameW    = newTex.width  * effectiveScale;
+    const frameH    = newTex.height * effectiveScale;
+    const sw = app.screen.width, sh = app.screen.height;
+
+    const FRAME_INNER_PAD_X      = 0.030;
+    const FRAME_INNER_PAD_TOP    = 0.037;
+    const FRAME_INNER_PAD_BOTTOM = 0.045;
+    const innerW = frameW * (1 - FRAME_INNER_PAD_X * 2);
+    const innerH = frameH * (1 - FRAME_INNER_PAD_TOP - FRAME_INNER_PAD_BOTTOM);
+    const cellGap = frameW * 0.008;
+    const cellSize = Math.min(
+      (innerW - (newSize - 1) * cellGap) / newSize,
+      (innerH - (newSize - 1) * cellGap) / newSize
+    );
+    const gridW = newSize * cellSize + (newSize - 1) * cellGap;
+    const gridH = newSize * cellSize + (newSize - 1) * cellGap;
+    const SYMBOL_Y_NUDGE = 20 * gameScale;
+
+    // Default: centred placement (matches buildScene). Used when we have no
+    // pin point (e.g. very first expansion after a spawn-rebuild). Frame
+    // is centred both horizontally and vertically — no fixed bottom-pixel
+    // gap reserved for the UI row.
+    let gridX = ((sw - frameW) / 2) + frameW * FRAME_INNER_PAD_X + (innerW - gridW) / 2;
+    let gridY;
+    {
+      const compY0 = Math.max(10 * gameScale, (sh - frameH) / 2);
+      gridY = compY0 + frameH * FRAME_INNER_PAD_TOP + (innerH - gridH) / 2 - SYMBOL_Y_NUDGE;
+    }
+    // Pin to the captured bottom-left corner only when GROWING — that's
+    // the user-visible "grid expands up + right" effect. On a shrink
+    // (between-spin reset to 4×4) we re-centre the smaller frame so the
+    // playfield reads as a fresh starting state, not an off-centre stub.
+    if (isGrow && oldBL_x !== null && oldBL_yBottom !== null) {
+      gridX = oldBL_x;
+      gridY = oldBL_yBottom - gridH;
+    }
+    // Derive frame top-left so its inner-grid lines up with (gridX, gridY).
+    const compX = gridX - frameW * FRAME_INNER_PAD_X - (innerW - gridW) / 2;
+    const compY = gridY + SYMBOL_Y_NUDGE - frameH * FRAME_INNER_PAD_TOP - (innerH - gridH) / 2;
+
+    // ── Build the new scene.cells grid.
+    const newCells = [];
+    for (let r = 0; r < newSize; r++) {
+      newCells[r] = [];
+      for (let c = 0; c < newSize; c++) {
+        newCells[r][c] = {
+          x: gridX + c * (cellSize + cellGap),
+          y: gridY + r * (cellSize + cellGap),
+          w: cellSize, h: cellSize,
+        };
+      }
+    }
+
+    // ── Frame swap. Snap the frame to its new texture AND new top-left
+    // immediately so it visually appears bigger anchored at the (pinned)
+    // bottom-left corner. A position-tween reads as "frame slides up
+    // from below" which is the opposite of the impact we want. Instead
+    // we sell the size jump with: (a) brief screen shake, (b) dust burst
+    // along the new bottom edge, (c) a thump scale-pop on the frame
+    // (anchored so it doesn't break the bottom-left pin).
+    // Both grow AND shrink (between-spin reset) get the dust + shake + thump
+    // treatment so the size change reads as a deliberate "the playfield is
+    // changing" beat, not a silent re-layout. Only a same-size call (no
+    // visible footprint change) skips the dramatic block.
+    const frame = this.scene.frame;
+    const isResize = (oldSize !== newSize);
+    if (frame && isResize) {
+      frame.texture = newTex;
+      frame.x = compX;
+      frame.y = compY;
+
+      // Pivot the frame at its bottom-left so the scale thump doesn't move
+      // the pinned corner. Pixi sprites use `pivot` in TEXTURE-local space;
+      // we offset position by the same amount so the frame's on-screen
+      // location is preserved. Save originals so we can restore.
+      const fW = newTex.width;   // texture-space width
+      const fH = newTex.height;  // texture-space height
+      const origPivotX = frame.pivot.x, origPivotY = frame.pivot.y;
+      frame.pivot.set(0, fH);
+      // Compensate position for the new pivot (pivot=(0,fH) shifts the
+      // sprite's anchor to its bottom-left in texture coords; render origin
+      // shifts down by fH * scale, so add that to y).
+      frame.y = compY + fH * effectiveScale;
+
+      // Brief scale thump from 0.96 → 1 (uniform), pivoting on bottom-left.
+      gsap.fromTo(frame.scale,
+        { x: effectiveScale * 0.96, y: effectiveScale * 0.96 },
+        {
+          x: effectiveScale, y: effectiveScale,
+          duration: T(0.45),
+          ease: 'elastic.out(1.1, 0.55)',
+          onComplete: () => {
+            // Restore pivot/position so subsequent code reads the frame at
+            // its conventional top-left origin.
+            frame.pivot.set(origPivotX, origPivotY);
+            frame.x = compX;
+            frame.y = compY;
+            frame.scale.set(effectiveScale);
+          },
+        }
+      );
+
+      // ── Screen shake: brief, decaying, uses app.stage transform.
+      // Kill any in-flight shake first so back-to-back grows don't fight
+      // each other for the stage transform.
+      const stage = this.app.stage;
+      gsap.killTweensOf(stage);
+      stage.x = 0; stage.y = 0;
+      const shakeAmp = 8 * gameScale;
+      const shakeDur = T(0.45);
+      const origStageX = stage.x, origStageY = stage.y;
+      gsap.to(stage, {
+        duration: shakeDur,
+        ease: 'power2.out',
+        onUpdate() {
+          const t  = this.progress();           // 0 → 1
+          const k  = (1 - t) * shakeAmp;        // decaying amplitude
+          stage.x = origStageX + (Math.random() - 0.5) * 2 * k;
+          stage.y = origStageY + (Math.random() - 0.5) * 2 * k;
+        },
+        onComplete() {
+          stage.x = origStageX;
+          stage.y = origStageY;
+        },
+      });
+
+      // ── Dust burst along the new bottom edge of the frame. Spread a
+      // dozen dust puffs evenly across the bottom width — the impact
+      // reads as "the frame just slammed down with extra weight".
+      const dustY = oldBL_yBottom !== null ? oldBL_yBottom : (gridY + gridH);
+      const dustLeft  = gridX;
+      const dustRight = gridX + gridW;
+      const PUFFS = 14;
+      for (let i = 0; i < PUFFS; i++) {
+        const px = dustLeft + (dustRight - dustLeft) * (i / (PUFFS - 1));
+        spawnLandingDust(this.scene.fxLayer, px, dustY, cellSize * 1.2);
+      }
+    } else if (frame) {
+      // No-op size change (oldSize === newSize): snap silently.
+      frame.texture = newTex;
+      frame.x = compX;
+      frame.y = compY;
+    }
+
+    this.scene.cells = newCells;
+    this.cellSize = cellSize;
+
+    // ── Build the new scene.flowers array. In GROW mode, slot the carried-
+    // over flowers into their new positions and tween them; create fresh
+    // FlowerSymbols (sliding in from outside the grid) for the new cells.
+    const flowerPromises = [];
+    this.scene.flowers = [];
+    for (let r = 0; r < newSize; r++) {
+      this.scene.flowers[r] = [];
+      for (let c = 0; c < newSize; c++) this.scene.flowers[r][c] = null;
+    }
+
+    if (isGrow) {
+      // 1. Reposition carried-over flowers to their new cell positions.
+      for (const cf of carriedFlowers) {
+        const rect = newCells[cf.newR][cf.newC];
+        const targetX = rect.x + rect.w / 2;
+        const targetY = rect.y + rect.h / 2;
+        this.scene.flowers[cf.newR][cf.newC] = cf.flower;
+        cf.flower._debugTag = `(${cf.newR},${cf.newC})@carried`;
+
+        // Match the FRAME's resize tween EXACTLY in duration + easing so
+        // flowers and frame scale as one. cellSize is the NEW cell size;
+        // cf.flower.cellSize is the size the flower was BUILT at. Their
+        // ratio is the absolute scale factor needed to make this flower
+        // fit the new cell. We set scale.x/y to that factor every time
+        // so a missed tween never leaves a flower oversized.
+        const sizeRatio = cellSize / cf.flower.cellSize;
+        const RESIZE_DUR  = T(0.45);
+        const RESIZE_EASE = 'elastic.out(1.1, 0.55)';
+
+        // Kill any in-flight tweens on this flower's position + scale to
+        // make sure the new tween isn't fighting the previous grow's
+        // residue (which can leave scale stuck mid-overshoot).
+        gsap.killTweensOf(cf.flower);
+        gsap.killTweensOf(cf.flower.scale);
+        gsap.killTweensOf(cf.flower.position);
+
+        flowerPromises.push(new Promise(resolve => {
+          gsap.to(cf.flower, {
+            x: targetX, y: targetY,
+            duration: RESIZE_DUR,
+            ease: RESIZE_EASE,
+            onComplete: () => {
+              // Force-snap to exact target on completion — defensive in
+              // case the tween was interrupted between the final frame
+              // and onComplete firing.
+              cf.flower.x = targetX;
+              cf.flower.y = targetY;
+              resolve();
+            },
+          });
+        }));
+        // Scale tween — capture a stable starting value so a mid-overshoot
+        // current scale doesn't become the new "from".
+        const fromX = cf.flower.scale.x;
+        const fromY = cf.flower.scale.y;
+        gsap.fromTo(cf.flower.scale,
+          { x: fromX, y: fromY },
+          {
+            x: sizeRatio, y: sizeRatio,
+            duration: RESIZE_DUR,
+            ease: RESIZE_EASE,
+            onComplete: () => {
+              // Hard-snap final scale so an interrupted elastic.out can
+              // never leave the flower visibly oversized (the original
+              // bug: "some flowers remained big after the grid size
+              // change").
+              cf.flower.scale.set(sizeRatio, sizeRatio);
+            },
+          });
+      }
+
+      // 2. Spawn freshly-revealed cells. New rows = top, new cols = right.
+      const rowOffset = newSize - oldSize;
+      for (let r = 0; r < newSize; r++) {
+        for (let c = 0; c < newSize; c++) {
+          if (this.scene.flowers[r][c]) continue;     // already carried
+          const data = ev.gridAfter[r][c];
+          if (!data) continue;
+          const rect = newCells[r][c];
+          const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+          flower._debugTag = `(${r},${c})@expand-${newSize}`;
+          const targetX = rect.x + rect.w / 2;
+          const targetY = rect.y + rect.h / 2;
+
+          // Start position depends on which side this cell was added on.
+          // New TOP rows  (r < rowOffset)  → fall in from above the frame.
+          // New RIGHT col (c >= oldSize)   → slide in from right of the frame.
+          // Cells on both axes: pick whichever distance is greater.
+          const fromTop = (r < rowOffset);
+          const fromRight = (c >= oldSize);
+          let startX = targetX, startY = targetY;
+          if (fromTop && fromRight) {
+            // Diagonal entry from top-right corner.
+            startX = gridX + gridW + cellSize;
+            startY = gridY - cellSize;
+          } else if (fromTop) {
+            startY = gridY - cellSize * (1 + (rowOffset - 1 - r) * 1.05);
+          } else if (fromRight) {
+            startX = gridX + gridW + cellSize * (1 + (c - oldSize) * 1.05);
+          }
+          flower.x = startX;
+          flower.y = startY;
+          flower.alpha = (fromTop || fromRight) ? 1 : 0;
+          this.scene.flowerLayer.addChild(flower);
+          this.scene.flowers[r][c] = flower;
+
+          const colDelay = fromRight ? (c - oldSize) * T(0.05) : 0;
+          const rowDelay = fromTop   ? (rowOffset - 1 - r) * T(0.05) : 0;
+          const delay    = Math.max(colDelay, rowDelay) + T(0.10);
+
+          if (!fromTop && !fromRight) {
+            // Shouldn't happen — every freshly-spawned cell is in a new row
+            // or column. Fade in just in case.
+            flowerPromises.push(new Promise(resolve => {
+              gsap.to(flower, { alpha: 1, duration: T(0.25), delay, onComplete: resolve });
+            }));
+            continue;
+          }
+
+          flowerPromises.push(new Promise(resolve => {
+            gsap.to(flower, {
+              x: targetX,
+              y: targetY,
+              duration: T(0.45),
+              delay,
+              ease: 'power2.out',
+              onComplete: () => {
+                gsap.timeline({ onComplete: resolve })
+                  .to(flower.scale, { x: 1.10, y: 0.88, duration: T(0.08), ease: 'sine.out' })
+                  .to(flower.scale, { x: 1, y: 1, duration: T(0.14), ease: 'sine.inOut' });
+              },
+            });
+          }));
+        }
+      }
+    } else {
+      // SHRINK path: rebuild flowers from gridAfter directly (no animation —
+      // _playSpawn will run its full drop-in sequence right after this).
+      for (let r = 0; r < newSize; r++) {
+        for (let c = 0; c < newSize; c++) {
+          const data = ev.gridAfter[r][c];
+          if (!data) continue;
+          const rect = newCells[r][c];
+          const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+          flower._debugTag = `(${r},${c})@expand-shrink-${newSize}`;
+          flower.x = rect.x + rect.w / 2;
+          flower.y = rect.y + rect.h / 2;
+          this.scene.flowerLayer.addChild(flower);
+          this.scene.flowers[r][c] = flower;
+        }
+      }
+    }
+
+    // 6. Reset auxiliary per-cell layers (alt-3 doesn't use them, but their
+    // arrays must be the right shape so any defensive reads don't crash).
+    this.scene.cellTints = [];
+    this.scene.cellMultTexts = [];
+    this.scene.tileBadges = [];
+    for (let r = 0; r < newSize; r++) {
+      this.scene.cellTints[r]     = [];
+      this.scene.cellMultTexts[r] = [];
+      this.scene.tileBadges[r]    = [];
+      for (let c = 0; c < newSize; c++) {
+        this.scene.cellTints[r][c]     = null;
+        this.scene.cellMultTexts[r][c] = null;
+        this.scene.tileBadges[r][c]    = null;
+      }
+    }
+
+    // 7. Update mask + grid bounds for the new footprint.
+    const gridLeft   = this.scene.cells[0][0].x;
+    const gridTop    = this.scene.cells[0][0].y;
+    const gridRight  = this.scene.cells[0][newSize - 1].x + this.scene.cells[0][newSize - 1].w;
+    const gridBottom = this.scene.cells[newSize - 1][0].y + this.scene.cells[newSize - 1][0].h;
+    if (this.scene.gridMask) {
+      this.scene.gridMask.clear();
+      this.scene.gridMask.beginFill(0xFFFFFF);
+      this.scene.gridMask.drawRect(
+        gridLeft, gridTop,
+        gridRight - gridLeft, gridBottom - gridTop
+      );
+      this.scene.gridMask.endFill();
+    }
+    this.scene.gridBounds = {
+      left: gridLeft, top: gridTop,
+      right: gridRight, bottom: gridBottom,
+      w: gridRight - gridLeft, h: gridBottom - gridTop,
+    };
+
+    // Wait for the grow animation to settle before the next event runs.
+    if (flowerPromises.length > 0) {
+      try { await Promise.all(flowerPromises); } catch (_) {}
+    }
+
+    // ── Defensive scale + position sweep. After the resize tween settles
+    // walk every flower and HARD-SNAP its scale to the canonical value
+    // for the new cell size (this.cellSize / flower.cellSize) plus its
+    // position to the cell-center. This catches any flower whose elastic
+    // scale tween was killed mid-overshoot or whose position was
+    // perturbed by a colliding tween — the previously-reported "some
+    // pots remain big after grid size change" bug.
+    for (let r = 0; r < this.scene.flowers.length; r++) {
+      const row = this.scene.flowers[r];
+      if (!row) continue;
+      for (let c = 0; c < row.length; c++) {
+        const f = row[c];
+        if (!f || f.destroyed) continue;
+        const rect = this.scene.cells[r] && this.scene.cells[r][c];
+        if (!rect) continue;
+        const targetScale = (f.cellSize > 0)
+          ? (this.cellSize / f.cellSize)
+          : 1;
+        gsap.killTweensOf(f);
+        gsap.killTweensOf(f.scale);
+        gsap.killTweensOf(f.position);
+        f.x = rect.x + rect.w / 2;
+        f.y = rect.y + rect.h / 2;
+        f.scale.set(targetScale, targetScale);
+        f.alpha = 1;
+      }
+    }
+
+    await SpinAnimator._wait(T(120));
   }
 }
 
@@ -3015,8 +3886,8 @@ class SpinAnimator {
 // ═══════════════════════════════════════════════════════════════════════════════
 const FONT = "'Fredoka One', cursive";
 
-const COLS        = 5;
-const ROWS        = 4;
+// COLS/ROWS now read from GAME at function entry — they are mutable in
+// alt-3 (Expanding Reels) where the grid grows mid-spin from 4×4 → 6×6.
 const GAP_REF     = 10;    // cell gap at 1080h
 const FRAME_PAD   = 40;    // padding inside frame around cells
 const BAR_H_REF   = 100;   // bottom bar height at 1080h
@@ -3043,6 +3914,7 @@ function calculateLayout(sw, sh) {
   const gridZoneH = barY - gridGapB - gridZoneY;
 
   // Frame / cells
+  const ROWS = GAME.ROWS, COLS = GAME.COLS;
   const availH   = gridZoneH - framePad * 2;
   const cellSize = Math.floor((availH - (ROWS - 1) * gap) / ROWS);
   const cellsW   = COLS * cellSize + (COLS - 1) * gap;
@@ -3163,10 +4035,25 @@ const player = {
     costPaid:        0,      // cost player paid to enter feature (for popup + net-win)
     cellMults:       null,   // alt-2: per-cell tile multipliers
     emptyCountCarry: 0,      // alt-1: cumulative empties across feature
+    // Alt-3 free-spin state:
+    //   gridSizeCarry : the grid size to RESUME at on the next free spin
+    //                   (instead of resetting to 4×4) — bumped each time
+    //                   a spin grew the grid.
+    //   bloomMult     : current global multiplier; starts at
+    //                   ALT3_FEATURE_MULT_START, +ALT3_FEATURE_MULT_STEP
+    //                   per Full Bloom for the duration of the feature.
+    //   bloomCount    : total Full Blooms during the feature (for stats).
+    gridSizeCarry:   null,
+    bloomMult:       1,
+    bloomCount:      0,
   },
 };
 
-const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 15 };
+const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 15, alt3: 10 };
+// Alt-3 free-spin multiplier: starts at 2x, +1x for every Full Bloom
+// during the feature. Persists across all 10 free spins.
+const ALT3_FEATURE_MULT_START = 2;
+const ALT3_FEATURE_MULT_STEP  = 1;
 const FEATURE_COST_MULT  = 100;   // cost = 100 × bet
 
 function featureSpinCount() {
@@ -3212,9 +4099,25 @@ const DESIGN_W = 1920;
 const DESIGN_H = 1120;
 
 function buildScene(L) {
+  // Kill any in-flight tweens on the stage transform (e.g. an alt-3
+  // expand-time screen shake) and snap stage offset back to (0,0). Without
+  // this, switching mode mid-shake leaves the rebuilt scene rendered at an
+  // offset that pushes most of the UI off-screen.
+  gsap.killTweensOf(app.stage);
+  app.stage.x = 0;
+  app.stage.y = 0;
+  app.stage.scale.set(1);
   app.stage.removeChildren();
   scene.cells = [];
   scene.barItems = {};
+  // Snapshot logical grid dims at build time. In alt-3 these change mid-spin
+  // when the grid expands — the animator's gridExpand handler rebuilds the
+  // scene in-place rather than calling buildScene again.
+  const ROWS = GAME.ROWS, COLS = GAME.COLS;
+  // Pick the correct frame asset for the current grid size in alt-3.
+  const activeFrameTexture = (ALT_MODE === 'alt3')
+    ? (frameTexturesBySize[ROWS] || frameTexturesBySize[4])
+    : frameTexture;
 
   // ─── BACKGROUND ────────────────────────────────────────────────────────────
   // Flat color wash — no image. Color is set on the PIXI app backgroundColor,
@@ -3229,33 +4132,33 @@ function buildScene(L) {
   const gameScale = Math.min(L.sw / DESIGN_W, L.sh / DESIGN_H, 1.0);
   currentGameScale = gameScale;
 
-  // Dimensions
-  const frameW  = frameTexture.width * gameScale;
-  const frameH  = frameTexture.height * gameScale;
+  // Dimensions. In alt-3 we apply an extra per-texture scale so every
+  // grid size renders with the SAME outer pixel footprint (locked to the
+  // 4×4 frame's dimensions). Cells inside naturally shrink as the count
+  // grows. Outside alt-3 the extra scale is 1.0.
+  const frameTexScale = (ALT_MODE === 'alt3')
+    ? alt3FrameScale(GAME.ROWS) : 1.0;
+  const frameW  = activeFrameTexture.width  * gameScale * frameTexScale;
+  const frameH  = activeFrameTexture.height * gameScale * frameTexScale;
   const logoScale = gameScale * 0.45;
   const logoW   = logoTexture.width * logoScale;
   const logoH   = logoTexture.height * logoScale;
   const gapX    = 24 * gameScale; // gap between frame and logo column
 
   // Frame is centered horizontally; vertically placed so there's enough room
-  // below for the UI row (pills + spin button + RTP line) without overlap.
-  //   UI budget at gameScale=1:  5 (gap) + 130 (holder) +  5 (gap) +
-  //                             130 (spin btn / row height) + 25 (rtp) = 295
-  // Frame top margin fills whatever's left above.
+  // Center the frame both horizontally and vertically on the canvas. The
+  // bottom UI row (bet/balance pills, spin button, RTP line) is positioned
+  // RELATIVE to the centred frame, not by reserving a fixed pixel band at
+  // the bottom. Earlier we used a UI_BELOW_BUDGET constant to bias the
+  // frame upward, but that made the composition feel bottom-anchored on
+  // tall windows.
   const rightColW = logoW;
   const compX     = (L.sw - frameW) / 2;
-  const UI_BELOW_BUDGET = 295 * gameScale;
-  const compY     = Math.max(
-    10 * gameScale,
-    Math.min(
-      (L.sh - frameH) / 2 - UI_BELOW_BUDGET / 2,  // vertical center, biased up
-      L.sh - frameH - UI_BELOW_BUDGET             // never push UI off-screen
-    )
-  );
+  const compY     = Math.max(10 * gameScale, (L.sh - frameH) / 2);
 
   // ─── FRAME (image w/ cells baked in) ───────────────────────────────────────
-  scene.frame = new PIXI.Sprite(frameTexture);
-  scene.frame.scale.set(gameScale);
+  scene.frame = new PIXI.Sprite(activeFrameTexture);
+  scene.frame.scale.set(gameScale * frameTexScale);
   scene.frame.x = compX;
   scene.frame.y = compY;
   app.stage.addChild(scene.frame);
@@ -3264,12 +4167,9 @@ function buildScene(L) {
   const rightColCX = compX + frameW + gapX + rightColW / 2;
 
   // ─── LOGO ──────────────────────────────────────────────────────────────────
-  scene.logoText = new PIXI.Sprite(logoTexture);
-  scene.logoText.anchor.set(0.5, 0);
-  scene.logoText.scale.set(logoScale);
-  scene.logoText.x = rightColCX;
-  scene.logoText.y = compY;
-  app.stage.addChild(scene.logoText);
+  // Removed per design — the right-column logo previously sat next to the
+  // frame. The asset is still loaded so future re-introduction is cheap.
+  scene.logoText = null;
 
   // ─── CELLS (invisible hit areas for future interactivity) ──────────────────
   // The frame image has the cells baked in visually. We still compute their
@@ -3315,8 +4215,13 @@ function buildScene(L) {
 
   // ─── FLOWER SYMBOLS (live grid) ────────────────────────────────────────────
   // Generate once on first build; re-use the same grid on resize so we don't
-  // "spin" every time the window changes.
-  if (!currentGrid) currentGrid = generateGrid();
+  // "spin" every time the window changes. If the cached grid's dimensions
+  // don't match the current mode's grid (e.g. switching alt-3 → alt-2,
+  // where alt-3 may have left a 6×6 grid behind but alt-2 needs 4×5),
+  // regenerate so the iteration below can't hit undefined cells.
+  const gridRowsOK = currentGrid && currentGrid.length === GAME.ROWS;
+  const gridColsOK = gridRowsOK && currentGrid[0] && currentGrid[0].length === GAME.COLS;
+  if (!currentGrid || !gridRowsOK || !gridColsOK) currentGrid = generateGrid();
 
   scene.flowerLayer = new PIXI.Container();
   scene.flowers = [];
@@ -3480,7 +4385,10 @@ function buildScene(L) {
 
     const lbl = new PIXI.Text(label, {
       fontFamily: FONT,
-      fontSize: Math.max(10, 13 * gameScale),
+      // Scale with gameScale (no rigid pixel floor) so text fits the
+      // pill on mobile — the pill itself shrinks proportionally and a
+      // floored font would break out of the pill on small screens.
+      fontSize: 13 * gameScale,
       fill: accent || 0xD4A017,
       letterSpacing: 1.2,
     });
@@ -3490,7 +4398,7 @@ function buildScene(L) {
 
     const val = new PIXI.Text(value, {
       fontFamily: FONT,
-      fontSize: valueFontSize || Math.max(16, 26 * gameScale),
+      fontSize: valueFontSize || (26 * gameScale),
       fill: 0xFFECB3,
     });
     val.anchor.set(0.5);
@@ -3608,8 +4516,8 @@ function buildScene(L) {
     const COLLAPSED_LEFT_CX =  0;       // Win centred when collapsed
     const EXPANDED_LEFT_CX  = -pw / 4;  // Win in left half when expanded
     const EXPANDED_RIGHT_CX =  pw / 4;  // Mult in right half when expanded
-    const labelFs = labelFontSize || Math.max(10, 12 * gameScale);
-    const valueFs = valueFontSize || Math.max(16, 24 * gameScale);
+    const labelFs = labelFontSize || (12 * gameScale);
+    const valueFs = valueFontSize || (24 * gameScale);
 
     // Starting x for each half: permanent pills open expanded; non-permanent
     // start with WIN centred and MULTIPLIER tucked to the right (alpha 0).
@@ -3646,7 +4554,7 @@ function buildScene(L) {
     if (!permanent) {
       greeting = new PIXI.Text('Good luck!', {
         fontFamily: FONT,
-        fontSize: Math.max(18, 28 * gameScale),
+        fontSize: 28 * gameScale,
         fill: 0xFFECB3,
         letterSpacing: 0.5,
       });
@@ -3937,7 +4845,7 @@ function buildScene(L) {
   // by 25% of its own height. Shows running Avalanche total + multiplier
   // across the whole spin. Stays visible permanently (both halves always on).
   const avalanchePillW = Math.min(frameW * 0.78, 640 * gameScale);
-  const avalanchePillH = Math.max(36, 46 * gameScale) + 20 * gameScale;
+  const avalanchePillH = (46 + 20) * gameScale;
   // Pill center Y so the pill overlaps the grid by 25% of its own height:
   //   pill bottom = gridTop + 0.25 * pillH
   //   pill centerY = pill bottom - pillH/2 = gridTop - 0.25 * pillH
@@ -3959,25 +4867,90 @@ function buildScene(L) {
       rightValue: '\u2013',
       rightAccent: 0xFFD700,       // gold for the multiplier side
       permanent:  true,
-      labelFontSize: Math.max(14, 17 * gameScale),
-      valueFontSize: Math.max(22, 34 * gameScale),
+      labelFontSize: 17 * gameScale,
+      valueFontSize: 34 * gameScale,
     });
     app.stage.addChild(scene.winPill);
   } else {
     scene.winPill = null;
   }
 
-  // ─── MECHANIC BUTTONS (top-right) ────────────────────────────────────────
-  // Two separate buttons for the two mechanics — the active one is shown
-  // highlighted, the inactive one dimmed. Clicking the inactive one switches
-  // modes and rebuilds the scene. Disabled while a spin is in flight.
+  // ─── ALT-3 FREE-SPIN MULTIPLIER PILL ────────────────────────────────────
+  // Compact pill above the grid that displays the persistent global bloom
+  // multiplier during Expanding Reels free spins. Only visible while the
+  // alt-3 feature is active. Starts at 2× and bumps +1× per Full Bloom.
+  scene.alt3MultPill = null;
+  if (ALT_MODE === 'alt3') {
+    // Build label + value first so we can size the pill to actually fit
+    // the longest label string ("BLOOM MULT  ×88" etc.). Text-driven
+    // sizing instead of a fixed pillW prevents any clipping.
+    const cont = new PIXI.Container();
+    cont.x = avalancheCX;
+
+    const label = new PIXI.Text('BLOOM MULT', {
+      fontFamily: FONT,
+      fontSize: 16 * gameScale,
+      fill: 0xFFECB3,
+      letterSpacing: 1.5,
+    });
+    const valueText = new PIXI.Text('×2', {
+      fontFamily: FONT,
+      fontSize: 32 * gameScale,
+      fill: 0xFFD54F,
+    });
+    const innerGap = 12 * gameScale;
+    const padX     = 22 * gameScale;
+    const contentW = label.width + innerGap + valueText.width;
+    const pillW    = Math.max(220 * gameScale, contentW + padX * 2);
+    const pillH    = 56 * gameScale;
+
+    const bg = new PIXI.Graphics();
+    bg.lineStyle(2 * gameScale, 0xFFD54F, 1);
+    bg.beginFill(0x2A1808, 0.95);
+    bg.drawRoundedRect(-pillW / 2, -pillH / 2, pillW, pillH, pillH * 0.45);
+    bg.endFill();
+    cont.addChild(bg);
+
+    // Lay out label + value as a single horizontal block, centred in the pill.
+    const blockW = contentW;
+    const blockLeft = -blockW / 2;
+    label.anchor.set(0, 0.5);
+    label.x = blockLeft;
+    label.y = 0;
+    cont.addChild(label);
+    valueText.anchor.set(0, 0.5);
+    valueText.x = blockLeft + label.width + innerGap;
+    valueText.y = -1 * gameScale;
+    cont.addChild(valueText);
+    cont.valueText = valueText;
+
+    // Position vertically using the actual pillH we just computed.
+    cont.y = gridTop - 0.25 * pillH;
+    cont.visible = !!(player.feature.active);
+    if (cont.visible) {
+      valueText.text = `×${player.feature.bloomMult || ALT3_FEATURE_MULT_START}`;
+    }
+    scene.alt3MultPill = cont;
+    app.stage.addChild(cont);
+  }
+
+  // ─── MECHANIC BUTTONS (top, centered) ────────────────────────────────────
+  // Three buttons for the three mechanics — the active one is shown
+  // highlighted, the inactive ones dimmed. Clicking an inactive one opens
+  // a confirm modal explaining the gameplay; PLAY switches mode + rebuilds,
+  // CANCEL backs out. Disabled while a spin is in flight or during the
+  // free-spin feature.
+  // A "GAME MODE" caption sits above the row.
   {
-    const btnW = Math.max(150, 190 * gameScale);
-    const btnH = Math.max(38, 48 * gameScale);
+    // Pure gameScale (no rigid pixel floor) so the trio shrinks on
+    // mobile alongside the rest of the composition. Floored sizes
+    // here would push the buttons off the canvas on narrow screens.
+    const btnW = 190 * gameScale;
+    const btnH = 48 * gameScale;
     const gap  = 10 * gameScale;
-    // Right-align the pair, with a 24px margin from the right edge.
-    const rightEdge = L.sw - 24 * gameScale;
-    const topY      = btnH / 2 + 24 * gameScale;
+    // Make room above the buttons for the GAME MODE caption.
+    const captionY  = 14 * gameScale;
+    const topY      = captionY + 22 * gameScale + btnH / 2;
 
     function makeMechanicButton(mode, label, cx) {
       const cont = new PIXI.Container();
@@ -3986,7 +4959,7 @@ function buildScene(L) {
       const bg   = new PIXI.Graphics();
       const text = new PIXI.Text(label, {
         fontFamily: FONT,
-        fontSize: Math.max(13, 15 * gameScale),
+        fontSize: 15 * gameScale,
         fill: 0xFFECB3,
         letterSpacing: 0.4,
       });
@@ -4031,22 +5004,43 @@ function buildScene(L) {
       cont.on('pointertap', () => {
         if (scene.spinButton && scene.spinButton.busy) return;
         if (player.feature.active) return;   // locked during free spins
-        if (ALT_MODE === mode) return;       // already active — no-op
-        setAltMode(mode);
-        rebuild();                           // redraws everything for the new mode
+        // ALWAYS open the explanation popup — even when the clicked mode
+        // is the one already active. Lets the player re-read what their
+        // current mode does without forcing them to switch off and back.
+        openModeConfirmModal(mode);
       });
 
       return cont;
     }
 
-    // Right-to-left: Tile Multiplier (rightmost), then Chain Multiplier.
-    const tileCX  = rightEdge - btnW / 2;
-    const chainCX = tileCX - btnW - gap;
+    // Left → right: Tile Multiplier, Chain Multiplier, Expanding Reels.
+    // Trio centred horizontally on the canvas.
+    const totalRowW  = 3 * btnW + 2 * gap;
+    const rowLeftCX  = (L.sw - totalRowW) / 2 + btnW / 2;
+    const tileCX     = rowLeftCX;
+    const chainCX    = rowLeftCX + (btnW + gap);
+    const expandCX   = rowLeftCX + 2 * (btnW + gap);
 
-    scene.chainBtn = makeMechanicButton('alt1', 'Chain Multiplier', chainCX);
-    scene.tileBtn  = makeMechanicButton('alt2', 'Tile Multiplier',  tileCX);
-    app.stage.addChild(scene.chainBtn);
+    // ── GAME MODE caption above the trio ──────────────────────────────────
+    const modeCaption = new PIXI.Text('GAME MODE', {
+      fontFamily: FONT,
+      fontSize: 13 * gameScale,
+      fill: 0xFFD54F,
+      letterSpacing: 2,
+    });
+    modeCaption.anchor.set(0.5, 0);
+    modeCaption.x = L.sw / 2;
+    modeCaption.y = captionY;
+    modeCaption.alpha = 0.85;
+    app.stage.addChild(modeCaption);
+
+    scene.tileBtn   = makeMechanicButton('alt2', 'Tile Multiplier',  tileCX);
+    scene.chainBtn  = makeMechanicButton('alt1', 'Chain Multiplier', chainCX);
+    scene.expandBtn = makeMechanicButton('alt3', 'Expanding Reels',  expandCX);
+
     app.stage.addChild(scene.tileBtn);
+    app.stage.addChild(scene.chainBtn);
+    app.stage.addChild(scene.expandBtn);
   }
 
   // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (both modes) ────────────────
@@ -4055,7 +5049,10 @@ function buildScene(L) {
   // spin feature. Alt-2 gets 15 spins with tile-multiplier persistence;
   // alt-1 gets 10 spins with chain-multiplier (emptyCount) persistence.
   {
-    const bfSize = Math.max(120, 140 * gameScale);
+    // Pure gameScale (no rigid pixel floor) — the giant "BUY FEATURE"
+    // button on mobile was the result of a 120px floor that ignored
+    // the canvas size. Now it scales down with everything else.
+    const bfSize = 140 * gameScale;
     const bfW = bfSize;
     const bfH = bfSize;
     // Position: left of grid, top-aligned with grid top. Center of the
@@ -4075,7 +5072,7 @@ function buildScene(L) {
     // Three-line centred layout for the square button: BUY / FEATURE / price.
     const buyLineTop = new PIXI.Text('BUY', {
       fontFamily: FONT,
-      fontSize: Math.max(14, 17 * gameScale),
+      fontSize: 17 * gameScale,
       fill: 0xFFECB3,
       letterSpacing: 0.6,
     });
@@ -4083,7 +5080,7 @@ function buildScene(L) {
     buyLineTop.y = -bfH * 0.28;
     const buyLineMid = new PIXI.Text('FEATURE', {
       fontFamily: FONT,
-      fontSize: Math.max(14, 17 * gameScale),
+      fontSize: 17 * gameScale,
       fill: 0xFFECB3,
       letterSpacing: 0.6,
     });
@@ -4091,7 +5088,7 @@ function buildScene(L) {
     buyLineMid.y = -bfH * 0.07;
     const priceLbl = new PIXI.Text('', {
       fontFamily: FONT,
-      fontSize: Math.max(16, 22 * gameScale),
+      fontSize: 22 * gameScale,
       fill: 0xFFD54F,
     });
     priceLbl.anchor.set(0.5);
@@ -4158,7 +5155,7 @@ function buildScene(L) {
     bannerCont.addChild(bBg);
     const bTitle = new PIXI.Text('FREE SPINS', {
       fontFamily: FONT,
-      fontSize: Math.max(13, 15 * gameScale),
+      fontSize: 15 * gameScale,
       fill: 0xFFECB3,
       letterSpacing: 0.6,
     });
@@ -4167,7 +5164,7 @@ function buildScene(L) {
     bannerCont.addChild(bTitle);
     const bCount = new PIXI.Text('', {
       fontFamily: FONT,
-      fontSize: Math.max(18, 22 * gameScale),
+      fontSize: 22 * gameScale,
       fill: 0xFFD54F,
     });
     bCount.anchor.set(0.5);
@@ -4189,7 +5186,9 @@ function buildScene(L) {
   // to "WIN <amount>". Updated via updateStatusText(…).
   scene.statusText = new PIXI.Text('Good luck!', {
     fontFamily: FONT,
-    fontSize: Math.max(20, 32 * gameScale),
+    // Scale with gameScale so the WIN/Good luck text shrinks on mobile
+    // alongside the pills it sits between.
+    fontSize: 32 * gameScale,
     fill: 0xFFECB3,
     letterSpacing: 0.6,
   });
@@ -4201,7 +5200,7 @@ function buildScene(L) {
   // Small RTP line — low-contrast, near the bottom of the viewport
   scene.rtpText = new PIXI.Text(`RTP 0.00%  |  Spins 0`, {
     fontFamily: FONT,
-    fontSize: Math.max(10, 13 * gameScale),
+    fontSize: 13 * gameScale,
     fill: 0xFFE0A0,
   });
   scene.rtpText.anchor.set(0.5);
@@ -4786,6 +5785,39 @@ function updateStatusText(text) {
     { x: 1, y: 1, duration: 0.28, ease: 'back.out(2)' });
 }
 
+// Animated count-up of the bottom-of-grid "WIN <amount>" status text.
+// Resolves the previously-shown value out of the current text (or 0 if
+// none) and tweens to `target`, formatting each frame. Use during cascade
+// playback so the player sees the win climb in real time instead of
+// snapping to the final number.
+let _statusCountUpObj = null;
+function countUpStatusWin(target) {
+  if (!scene.statusText) return;
+  // Parse the currently-displayed value out of "WIN 123,45" or similar.
+  const cur = scene.statusText.text || '';
+  const m   = cur.match(/[\d.,]+/);
+  const fromVal = m ? parseFloat(m[0].replace(',', '.')) || 0 : 0;
+  if (target <= fromVal) {
+    scene.statusText.text = `WIN ${fmtCurrency(target)}`;
+    return;
+  }
+  // Kill any in-flight count-up so back-to-back updates always converge
+  // on the latest target instead of fighting each other.
+  if (_statusCountUpObj) gsap.killTweensOf(_statusCountUpObj);
+  _statusCountUpObj = { v: fromVal };
+  gsap.to(_statusCountUpObj, {
+    v: target,
+    duration: 0.45,
+    ease: 'power2.out',
+    onUpdate: () => {
+      scene.statusText.text = `WIN ${fmtCurrency(_statusCountUpObj.v)}`;
+    },
+    onComplete: () => {
+      scene.statusText.text = `WIN ${fmtCurrency(target)}`;
+    },
+  });
+}
+
 function updateRtpText() {
   if (!scene.rtpText) return;
   const s = BloomSort.stats;
@@ -4837,6 +5869,11 @@ function startFeature() {
   player.feature.totalWin        = 0;
   player.feature.costPaid        = cost;
   player.feature.emptyCountCarry = 0;
+  // Alt-3: free spins start at 4×4 just like the first base-game spin,
+  // and the global bloom multiplier seeds at 2×.
+  player.feature.gridSizeCarry = (ALT_MODE === 'alt3') ? GAME.ALT3_SIZES[0] : null;
+  player.feature.bloomMult     = (ALT_MODE === 'alt3') ? ALT3_FEATURE_MULT_START : 1;
+  player.feature.bloomCount    = 0;
   // Clear any leftover tile badges from prior spins — feature tiles start
   // fresh and accumulate from here.
   clearAllTileBadges();
@@ -4859,6 +5896,9 @@ function endFeature() {
   player.feature.totalWin        = 0;
   player.feature.costPaid        = 0;
   player.feature.emptyCountCarry = 0;
+  player.feature.gridSizeCarry   = null;
+  player.feature.bloomMult       = 1;
+  player.feature.bloomCount      = 0;
   // Credit the full feature win to the balance NOW — during the feature
   // itself the balance was held unchanged.
   if (totalWon > 0) {
@@ -4877,8 +5917,18 @@ function refreshFeatureUI() {
   if (scene.featureBanner && scene.featureBanner._refresh) scene.featureBanner._refresh();
   refreshBetControlsEnabled();
   // Mechanic toggle disabled mid-feature — redraw to reflect.
-  if (scene.chainBtn && scene.chainBtn._redraw) scene.chainBtn._redraw();
-  if (scene.tileBtn  && scene.tileBtn._redraw)  scene.tileBtn._redraw();
+  if (scene.chainBtn  && scene.chainBtn._redraw)  scene.chainBtn._redraw();
+  if (scene.tileBtn   && scene.tileBtn._redraw)   scene.tileBtn._redraw();
+  if (scene.expandBtn && scene.expandBtn._redraw) scene.expandBtn._redraw();
+  // Alt-3 bloom multiplier pill: visible only during the alt-3 feature.
+  if (scene.alt3MultPill) {
+    const visible = (ALT_MODE === 'alt3' && player.feature.active);
+    scene.alt3MultPill.visible = visible;
+    if (visible && scene.alt3MultPill.valueText) {
+      const mult = player.feature.bloomMult || ALT3_FEATURE_MULT_START;
+      scene.alt3MultPill.valueText.text = `×${mult}`;
+    }
+  }
   updateSpinButtonState();
 }
 
@@ -5209,7 +6259,12 @@ function openPaytableModal(L) {
     card.endFill();
     paytableContent.addChild(card);
 
-    const preview = new FlowerSymbol(color.name, 8, flowerPreviewCell);
+    // Petal count for the preview must match the current mode's max
+    // bloom (8 for alt-1/alt-2, 6 for alt-3). FlowerSymbol's
+    // _layoutPetals early-returns when n exceeds the mode's cap, which
+    // would render the preview as a bare pot in alt-3 if we passed 8.
+    const previewPetals = (ALT_MODE === 'alt3') ? GAME.ALT3_MAX_PETALS : 8;
+    const preview = new FlowerSymbol(color.name, previewPetals, flowerPreviewCell);
     preview.x = cx + cardH / 2;
     preview.y = cy + cardH / 2;
     paytableContent.addChild(preview);
@@ -5246,7 +6301,47 @@ function openPaytableModal(L) {
   rulesHeader.y = panelY + 102 * scale;
   rulesContent.addChild(rulesHeader);
 
-  const rulesText = (ALT_MODE === 'alt2')
+  const rulesText = (ALT_MODE === 'alt3')
+? `The Grid
+• Spins start on a 4×4 grid of flower pots. Each flower has a colour and
+  starts with 1–3 petals.
+• Every cascade that produces a Full Bloom EXPANDS the grid by one row
+  and one column, anchored at the bottom-left corner:
+    4×4  →  5×5  →  6×6 (max)
+• Existing flowers stay in place; the freshly-revealed row (top) and
+  column (right) are filled with brand-new random flowers.
+• In the base game the grid resets to 4×4 at the start of every new spin.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• A flower blooms at 6 petals (instead of 8).
+• A Full Bloom pays its colour's base value × bet, and triggers the next
+  grid expansion (if the grid is below 6×6).
+
+Empty Dissolve
+• When a flower gives away all its petals, it dissolves with a puff.
+• Empty dissolves do NOT trigger expansions on their own.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers
+  (along with the new row/column when the grid grew this cascade).
+• Transfers run again on the new (possibly larger) grid; cascades keep
+  going as long as new blooms or empties happen.
+
+Buy Feature — 10 Free Spins
+• Pays 100× bet for 10 free spins.
+• The grid size DOES NOT reset between free spins — once the grid grows
+  to 5×5 or 6×6, it stays there for the rest of the feature.
+• A persistent BLOOM MULTIPLIER appears at the top of the grid:
+  – Starts at ×2.
+  – Bumps +×1 every time a flower fully blooms (across every cascade,
+    every free spin — it never resets until the feature ends).
+  – Multiplies every Full Bloom payout for the rest of the feature.`
+: (ALT_MODE === 'alt2')
 ? `The Grid
 • 4 rows × 5 columns of flower pots. Every cell always holds one flower.
 • Each flower has a colour and starts with 1 – 4 petals.
@@ -5317,19 +6412,46 @@ Buy Feature
 • The spin multiplier does NOT reset between free spins — the tier
   ladder keeps climbing from wherever the previous free spin ended.`;
 
+  // ── Scrollable viewport for the rules body ─────────────────────────────
+  // Rules text grew long enough (especially with alt-3 / Expanding Reels)
+  // that it overflows the modal. Wrap it in a masked viewport and let the
+  // mouse wheel + drag scroll through the content. A thin scrollbar on
+  // the right edge gives a visual hint of position + scrollability.
+  const sbW          = 6 * scale;
+  const sbGap        = 6 * scale;
+  const scrollVPx    = panelX + panelPadX + 10 * scale;
+  const scrollVPy    = panelY + 130 * scale;
+  const scrollVPw    = panelW - panelPadX * 2 - 20 * scale;
+  const scrollVPh    = (panelY + panelH - 50 * scale) - scrollVPy;
+
+  const scrollViewport = new PIXI.Container();
+  scrollViewport.x = scrollVPx;
+  scrollViewport.y = scrollVPy;
+  rulesContent.addChild(scrollViewport);
+
+  const scrollMask = new PIXI.Graphics();
+  scrollMask.beginFill(0xFFFFFF);
+  scrollMask.drawRect(scrollVPx, scrollVPy, scrollVPw, scrollVPh);
+  scrollMask.endFill();
+  rulesContent.addChild(scrollMask);
+  scrollViewport.mask = scrollMask;
+
+  const scrollContent = new PIXI.Container();
+  scrollViewport.addChild(scrollContent);
+
   const rulesBody = new PIXI.Text(rulesText, {
     fontFamily: 'Arial, sans-serif',
     fontSize: 13 * scale,
     fill: 0x3D1C02,
     lineHeight: 18 * scale,
     wordWrap: true,
-    wordWrapWidth: panelW - panelPadX * 2 - 20 * scale,
+    wordWrapWidth: scrollVPw - sbW - sbGap,
   });
-  rulesBody.x = panelX + panelPadX + 10 * scale;
-  rulesBody.y = panelY + 130 * scale;
-  rulesContent.addChild(rulesBody);
+  rulesBody.x = 0;
+  rulesBody.y = 0;
+  scrollContent.addChild(rulesBody);
 
-  // Tripwire values (colour weights etc.) for power users
+  // Tripwire footer: shown INSIDE the scrollable area at the bottom.
   const rulesFoot = new PIXI.Text(
     'Colour weights & base pays are shown in the Paytable tab.',
     {
@@ -5338,10 +6460,83 @@ Buy Feature
       fill: 0x9C6A1A,
     }
   );
-  rulesFoot.anchor.set(0.5);
-  rulesFoot.x = panelX + panelW / 2;
-  rulesFoot.y = panelY + panelH - 28 * scale;
-  rulesContent.addChild(rulesFoot);
+  rulesFoot.x = 0;
+  rulesFoot.y = rulesBody.height + 18 * scale;
+  scrollContent.addChild(rulesFoot);
+
+  // ── Scrollbar (track + thumb) ─────────────────────────────────────────
+  const contentH  = rulesFoot.y + rulesFoot.height;
+  const maxScroll = Math.max(0, contentH - scrollVPh);
+  const sbX       = scrollVPx + scrollVPw - sbW;
+
+  const sbTrack = new PIXI.Graphics();
+  sbTrack.beginFill(0x3D1C02, 0.10);
+  sbTrack.drawRoundedRect(sbX, scrollVPy, sbW, scrollVPh, sbW / 2);
+  sbTrack.endFill();
+  sbTrack.visible = (maxScroll > 0);
+  rulesContent.addChild(sbTrack);
+
+  const sbThumb = new PIXI.Graphics();
+  let scrollY = 0;
+  const drawThumb = () => {
+    sbThumb.clear();
+    if (maxScroll <= 0) return;
+    const thumbH = Math.max(24 * scale, scrollVPh * (scrollVPh / contentH));
+    const thumbY = scrollVPy + (scrollY / maxScroll) * (scrollVPh - thumbH);
+    sbThumb.beginFill(0xC08050, 0.95);
+    sbThumb.drawRoundedRect(sbX, thumbY, sbW, thumbH, sbW / 2);
+    sbThumb.endFill();
+  };
+  drawThumb();
+  rulesContent.addChild(sbThumb);
+
+  const setScroll = (y) => {
+    if (maxScroll <= 0) return;
+    scrollY = Math.max(0, Math.min(maxScroll, y));
+    scrollContent.y = -scrollY;
+    drawThumb();
+  };
+
+  // Mouse-wheel scrolling — Pixi doesn't forward 'wheel' through the scene
+  // tree, so we attach to the canvas DOM element and dispatch only when
+  // this modal + its rules tab are visible.
+  const onWheel = (e) => {
+    if (!scene.paytableModal) return;
+    if (!rulesContent.visible)  return;
+    if (maxScroll <= 0)         return;
+    e.preventDefault();
+    setScroll(scrollY + e.deltaY);
+  };
+  app.view.addEventListener('wheel', onWheel, { passive: false });
+
+  // Touch / drag-to-scroll inside the viewport
+  let dragging = false, dragStartY = 0, dragStartScroll = 0;
+  const dragHit = new PIXI.Container();
+  dragHit.eventMode = 'static';
+  dragHit.cursor    = (maxScroll > 0) ? 'grab' : 'default';
+  dragHit.hitArea   = new PIXI.Rectangle(scrollVPx, scrollVPy, scrollVPw, scrollVPh);
+  dragHit.on('pointerdown', (e) => {
+    if (maxScroll <= 0) return;
+    dragging = true;
+    dragStartY = e.global.y;
+    dragStartScroll = scrollY;
+    dragHit.cursor = 'grabbing';
+  });
+  dragHit.on('globalpointermove', (e) => {
+    if (!dragging) return;
+    setScroll(dragStartScroll - (e.global.y - dragStartY));
+  });
+  const stopDrag = () => { dragging = false; dragHit.cursor = (maxScroll > 0) ? 'grab' : 'default'; };
+  dragHit.on('pointerup',        stopDrag);
+  dragHit.on('pointerupoutside', stopDrag);
+  rulesContent.addChild(dragHit);
+
+  // Stash the wheel-listener cleanup on the modal so closePaytableModal()
+  // can remove it — otherwise we'd leak a listener every time the modal
+  // is opened.
+  modal._cleanup = () => {
+    try { app.view.removeEventListener('wheel', onWheel); } catch (_) {}
+  };
 
   modal.alpha = 0;
   app.stage.addChild(modal);
@@ -5354,6 +6549,7 @@ function closePaytableModal() {
   const m = scene.paytableModal;
   if (!m) return;
   scene.paytableModal = null;
+  if (typeof m._cleanup === 'function') { try { m._cleanup(); } catch (_) {} }
   gsap.to(m, {
     alpha: 0,
     duration: 0.18,
@@ -5384,20 +6580,72 @@ function _openSimpleModal({ title, bodyLines, buttons }) {
   modal.addChild(backdrop);
 
   // Panel sized relative to content.
-  const panelW = Math.min(L.sw * 0.8, 480 * scale);
+  const panelW = Math.min(L.sw * 0.85, 540 * scale);
   const titleFS = Math.max(24, 32 * scale);
-  const bodyFS  = Math.max(16, 22 * scale);
   const btnH    = Math.max(44, 56 * scale);
   const btnFS   = Math.max(16, 20 * scale);
   const padY    = 28 * scale;
-  const lineGap = 8 * scale;
+  const wrapW   = panelW - padY * 2;
 
-  // Measure body height
-  const titleH = titleFS + lineGap;
-  const bodyH  = (bodyLines.length) * (bodyFS + lineGap);
+  // ── Auto-fit body font size. We pre-render each line at a baseline
+  // font size, measure the total stacked height (taking word-wrap into
+  // account so wrapped lines don't overlap), and pick the largest
+  // candidate font size whose total body height fits within the available
+  // vertical budget. This makes the popup adapt to ANY screen height
+  // and ANY body length without smushing or overflowing.
+  const titleH = titleFS + 12 * scale;
   const btnRowH = btnH + padY;
-  const panelH = padY + titleH + padY * 0.5 + bodyH + padY + btnRowH;
+  // Leave 12% of the screen height as min outside margin so panel never
+  // hugs the edges.
+  const maxPanelH = L.sh * 0.88;
+  const maxBodyH  = maxPanelH - (padY + titleH + padY * 0.5 + padY + btnRowH);
 
+  // Try fonts from large to small; stop at the largest that fits.
+  const FONT_CANDIDATES = [28, 24, 22, 20, 18, 16, 14, 13, 12];
+  let chosenFS  = FONT_CANDIDATES[FONT_CANDIDATES.length - 1] * scale;
+  let chosenLineGap = 8 * scale;
+  let chosenBodyH = 0;
+  let chosenLineHeights = [];
+  for (const candidate of FONT_CANDIDATES) {
+    const fs = candidate * scale;
+    const gap = Math.max(4, fs * 0.36);
+    const heights = [];
+    let totalH = 0;
+    for (const line of bodyLines) {
+      const isEmphasis = line.emphasis === true;
+      const lineFS = isEmphasis ? fs * 1.4 : fs;
+      const probe = new PIXI.Text(line.text ?? line, {
+        fontFamily: FONT,
+        fontSize: lineFS,
+        wordWrap: true,
+        wordWrapWidth: wrapW,
+      });
+      const h = probe.height;
+      heights.push(h);
+      totalH += h + gap;
+      probe.destroy();
+    }
+    // Strip the trailing gap (no gap after the last line).
+    if (heights.length) totalH -= gap;
+    if (totalH <= maxBodyH) {
+      chosenFS = fs;
+      chosenLineGap = gap;
+      chosenBodyH = totalH;
+      chosenLineHeights = heights;
+      break;
+    }
+    // Always keep the last (smallest) result as a fallback.
+    chosenFS = fs;
+    chosenLineGap = gap;
+    chosenBodyH = totalH;
+    chosenLineHeights = heights;
+  }
+  const bodyFS = chosenFS;
+  const lineGap = chosenLineGap;
+  const bodyH   = chosenBodyH;
+  const lineHeights = chosenLineHeights;
+
+  const panelH = padY + titleH + padY * 0.5 + bodyH + padY + btnRowH;
   const panelX = (L.sw - panelW) / 2;
   const panelY = (L.sh - panelH) / 2;
 
@@ -5423,9 +6671,13 @@ function _openSimpleModal({ title, bodyLines, buttons }) {
     modal.addChild(t);
   }
 
-  // Body lines
+  // Body lines. We advance lineY by the ACTUAL rendered text height
+  // (captured during the auto-fit measure pass) so word-wrapped lines
+  // don't overlap the next bodyLine — which was the cause of the
+  // smushed-text bug after multi-line explanations were added.
   let lineY = panelY + padY + titleH + padY * 0.5;
-  for (const line of bodyLines) {
+  for (let i = 0; i < bodyLines.length; i++) {
+    const line = bodyLines[i];
     const isEmphasis = line.emphasis === true;
     const t = new PIXI.Text(line.text ?? line, {
       fontFamily: FONT,
@@ -5433,13 +6685,14 @@ function _openSimpleModal({ title, bodyLines, buttons }) {
       fill: isEmphasis ? 0xFFD54F : 0xFFECB3,
       align: 'center',
       wordWrap: true,
-      wordWrapWidth: panelW - padY * 2,
+      wordWrapWidth: wrapW,
     });
     t.anchor.set(0.5, 0);
     t.x = panelX + panelW / 2;
     t.y = lineY;
     modal.addChild(t);
-    lineY += (isEmphasis ? bodyFS * 1.4 : bodyFS) + lineGap;
+    const h = (lineHeights && lineHeights[i] != null) ? lineHeights[i] : t.height;
+    lineY += h + lineGap;
   }
 
   // Buttons row
@@ -5498,6 +6751,75 @@ function _openSimpleModal({ title, bodyLines, buttons }) {
 
   gsap.to(modal, { alpha: 1, duration: 0.18, ease: 'power2.out' });
   return { modal, close };
+}
+
+// Mode-switch confirm modal — triggered by clicking an inactive mechanic
+// button. Shows a short explanation of the target mode and a green PLAY /
+// red CANCEL pair. PLAY commits the switch (setAltMode + rebuild).
+function openModeConfirmModal(mode) {
+  const META = {
+    alt1: {
+      title: 'Chain Multiplier',
+      lines: [
+        'A 4×5 grid of flower pots. Adjacent same-colour flowers',
+        'exchange petals each cascade.',
+        '',
+        'Every empty pot bumps a SPIN MULTIPLIER along a tier ladder',
+        '(2× → 3× → 5× → 10× → +5× per 5 more empties). The final',
+        'Bloom Win for the whole spin is multiplied by that value.',
+      ],
+    },
+    alt2: {
+      title: 'Tile Multiplier',
+      lines: [
+        'A 4×5 grid of flower pots. Adjacent same-colour flowers',
+        'exchange petals each cascade.',
+        '',
+        'Every Full Bloom DROPS a multiplier tile on its own cell',
+        'plus half that value on each of the 8 surrounding cells.',
+        'Future blooms on a tile pay base × the cell\u2019s total value.',
+      ],
+    },
+    alt3: {
+      title: 'Expanding Reels',
+      lines: [
+        'Spins start on a 4×4 grid; flowers bloom at 6 petals.',
+        'Adjacent same-colour flowers exchange petals each cascade.',
+        '',
+        'Every winning cascade GROWS the grid one step',
+        '(4×4 → 5×5 → 6×6), anchored at the bottom-left corner.',
+        'Existing flowers stay put; the new row + column are fresh.',
+      ],
+    },
+  };
+  const m = META[mode];
+  if (!m) return;
+  const bodyLines = m.lines.map(line => ({ text: line }));
+  _openSimpleModal({
+    title: m.title,
+    bodyLines,
+    buttons: [
+      {
+        label: 'CANCEL',
+        fill:  0xB71C1C,
+        hoverFill: 0xD32F2F,
+        stroke: 0xEF9A9A,
+        onTap: (close) => close(),
+      },
+      {
+        label: 'PLAY',
+        fill:  0x2E7D32,
+        hoverFill: 0x3FA143,
+        stroke: 0x7FE080,
+        onTap: (close) => {
+          close();
+          if (ALT_MODE === mode) return;
+          setAltMode(mode);
+          rebuild();
+        },
+      },
+    ],
+  });
 }
 
 function openBuyFeatureModal() {
@@ -5614,8 +6936,18 @@ async function onSpinClick() {
   const runOpts = {};
   if (inFeature) {
     runOpts.freeSpin = true;
-    if (ALT_MODE === 'alt2') runOpts.cellMults       = player.feature.cellMults;
-    if (ALT_MODE === 'alt1') runOpts.emptyCountStart = player.feature.emptyCountCarry || 0;
+    if (ALT_MODE === 'alt2') runOpts.cellMults          = player.feature.cellMults;
+    if (ALT_MODE === 'alt1') runOpts.emptyCountStart    = player.feature.emptyCountCarry || 0;
+    if (ALT_MODE === 'alt3') {
+      // Carry the previous free spin's grid size so we DON'T reset to
+      // 4×4 between free spins — and the persistent global bloom
+      // multiplier (starts at 2× when the feature begins, +1× per Full
+      // Bloom forever during the feature). Mark the feature as active so
+      // the model actually applies the multiplier.
+      runOpts.gridSizeStart      = player.feature.gridSizeCarry || GAME.ALT3_SIZES[0];
+      runOpts.alt3BloomMultStart = player.feature.bloomMult     || ALT3_FEATURE_MULT_START;
+      runOpts.alt3FeatureActive  = true;
+    }
   }
   const result = BloomSort.runSpin(bet, runOpts);
   if (inFeature && ALT_MODE === 'alt2' && result.cellMults) {
@@ -5624,21 +6956,52 @@ async function onSpinClick() {
   if (inFeature && ALT_MODE === 'alt1' && typeof result.emptyCount === 'number') {
     player.feature.emptyCountCarry = result.emptyCount;
   }
+  if (inFeature && ALT_MODE === 'alt3') {
+    if (typeof result.alt3GridSizeEnd === 'number') {
+      player.feature.gridSizeCarry = result.alt3GridSizeEnd;
+    }
+    if (typeof result.alt3BloomMultEnd === 'number') {
+      player.feature.bloomMult = result.alt3BloomMultEnd;
+    }
+    player.feature.bloomCount = (player.feature.bloomCount || 0)
+                              + (result.alt3BloomCount || 0);
+  }
 
   if (!animator) animator = new SpinAnimator({ scene, app });
 
   animator.onProgress = (ev) => {
     if (ev.type === 'dissolve') {
+      // Alt-3 feature: bump the visible multiplier pill ONLY when the
+      // value actually changed. Empty-only cascades emit a dissolve
+      // event with the unchanged multiplier; we'd otherwise pulse the
+      // pill animation for nothing, which reads as a false "you got
+      // a bloom" signal.
+      if (ALT_MODE === 'alt3' && player.feature.active && scene.alt3MultPill
+          && typeof ev.alt3BloomMult === 'number') {
+        const pill = scene.alt3MultPill;
+        pill.visible = true;
+        if (pill.valueText) {
+          const newLabel = `×${ev.alt3BloomMult}`;
+          if (pill.valueText.text !== newLabel) {
+            pill.valueText.text = newLabel;
+            gsap.fromTo(pill.valueText.scale,
+              { x: 1.4, y: 1.4 },
+              { x: 1, y: 1, duration: 0.45, ease: 'elastic.out(1, 0.4)' });
+          }
+        }
+      }
       const runningWin = ev.payoutTotal * bet;
-      if (ALT_MODE === 'alt2') {
-        // Tile-multiplier mode: running total shows in the bottom status
-        // text. During the free-spin feature, it's cumulative across all
-        // 15 spins (feature.totalWin baseline + this spin's running).
+      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt3') {
+        // Tile-multiplier and Expanding-Reels modes: running total shows
+        // in the bottom status text. Counts UP smoothly from whatever
+        // value is currently shown to the new running total. During the
+        // free-spin feature, it's cumulative across all spins
+        // (feature.totalWin baseline + this spin's running).
         const displayWin = inFeature
           ? player.feature.totalWin + runningWin
           : runningWin;
         if (displayWin > 0) {
-          updateStatusText(`WIN ${fmtCurrency(displayWin)}`);
+          countUpStatusWin(displayWin);
         }
       } else {
         // Chain-multiplier mode: the top pill shows the running pre-mult win.
@@ -5745,6 +7108,12 @@ async function onSpinClick() {
         }
         // Buy-feature affordability can change as balance changes.
         if (scene.buyBtn && scene.buyBtn._refresh) scene.buyBtn._refresh();
+        // If a resize fired DURING the spin, rebuild() deferred itself.
+        // Now is safe — catch up so the layout reflects the new viewport.
+        // Skipped if we're chaining straight into another free spin.
+        if (typeof _runPendingRebuild === 'function' && !(doAutoSpin && player.feature.active)) {
+          _runPendingRebuild();
+        }
         // Auto-chain the next free spin after a short breather.
         if (doAutoSpin && player.feature.active) {
           setTimeout(() => { onSpinClick(); }, 400);
@@ -5759,18 +7128,53 @@ async function onSpinClick() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // INITIAL BUILD & RESIZE
 // ═══════════════════════════════════════════════════════════════════════════════
+// Tracks whether a resize was deferred because a spin was in flight.
+// When the spin finishes, animator.onEnd checks this flag and runs a
+// catch-up rebuild.
+let _pendingRebuild = false;
+
 function rebuild() {
+  // CRITICAL: never destroy the scene while an animator is mid-spin —
+  // the in-flight events would keep walking destroyed/re-created sprites
+  // and produce massive heal-eoc desync (cross-colour adopt errors,
+  // petal-count drift). Defer until the spin lands; animator.onEnd
+  // runs `_runPendingRebuild()` to catch up.
+  if (animator && animator.playing) {
+    _pendingRebuild = true;
+    return;
+  }
+  const L = calculateLayout(app.screen.width, app.screen.height);
+  buildScene(L);
+}
+
+function _runPendingRebuild() {
+  if (!_pendingRebuild) return;
+  _pendingRebuild = false;
   const L = calculateLayout(app.screen.width, app.screen.height);
   buildScene(L);
 }
 
 rebuild();
 
+// Resize bookkeeping. We debounce so a flurry of resize events (browser
+// chrome animating in/out, virtual keyboard, orientation change) collapses
+// into ONE rebuild — and that rebuild self-defers if a spin is playing.
 let resizeTimer = null;
-window.addEventListener('resize', () => {
+const _onResize = () => {
   if (resizeTimer) clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(rebuild, 50);
+  resizeTimer = setTimeout(rebuild, 120);
+};
+window.addEventListener('resize', _onResize);
+// Mobile: orientation change fires AFTER the geometry has settled.
+window.addEventListener('orientationchange', () => {
+  // Two-shot: rebuild now and again after the address-bar collapse settles.
+  _onResize();
+  setTimeout(_onResize, 350);
 });
+// iOS Safari fires visualViewport.resize when the URL bar shows/hides.
+// We DON'T rebuild on every visualViewport.resize because it fires
+// continuously while the address bar animates, which would queue a
+// flood of rebuilds. Only listen for the size-stable events above.
 
 // ─── KEYBOARD: Space = spin ─────────────────────────────────────────────────
 // Standard slot-game convention — hitting space triggers the spin. We also
