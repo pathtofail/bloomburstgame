@@ -247,7 +247,14 @@ function expandGrid(oldGrid, newSize) {
       const oldC = c;
       if (oldR >= 0 && oldR < oldSize && oldC < oldSize
           && oldGrid[oldR]) {
-        row.push(oldGrid[oldR][oldC] ? { ...oldGrid[oldR][oldC] } : null);
+        const src = oldGrid[oldR][oldC];
+        if (src) {
+          const copy = { ...src };
+          if (src.petalColors) copy.petalColors = src.petalColors.slice();
+          row.push(copy);
+        } else {
+          row.push(null);
+        }
       } else {
         row.push(null);
       }
@@ -281,7 +288,53 @@ function weightedPick(items) {
   return items[items.length - 1];
 }
 
+// ─── Alt-4 (Tile Multiplier with Wilds) ─────────────────────────────────────
+// 5% of cells spawn as WILDs in alt-4. WILDs are multi-coloured pots that
+// only OUTFLOW petals (never receive). Each WILD petal has its own colour
+// drawn from the standard colour weights; on transfer it's sent to the
+// nearest grid-wide cell whose colour matches that petal. When a WILD
+// runs out of petals it dissolves like an empty pot (no Full Bloom).
+const ALT4_WILD_SPAWN_CHANCE = 0.05;
+const ALT4_WILD_PETAL_WEIGHTS = [
+  { count: 4, weight: 35 },
+  { count: 5, weight: 28 },
+  { count: 6, weight: 18 },
+  { count: 7, weight: 12 },
+  { count: 8, weight:  7 },
+];
+
+function isWildCell(cell) { return !!(cell && cell.wild); }
+
+// How many WILDs have been spawned during the current spin. Capped at 1
+// — see spawnCell(). Reset at the top of runSpin().
+let _alt4WildsThisSpin = 0;
+
+function spawnWildCell() {
+  const n = weightedPick(ALT4_WILD_PETAL_WEIGHTS).count;
+  const petalColors = [];
+  for (let i = 0; i < n; i++) {
+    petalColors.push(weightedPick(GAME.COLORS).name);
+  }
+  return {
+    wild: true,
+    color: '__wild__',     // sentinel so existing same-colour checks fail
+    petals: n,             // unified petal count (matches regular cells)
+    petalColors,           // ordered list — petals are popped from the end
+  };
+}
+
 function spawnCell() {
+  // Alt-4 sprinkles WILDs in at a small per-cell rate. The
+  // _alt4WildsThisSpin counter caps the total WILDs created during a
+  // single spin to ONE — once one has spawned (initial grid OR refill),
+  // subsequent rolls fall through to the regular flower path. runSpin
+  // resets the counter at the top of each spin.
+  if (ALT_MODE === 'alt4'
+      && _alt4WildsThisSpin === 0
+      && _rng() < ALT4_WILD_SPAWN_CHANCE) {
+    _alt4WildsThisSpin++;
+    return spawnWildCell();
+  }
   // Alt-3 (Expanding Reels) blooms at 6 petals — cap initial petal counts
   // at 3 AND lock the 3-petal share at 10% (so a freshly-spawned half-
   // bloom is rare). The remaining 90% is split between 1 and 2 in the
@@ -367,12 +420,12 @@ const ALT_MODE_KEY = 'bloom_burst_alt_mode';
 let ALT_MODE = (() => {
   try {
     const v = localStorage.getItem(ALT_MODE_KEY);
-    if (v === 'alt1' || v === 'alt2' || v === 'alt3') return v;
+    if (v === 'alt1' || v === 'alt2' || v === 'alt3' || v === 'alt4') return v;
   } catch (_) {}
   return 'alt2';
 })();
 function setAltMode(m) {
-  if (m !== 'alt1' && m !== 'alt2' && m !== 'alt3') return;
+  if (m !== 'alt1' && m !== 'alt2' && m !== 'alt3' && m !== 'alt4') return;
   ALT_MODE = m;
   // Reset alt-3 grid back to 4×4 whenever we (re-)enter alt-3 from another
   // mode. Mirror the new dims into GAME.* so model + tests + scene agree.
@@ -412,12 +465,33 @@ function generateGrid() {
 }
 
 function cloneGrid(grid) {
-  return grid.map(row => row.map(cell => cell ? { ...cell } : null));
+  return grid.map(row => row.map(cell => {
+    if (!cell) return null;
+    const copy = { ...cell };
+    // Deep-copy WILD petalColors so independent passes don't alias the
+    // same array (transferPass mutates next[r][c].petalColors).
+    if (cell.petalColors) copy.petalColors = cell.petalColors.slice();
+    return copy;
+  }));
 }
 
 // Single transfer pass. Copy-based simultaneous evaluation.
-// Returns { nextGrid, moves }. moves = [{ from:{r,c}, to:{r,c}, color }]
-function transferPass(grid) {
+// Returns { nextGrid, moves }. moves = [{ from:{r,c}, to:{r,c}, color, wild? }]
+//
+// Two transfer rules now coexist:
+//  1. REGULAR cells: send one petal to a same-colour orthogonal neighbour
+//     (right > down preference). Skip neighbour if it's a WILD (WILDs
+//     never receive).
+//  2. WILD cells: pop one petal whose colour matches the closest grid-wide
+//     cell of that colour (Manhattan distance). The petal flies all the
+//     way there. WILDs hold a stack of multi-coloured petals; the chosen
+//     petal is removed from petalColors as well as decrementing petals.
+function transferPass(grid, opts) {
+  // opts.kind:
+  //   'regular' — only regular flowers send petals this pass; WILDs sit still
+  //   'wild'    — only WILDs send petals this pass; regular flowers sit still
+  //   undefined / 'all' — both run together (legacy behaviour)
+  const kind = (opts && opts.kind) || 'all';
   const next = cloneGrid(grid);
   const moves = [];
   const DIRS = [
@@ -430,13 +504,66 @@ function transferPass(grid) {
       const cell = grid[r][c];
       if (!cell || cell.petals <= 0) continue;
 
+      // ── WILD outflow ──────────────────────────────────────────────────
+      if (cell.wild) {
+        if (kind === 'regular') continue;     // WILDs hold during regular phase
+        // For each petal colour the WILD holds, find the closest cell
+        // grid-wide whose colour matches AND has capacity. Pick the
+        // (petalIndex, target) pair with the SMALLEST Manhattan distance;
+        // ties broken by reading order on the target cell.
+        const colors = cell.petalColors || [];
+        let bestDist = Infinity;
+        let bestPetalIdx = -1;
+        let bestTarget = null;
+        for (let pi = 0; pi < colors.length; pi++) {
+          const wantColor = colors[pi];
+          for (let tr = 0; tr < GAME.ROWS; tr++) {
+            for (let tc = 0; tc < GAME.COLS; tc++) {
+              if (tr === r && tc === c) continue;
+              const target = grid[tr][tc];
+              if (!target || target.wild) continue;
+              // Skip empty pots — they've already drained themselves
+              // and are about to dissolve, so a WILD petal landing there
+              // would just vanish with the dissolve. Ignore them.
+              if (target.petals <= 0) continue;
+              if (target.color !== wantColor) continue;
+              if (next[tr][tc].petals >= GAME.MAX_PETALS) continue;
+              const dist = Math.abs(tr - r) + Math.abs(tc - c);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestPetalIdx = pi;
+                bestTarget = { r: tr, c: tc };
+              }
+            }
+          }
+        }
+        if (bestTarget) {
+          // Remove the chosen petal from the WILD's stack (visually + count).
+          const sentColor = colors[bestPetalIdx];
+          next[r][c].petalColors = colors.slice();
+          next[r][c].petalColors.splice(bestPetalIdx, 1);
+          next[r][c].petals -= 1;
+          next[bestTarget.r][bestTarget.c].petals += 1;
+          moves.push({
+            from:   { r, c },
+            to:     bestTarget,
+            color:  sentColor,
+            wild:   true,
+            petalIndex: bestPetalIdx,
+          });
+        }
+        continue;   // WILDs never use the regular DIRS branch
+      }
+
+      // ── Regular cell outflow (same-colour right/down neighbour) ──────
+      if (kind === 'wild') continue;          // regulars hold during wild phase
       for (const dir of DIRS) {
         const nr = r + dir.dr, nc = c + dir.dc;
         if (nr < 0 || nr >= GAME.ROWS || nc < 0 || nc >= GAME.COLS) continue;
         const neighbor = grid[nr][nc];
         if (!neighbor) continue;
+        if (neighbor.wild) continue;          // WILDs never receive
         if (neighbor.color !== cell.color) continue;
-        // Read sender state from original grid; check receiver capacity against copy
         if (next[nr][nc].petals >= GAME.MAX_PETALS) continue;
 
         next[r][c].petals  -= 1;
@@ -452,14 +579,48 @@ function transferPass(grid) {
 
 // Run transfer passes until stable. Returns { finalGrid, passes } where
 // passes = [{ passIndex, moves, gridAfter }].
+//
+// Two-phase ordering when WILDs are present (alt-4):
+//   1. REGULAR cells run until they stabilise (no more same-colour
+//      transfers possible).
+//   2. ONE WILD pass fires — each WILD sends one matching-colour petal
+//      to its nearest target.
+//   3. If the wild pass produced any moves, regular flowers may now have
+//      new same-colour chains available — go back to step 1.
+//   4. Stop when neither regulars nor wilds can move.
+//
+// For modes without WILDs the wild phase always emits zero moves, so
+// behaviour reduces to the original "regular-only" loop.
 function runTransfers(grid) {
   const passes = [];
   let current = grid;
-  for (let i = 0; i < GAME.MAX_TRANSFER_PASSES; i++) {
-    const { nextGrid, moves } = transferPass(current);
-    if (moves.length === 0) break;
-    passes.push({ passIndex: i, moves, gridAfter: cloneGrid(nextGrid) });
-    current = nextGrid;
+  let i = 0;
+  while (i < GAME.MAX_TRANSFER_PASSES) {
+    // Phase A — regular flowers until stable.
+    while (i < GAME.MAX_TRANSFER_PASSES) {
+      const { nextGrid, moves } = transferPass(current, { kind: 'regular' });
+      if (moves.length === 0) break;
+      passes.push({ passIndex: i, moves, gridAfter: cloneGrid(nextGrid), kind: 'regular' });
+      current = nextGrid;
+      i++;
+    }
+    if (i >= GAME.MAX_TRANSFER_PASSES) break;
+
+    // Phase B — one wild pass. Tagged so the animator can give it the
+    // full "time stood still" treatment (pause, spotlight, slow flight,
+    // hold).
+    const wildResult = transferPass(current, { kind: 'wild' });
+    if (wildResult.moves.length === 0) break;   // nothing left to do
+    passes.push({
+      passIndex: i,
+      moves:     wildResult.moves,
+      gridAfter: cloneGrid(wildResult.nextGrid),
+      kind:      'wild',
+    });
+    current = wildResult.nextGrid;
+    i++;
+    // Loop back to Phase A — the wild's recipients may have just enabled
+    // new regular same-colour transfers.
   }
   return { finalGrid: current, passes };
 }
@@ -471,6 +632,14 @@ function findDissolves(grid) {
     for (let c = 0; c < GAME.COLS; c++) {
       const cell = grid[r][c];
       if (!cell) continue;
+      // WILDs (alt-4) never Full Bloom — they only ever drain. They
+      // empty-dissolve like a regular pot once their petalColors run out.
+      if (cell.wild) {
+        if (cell.petals === 0) {
+          emptyDissolves.push({ r, c, color: cell.color, wild: true });
+        }
+        continue;
+      }
       if (cell.petals >= GAME.MAX_PETALS) {
         fullBlooms.push({
           r, c,
@@ -511,7 +680,10 @@ function applyGravity(grid) {
 }
 
 // Fill every null cell with a freshly-spawned symbol. Mutates grid.
-// Returns newCells = [{ r, c, color, petals }].
+// Returns newCells = [{ r, c, color, petals, wild?, petalColors? }].
+// Forwards the alt-4 WILD payload too so the animator's _playRefill can
+// build a WILD FlowerSymbol (gold tint + per-index petal colours)
+// instead of crashing on COLOR_BY_NAME['__wild__'].
 function refillGrid(grid) {
   const newCells = [];
   for (let r = 0; r < GAME.ROWS; r++) {
@@ -519,7 +691,12 @@ function refillGrid(grid) {
       if (!grid[r][c]) {
         const cell = spawnCell();
         grid[r][c] = cell;
-        newCells.push({ r, c, color: cell.color, petals: cell.petals });
+        const nc = { r, c, color: cell.color, petals: cell.petals };
+        if (cell.wild) {
+          nc.wild = true;
+          nc.petalColors = cell.petalColors ? cell.petalColors.slice() : [];
+        }
+        newCells.push(nc);
       }
     }
   }
@@ -587,6 +764,9 @@ function runManySpins(n, bet = 1) {
 //   { events, finalGrid, totalPayout, multiplier, finalWin, cascadeCount, bet, rtp }
 function runSpin(bet = 1, opts = {}) {
   const events = [];
+  // Reset the alt-4 WILD counter so each spin can spawn at most one
+  // WILD across its initial grid + every refill.
+  _alt4WildsThisSpin = 0;
   // Alt-3: every spin starts on the smallest grid (4×4) — UNLESS the
   // caller passed `opts.gridSizeStart`, which the alt-3 free-spin feature
   // uses to RESUME at the previous spin's grid size (no reset between
@@ -638,6 +818,34 @@ function runSpin(bet = 1, opts = {}) {
     // 1. Transfers until stable
     const { finalGrid, passes } = runTransfers(grid);
 
+    // Alt-4: every WILD petal that landed during this cascade BUMPS the
+    // destination cell's tile multiplier by +2× (e.g. 0 → 2, 10 → 12,
+    // 50 → 52). Mutates cellMults so any same-cascade Full Bloom on
+    // that cell pays at the boosted rate, and the bumped values are
+    // included in the dissolve event's cellMultsAfter snapshot for the
+    // animator. We also collect them per-pass for the wildBumps event
+    // payload so the animator can pop the badge at the right moment.
+    const wildBumpsByPassIdx = passes.map(() => []);
+    if (ALT_MODE === 'alt4') {
+      for (let pi = 0; pi < passes.length; pi++) {
+        const p = passes[pi];
+        if (p.kind !== 'wild') continue;
+        for (const move of p.moves) {
+          if (!move.wild) continue;
+          const tr = move.to.r, tc = move.to.c;
+          const oldVal = cellMults[tr][tc] || 0;
+          const newVal = oldVal + 2;
+          cellMults[tr][tc] = newVal;
+          wildBumpsByPassIdx[pi].push({
+            r: tr, c: tc,
+            oldValue: oldVal,
+            newValue: newVal,
+            from: move.from,
+          });
+        }
+      }
+    }
+
     // Annotate each pass with `newEmpties` — cells that FIRST become empty
     // (petals=0) in that pass and STAY empty through the rest of the cascade.
     // Animator uses this to launch empty-dissolve flights the moment the pot
@@ -681,6 +889,8 @@ function runSpin(bet = 1, opts = {}) {
         moves: p.moves,
         gridAfter: p.gridAfter,
         newEmpties: p.newEmpties,
+        kind: p.kind || 'regular',
+        wildBumps: wildBumpsByPassIdx[pi] || [],
         isFinalInCascade: (pi === passes.length - 1),
         gridAtCascadeEnd: (pi === passes.length - 1) ? cloneGrid(finalGrid) : null,
       });
@@ -700,7 +910,7 @@ function runSpin(bet = 1, opts = {}) {
     // included — the FIRST bloom this spin still pays at the multiplier
     // value the spin started with).
     const perBloomInfo = fullBlooms.map(fb => {
-      const cellMult = (ALT_MODE === 'alt2') ? (cellMults[fb.r][fb.c] || 0) : 0;
+      const cellMult = (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') ? (cellMults[fb.r][fb.c] || 0) : 0;
       const effectiveMult = cellMult > 0 ? cellMult : 1;
       // Snapshot the alt-3 multiplier BEFORE we increment for this bloom
       // so the bloom is paid at the rate that was visible before it
@@ -724,11 +934,13 @@ function runSpin(bet = 1, opts = {}) {
     });
     const payoutDelta = perBloomInfo.reduce((s, f) => s + f.pay, 0);
 
-    // Alt-2: each bloom now DROPS a multiplier — full canonical value on
-    // its own cell, half on every adjacent cell (8-way, diagonals included).
-    // This happens AFTER payouts are computed so the bloom's own tile can't
-    // pay itself on the same cascade.
-    if (ALT_MODE === 'alt2') {
+    // Alt-2 / Alt-4: each bloom DROPS a multiplier — full canonical
+    // value on its own cell, half on every adjacent cell (8-way,
+    // diagonals included). Happens AFTER payouts are computed so the
+    // bloom's own tile can't pay itself on the same cascade. Alt-4
+    // skips dropping on cells that are WILDs (WILDs never bloom anyway,
+    // so a tile on a WILD would just be wasted).
+    if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
       const deltas = [
         [-1, -1], [-1, 0], [-1, 1],
         [ 0, -1],          [ 0, 1],
@@ -1525,10 +1737,22 @@ const ASSET_DESIGN_CELL = 540;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class FlowerSymbol extends PIXI.Container {
-  constructor(colorName, petalCount, cellSize) {
+  // colorName/petalCount/cellSize are the regular-flower constructor.
+  // For an alt-4 WILD pass `petalColors` (an array of N colour names);
+  // colorName should be '__wild__' and petalCount is petalColors.length.
+  // The pot tints gold and each petal is rendered in the colour at the
+  // corresponding index in petalColors.
+  constructor(colorName, petalCount, cellSize, petalColors) {
     super();
+    this.isWild = !!(petalColors && petalColors.length > 0);
+    this.petalColors = petalColors ? petalColors.slice() : null;
     this.colorName = colorName;
-    this.colorHex = hexToNumber(COLOR_BY_NAME[colorName].hex);
+    // Wild pots have no canonical colour — fall back to a gold tint for
+    // colorHex so any code path that reads colorHex still gets a valid
+    // value and doesn't crash on COLOR_BY_NAME['__wild__'].
+    this.colorHex = this.isWild
+      ? 0xFFD54F
+      : hexToNumber(COLOR_BY_NAME[colorName].hex);
     this.petalCount = petalCount;
     this.cellSize = cellSize;
 
@@ -1551,6 +1775,7 @@ class FlowerSymbol extends PIXI.Container {
     this._buildPetalLayer();
     this._buildMiddle();
     this._layoutPetals();
+    if (this.isWild) this._addWildHalo();
   }
 
   _buildPot() {
@@ -1561,8 +1786,67 @@ class FlowerSymbol extends PIXI.Container {
     s.scale.set(this._scale);
     s.x = 0;
     s.y = 0;
+    // Alt-4 WILDs: STRONG bright-magenta tint on the pot so it's
+    // unmistakably different from any natural-coloured pot. (The earlier
+    // gold tint was indistinguishable from the existing brown pot art.)
+    if (this.isWild) s.tint = 0xFF3DB1;
     this.potSprite = s;
     this.addChild(s);
+  }
+
+  // Glowing halo + permanent slow pulse behind the WILD pot so it pops
+  // out of the grid at a glance — the tint alone wasn't enough.
+  _addWildHalo() {
+    const r = this.cellSize * 0.55;
+    // Layered concentric circles for a soft glow look without the
+    // expense of a real blur filter.
+    const halo = new PIXI.Graphics();
+    halo.beginFill(0xFFD54F, 0.18);
+    halo.drawCircle(0, 0, r);
+    halo.endFill();
+    halo.beginFill(0xFFE082, 0.28);
+    halo.drawCircle(0, 0, r * 0.78);
+    halo.endFill();
+    halo.beginFill(0xFFF7B0, 0.32);
+    halo.drawCircle(0, 0, r * 0.55);
+    halo.endFill();
+    // Sit BEHIND the pot.
+    this.addChildAt(halo, 0);
+    this._wildHalo = halo;
+    // Slow continuous pulse so the eye keeps coming back to it.
+    gsap.to(halo.scale, {
+      x: 1.18, y: 1.18,
+      duration: 1.2,
+      yoyo: true, repeat: -1,
+      ease: 'sine.inOut',
+    });
+    gsap.to(halo, {
+      alpha: 0.55,
+      duration: 1.2,
+      yoyo: true, repeat: -1,
+      ease: 'sine.inOut',
+    });
+
+    // "WILD" badge text on the lower half of the pot. Sits in front of
+    // every other layer so the petals + middle never cover it. Sized so
+    // it stays inside the pot's body width regardless of cellSize.
+    const labelFs = Math.max(10, this.cellSize * 0.16);
+    const wildLabel = new PIXI.Text('WILD', {
+      fontFamily: FONT,
+      fontSize:   labelFs,
+      fill:       0xFFFFFF,
+      stroke:     0x3D1C02,
+      strokeThickness: Math.max(2, labelFs * 0.22),
+      letterSpacing:   1,
+    });
+    wildLabel.anchor.set(0.5);
+    wildLabel.x = 0;
+    // Container origin is the pot body's centre; pot art has its lower
+    // belly around y ≈ +0.18 × cellSize. Place the badge just below the
+    // middle/bulb so it reads as the pot's "name plate".
+    wildLabel.y = this.cellSize * 0.20;
+    this.addChild(wildLabel);
+    this._wildLabel = wildLabel;
   }
 
   _buildPetalLayer() {
@@ -1605,9 +1889,16 @@ class FlowerSymbol extends PIXI.Container {
     if (!this._isSixMode && n > 8) return;
     if ( this._isSixMode && n > 6) return;
 
-    const tex = petalTextures[this.colorName];
+    // WILDs use the per-index colour from petalColors so each petal in
+    // the pot can be a different colour. Regular flowers use a single
+    // colour for every petal.
     const angles = this._anglesFor(n);
-    for (const angle of angles) {
+    for (let i = 0; i < angles.length; i++) {
+      const angle = angles[i];
+      const colorForPetal = this.isWild
+        ? (this.petalColors && this.petalColors[i]) || 'Pearl'
+        : this.colorName;
+      const tex = petalTextures[colorForPetal];
       const p = new PIXI.Sprite(tex);
       // Anchor near the base tab so the petal pivots at the flower's center.
       p.anchor.set(0.5, 0.95);
@@ -1637,28 +1928,41 @@ class FlowerSymbol extends PIXI.Container {
     return this.toGlobal(new PIXI.Point(0, this._bulbY));
   }
 
-  // Detach a petal for transfer animation. Picks the petal whose tip direction
-  // best points toward `toWorldPos` so the "tearing off" reads naturally.
-  // Returns the detached PIXI.Sprite (still parented to petalLayer — caller
-  // should reparent to an FX layer after capturing its world pose). Remaining
-  // petals tween to the new (N−1) layout.
-  detachPetalToward(toWorldPos) {
+  // Detach a petal for transfer animation. For regular flowers, picks the
+  // petal whose tip direction best points toward `toWorldPos` so the
+  // "tearing off" reads naturally. For WILDs, the caller passes the
+  // explicit `petalIndex` (the model decided which colour to send) so
+  // the detach is exact and the WILD's petalColors stays in sync with
+  // the rendered children. Returns the detached PIXI.Sprite (still
+  // parented to petalLayer — caller should reparent to an FX layer
+  // after capturing its world pose). Remaining petals tween to the
+  // new (N−1) layout.
+  detachPetalToward(toWorldPos, petalIndex) {
     const kids = this.petalLayer.children.slice();
     if (kids.length === 0) return null;
 
-    const bulbWorld = this.getBulbWorldPos();
-    const toVec = { x: toWorldPos.x - bulbWorld.x, y: toWorldPos.y - bulbWorld.y };
-    const toLen = Math.hypot(toVec.x, toVec.y) || 1;
-    toVec.x /= toLen; toVec.y /= toLen;
-
-    let bestIdx = 0, bestDot = -Infinity;
-    kids.forEach((p, i) => {
-      // Petal tip direction in container-local: (sin θ, −cos θ) because
-      // rotation=0 means tip pointing UP (−y).
-      const pDx = Math.sin(p.rotation), pDy = -Math.cos(p.rotation);
-      const dot = pDx * toVec.x + pDy * toVec.y;
-      if (dot > bestDot) { bestDot = dot; bestIdx = i; }
-    });
+    let bestIdx;
+    if (this.isWild && typeof petalIndex === 'number'
+        && petalIndex >= 0 && petalIndex < kids.length) {
+      // WILD: explicit index from the model's transferPass.
+      bestIdx = petalIndex;
+      // Keep this.petalColors in sync with the rendered children.
+      if (this.petalColors) this.petalColors.splice(petalIndex, 1);
+    } else {
+      const bulbWorld = this.getBulbWorldPos();
+      const toVec = { x: toWorldPos.x - bulbWorld.x, y: toWorldPos.y - bulbWorld.y };
+      const toLen = Math.hypot(toVec.x, toVec.y) || 1;
+      toVec.x /= toLen; toVec.y /= toLen;
+      let bestDot = -Infinity;
+      bestIdx = 0;
+      kids.forEach((p, i) => {
+        // Petal tip direction in container-local: (sin θ, −cos θ) because
+        // rotation=0 means tip pointing UP (−y).
+        const pDx = Math.sin(p.rotation), pDy = -Math.cos(p.rotation);
+        const dot = pDx * toVec.x + pDy * toVec.y;
+        if (dot > bestDot) { bestDot = dot; bestIdx = i; }
+      });
+    }
 
     const petal = kids[bestIdx];
     this.petalLayer.removeChild(petal);
@@ -1797,6 +2101,12 @@ class FlowerSymbol extends PIXI.Container {
     for (const p of this.petalLayer.children) {
       gsap.killTweensOf(p);
       gsap.killTweensOf(p.scale);
+    }
+    // Wild halo (alt-4) has its own permanent yoyo tweens — kill them
+    // too so destroy() doesn't leave a tween writing to a null object.
+    if (this._wildHalo) {
+      gsap.killTweensOf(this._wildHalo);
+      gsap.killTweensOf(this._wildHalo.scale);
     }
   }
 }
@@ -2245,7 +2555,7 @@ class SpinAnimator {
       for (let r = 0; r < evRows; r++) {
         const data = ev.grid[r][c];
         if (!data) continue;
-        const flower = new FlowerSymbol(data.color, data.petals, this.cellSize);
+        const flower = new FlowerSymbol(data.color, data.petals, this.cellSize, data.petalColors);
         flower._debugTag = `(${r},${c})@spawn`;
         const rect = this.scene.cells[r][c];
         flower.x = rect.x + rect.w / 2;
@@ -2284,14 +2594,43 @@ class SpinAnimator {
     const hasEmpties  = ev.newEmpties && ev.newEmpties.length > 0;
     if (!hasMoves && !hasEmpties) return;
 
-    // Each pot fires its petal staggered AFTER the previous pot — gives
-    // the player time to follow individual transfers instead of an
-    // all-at-once burst. Each move within a pass is from a DIFFERENT
-    // source pot (transferPass only sends one petal per cell per pass),
-    // so this stagger spaces pots, not individual petals from a single
-    // pot. Flights are still fire-and-forget — the next pot launches
-    // before the previous petal lands, so a busy cascade still has
-    // multiple petals in the air, just visibly sequenced.
+    // ── WILD CEREMONY ──────────────────────────────────────────────────
+    // Wild passes (alt-4) get the "time stood still" treatment so the
+    // player can't miss them. Three things happen:
+    //   1. Drain every in-flight regular petal so nothing is moving.
+    //   2. Hold a beat (~500 ms) and pulse-glow each WILD pot that's
+    //      about to fire so the eye lands on them.
+    //   3. Run the wild pass at HALF speed (longer petal flights) so the
+    //      cross-grid trajectory is fully readable.
+    //   4. Hold another beat after the pass before regulars resume.
+    const isWildPass = (ev.kind === 'wild');
+    if (isWildPass && hasMoves) {
+      // Drain prior in-flight regular petals so nothing is moving when
+      // the WILDs take centre stage.
+      if (this._inFlightPetals && this._inFlightPetals.length) {
+        const pending = this._inFlightPetals;
+        this._inFlightPetals = [];
+        try { await Promise.all(pending); } catch (_) {}
+      }
+      // Pulse-glow each unique source WILD pot during the hold so the
+      // eye lands on them before they fire. Two breathes (yoyo×3 = up,
+      // down, up, down ≈ 4 phases of 0.22s = ~900ms total).
+      const sourceCells = new Set();
+      for (const m of ev.moves) sourceCells.add(`${m.from.r},${m.from.c}`);
+      for (const key of sourceCells) {
+        const [r, c] = key.split(',').map(Number);
+        const f = this.scene.flowers[r] && this.scene.flowers[r][c];
+        if (!f || f.destroyed) continue;
+        const baseSx = f.scale.x, baseSy = f.scale.y;
+        gsap.to(f.scale, {
+          x: baseSx * 1.15, y: baseSy * 1.15,
+          duration: 0.22, yoyo: true, repeat: 3, ease: 'sine.inOut',
+          onComplete: () => { f.scale.set(baseSx, baseSy); },
+        });
+      }
+      await SpinAnimator._wait(500);
+    }
+
     // Every petal launches with a tiny stagger (30 ms) and the same flight
     // speed — reads as a flurry rather than a march of individuals. Crucially
     // we do NOT await the flights to finish: we fire and forget, yield
@@ -2300,11 +2639,12 @@ class SpinAnimator {
     // of petals in motion at once — instead of playing one at a time.
     // Petals within a single pass fire almost simultaneously — a 30 ms
     // stagger is just enough to break lockstep but reads as "all at once".
-    const PETAL_STAGGER_S    = 0.03;
-    // Tiny beat between passes so cascades with one petal per pass still
-    // feel like a continuous flurry (the flight is ~437 ms; at 30 ms pass
-    // gap, ten chained passes all pile into the air within ~0.4 s).
-    const INTER_PASS_TAIL_MS = 30;
+    //
+    // Wild passes use a much larger stagger AND slower flight so each
+    // long-distance trajectory is readable.
+    const PETAL_STAGGER_S    = isWildPass ? 0.40 : 0.03;
+    const FLIGHT_SPEED_MUL   = isWildPass ? 1.4  : 1.0;
+    const INTER_PASS_TAIL_MS = isWildPass ? 500  : 30;
     // Beat after a pot's last petal detaches before it takes off for the
     // multiplier pill — gives the player time to register that the pot is
     // actually empty before it flies away.
@@ -2326,9 +2666,26 @@ class SpinAnimator {
       const detachDone = new Promise(r => { markDetached = r; });
       detachDoneByCell.set(fromKey, detachDone);
       this._inFlightPetals.push(
-        this._animateOneTransfer(move, detachTimeS, 1, markDetached)
+        this._animateOneTransfer(move, detachTimeS, FLIGHT_SPEED_MUL, markDetached)
       );
     });
+
+    // ── Alt-4 wild bumps. Each WILD petal landing adds +2× to the
+    // destination cell's tile multiplier. We schedule the badge update
+    // at the petal's expected arrival time (stagger + flight) rather
+    // than waiting on the actual adopt callback — a fixed schedule keeps
+    // the visual rhythm steady even if a petal flight gets stretched.
+    if (isWildPass && ev.wildBumps && ev.wildBumps.length) {
+      const flightMs = (T(0.70) * FLIGHT_SPEED_MUL) * 1000;
+      ev.wildBumps.forEach((bump, i) => {
+        const arriveMs = i * PETAL_STAGGER_S * 1000 + flightMs;
+        setTimeout(() => {
+          if (!scene.tileBadges) return;
+          // setCellTileBadge handles both create + update + tint.
+          setCellTileBadge(bump.r, bump.c, bump.newValue);
+        }, arriveMs);
+      });
+    }
 
     // Empty-dissolve pots that committed this pass — each one waits until
     // its last petal has visibly left before it takes off, so the player
@@ -2462,28 +2819,31 @@ class SpinAnimator {
     const dst = this.scene.flowers[move.to.r][move.to.c];
     if (!src || !dst) { finishDetached(); return; }
 
-    // HARD INVARIANT: the model only emits same-colour transfers. If the
-    // animator has somehow ended up with different-coloured flowers at these
-    // cell coords, fire the alarm BEFORE launching a doomed flight — the
-    // colour error downstream makes it hard to tell where the drift started.
-    if (src.colorName !== dst.colorName) {
-      console.warn(
-        `[colour-drift] (${move.from.r},${move.from.c})${src.colorName} → ` +
-        `(${move.to.r},${move.to.c})${dst.colorName}` +
-        ` · move.color=${move.color}`
-      );
-    }
-    if (move.color && src.colorName !== move.color) {
-      console.warn(
-        `[colour-drift] src (${move.from.r},${move.from.c}) is ${src.colorName} ` +
-        `but model says move.color=${move.color}`
-      );
-    }
-    if (move.color && dst.colorName !== move.color) {
-      console.warn(
-        `[colour-drift] dst (${move.to.r},${move.to.c}) is ${dst.colorName} ` +
-        `but model says move.color=${move.color}`
-      );
+    // HARD INVARIANT: regular same-colour transfers must have matching
+    // src/dst colours. WILDs (alt-4) intentionally violate this — a WILD
+    // is a multi-coloured pot sending one of its petals to a far-away
+    // matching cell — so skip every drift check when the move is from
+    // a WILD.
+    if (!move.wild) {
+      if (src.colorName !== dst.colorName) {
+        console.warn(
+          `[colour-drift] (${move.from.r},${move.from.c})${src.colorName} → ` +
+          `(${move.to.r},${move.to.c})${dst.colorName}` +
+          ` · move.color=${move.color}`
+        );
+      }
+      if (move.color && src.colorName !== move.color) {
+        console.warn(
+          `[colour-drift] src (${move.from.r},${move.from.c}) is ${src.colorName} ` +
+          `but model says move.color=${move.color}`
+        );
+      }
+      if (move.color && dst.colorName !== move.color) {
+        console.warn(
+          `[colour-drift] dst (${move.to.r},${move.to.c}) is ${dst.colorName} ` +
+          `but model says move.color=${move.color}`
+        );
+      }
     }
 
     // Hold for the stagger so this petal's "tearing" starts a hair later than
@@ -2526,9 +2886,15 @@ class SpinAnimator {
     if (!this._pendingAdoptsByCell.has(dstKey)) this._pendingAdoptsByCell.set(dstKey, []);
     this._pendingAdoptsByCell.get(dstKey).push(adoptPromise);
 
-    // Detach a petal from source, aimed toward the target's bulb.
+    // Detach a petal from source, aimed toward the target's bulb. For
+    // alt-4 WILDs, the model's transferPass picked an exact petal index
+    // (matching colour to the destination); pass it through so the
+    // detach takes that specific colour instead of the rotation-closest.
     const dstBulbWorld = dst.getBulbWorldPos();
-    const petal = src.detachPetalToward(dstBulbWorld);
+    const petal = src.detachPetalToward(
+      dstBulbWorld,
+      move.wild ? move.petalIndex : undefined
+    );
     if (!petal) {
       // This should not happen — the pending-adopt gate above is supposed to
       // ensure the source has the petal we expect. If it does, a petal is
@@ -2896,10 +3262,10 @@ class SpinAnimator {
       tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(1.65));
       tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(1.65));
     }).then(() => {
-      // Alt-2: after the bloom animates away, drop its multiplier tile
-      // (big reveal at cell centre → shrink to corner) plus half-value
-      // echoes flying to all 8 adjacent cells.
-      if (ALT_MODE === 'alt2' && d.newTile) {
+      // Alt-2 / Alt-4: after the bloom animates away, drop its
+      // multiplier tile (big reveal at cell centre → shrink to corner)
+      // plus half-value echoes flying to all 8 adjacent cells.
+      if ((ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && d.newTile) {
         return this._animateBloomMultiplierDrop(d);
       }
     });
@@ -3189,9 +3555,10 @@ class SpinAnimator {
       });
     }
 
-    // Alt-2 empties don't drop multipliers — the pot just poofs in place.
-    // Blooms are what place tiles (see _animateFullBloom for the reveal).
-    if (ALT_MODE === 'alt2') {
+    // Alt-2 / Alt-4 empties don't drop multipliers — the pot just poofs
+    // in place. Blooms are what place tiles (see _animateFullBloom for
+    // the reveal).
+    if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
       return new Promise(resolve => {
         const rect = this.scene.cells[d.r][d.c];
         const cx   = rect.x + rect.w / 2;
@@ -3415,7 +3782,7 @@ class SpinAnimator {
     for (const c in byCol) {
       byCol[c].forEach((nc, stackIdx) => {
         const rect = this.scene.cells[nc.r][nc.c];
-        const flower = new FlowerSymbol(nc.color, nc.petals, this.cellSize);
+        const flower = new FlowerSymbol(nc.color, nc.petals, this.cellSize, nc.petalColors);
         flower._debugTag = `(${nc.r},${nc.c})@refill`;
         flower.x = rect.x + rect.w / 2;
         // Spawn above the top of the grid, stacked so they don't visually overlap
@@ -3799,7 +4166,7 @@ class SpinAnimator {
           const data = ev.gridAfter[r][c];
           if (!data) continue;
           const rect = newCells[r][c];
-          const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+          const flower = new FlowerSymbol(data.color, data.petals, cellSize, data.petalColors);
           flower._debugTag = `(${r},${c})@expand-${newSize}`;
           const targetX = rect.x + rect.w / 2;
           const targetY = rect.y + rect.h / 2;
@@ -3863,7 +4230,7 @@ class SpinAnimator {
           const data = ev.gridAfter[r][c];
           if (!data) continue;
           const rect = newCells[r][c];
-          const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+          const flower = new FlowerSymbol(data.color, data.petals, cellSize, data.petalColors);
           flower._debugTag = `(${r},${c})@expand-shrink-${newSize}`;
           flower.x = rect.x + rect.w / 2;
           flower.y = rect.y + rect.h / 2;
@@ -4114,7 +4481,7 @@ const player = {
   },
 };
 
-const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 12, alt3: 10 };
+const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 12, alt3: 10, alt4: 12 };
 // Alt-3 free-spin multiplier: starts at 2x, +1x for every Full Bloom
 // during the feature. Persists across all 10 free spins.
 const ALT3_FEATURE_MULT_START = 2;
@@ -4295,7 +4662,7 @@ function buildScene(L) {
     for (let col = 0; col < COLS; col++) {
       const rect = scene.cells[row][col];
       const data = currentGrid[row][col];
-      const flower = new FlowerSymbol(data.color, data.petals, cellSize);
+      const flower = new FlowerSymbol(data.color, data.petals, cellSize, data.petalColors);
       flower.x = rect.x + rect.w / 2;
       flower.y = rect.y + rect.h / 2;
       scene.flowerLayer.addChild(flower);
@@ -4347,7 +4714,7 @@ function buildScene(L) {
   // — though the mode swap is blocked during the feature), restore the
   // accumulated tile multipliers so they survive the rebuild. This also
   // redraws the cell tints behind the flowers via setCellTileBadge.
-  if (ALT_MODE === 'alt2' && player.feature.active && player.feature.cellMults) {
+  if ((ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && player.feature.active && player.feature.cellMults) {
     const cm = player.feature.cellMults;
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
@@ -5078,15 +5445,16 @@ function buildScene(L) {
       return cont;
     }
 
-    // Left → right: Tile Multiplier, Chain Multiplier, Expanding Reels.
-    // Trio centred horizontally on the canvas.
-    const totalRowW  = 3 * btnW + 2 * gap;
+    // Left → right: Tile, Tile + Wilds, Chain, Expanding Reels.
+    // Quartet centred horizontally on the canvas.
+    const totalRowW  = 4 * btnW + 3 * gap;
     const rowLeftCX  = (L.sw - totalRowW) / 2 + btnW / 2;
     const tileCX     = rowLeftCX;
-    const chainCX    = rowLeftCX + (btnW + gap);
-    const expandCX   = rowLeftCX + 2 * (btnW + gap);
+    const wildsCX    = rowLeftCX + (btnW + gap);
+    const chainCX    = rowLeftCX + 2 * (btnW + gap);
+    const expandCX   = rowLeftCX + 3 * (btnW + gap);
 
-    // ── GAME MODE caption above the trio ──────────────────────────────────
+    // ── GAME MODE caption above the row ───────────────────────────────────
     const modeCaption = new PIXI.Text('GAME MODE', {
       fontFamily: FONT,
       fontSize: 13 * gameScale,
@@ -5099,11 +5467,13 @@ function buildScene(L) {
     modeCaption.alpha = 0.85;
     app.stage.addChild(modeCaption);
 
-    scene.tileBtn   = makeMechanicButton('alt2', 'Tile Multiplier',  tileCX);
-    scene.chainBtn  = makeMechanicButton('alt1', 'Chain Multiplier', chainCX);
-    scene.expandBtn = makeMechanicButton('alt3', 'Expanding Reels',  expandCX);
+    scene.tileBtn   = makeMechanicButton('alt2', 'Tile Multiplier',     tileCX);
+    scene.wildsBtn  = makeMechanicButton('alt4', 'Tile + Wilds',        wildsCX);
+    scene.chainBtn  = makeMechanicButton('alt1', 'Chain Multiplier',    chainCX);
+    scene.expandBtn = makeMechanicButton('alt3', 'Expanding Reels',     expandCX);
 
     app.stage.addChild(scene.tileBtn);
+    app.stage.addChild(scene.wildsBtn);
     app.stage.addChild(scene.chainBtn);
     app.stage.addChild(scene.expandBtn);
   }
@@ -5985,6 +6355,7 @@ function refreshFeatureUI() {
   if (scene.chainBtn  && scene.chainBtn._redraw)  scene.chainBtn._redraw();
   if (scene.tileBtn   && scene.tileBtn._redraw)   scene.tileBtn._redraw();
   if (scene.expandBtn && scene.expandBtn._redraw) scene.expandBtn._redraw();
+  if (scene.wildsBtn  && scene.wildsBtn._redraw)  scene.wildsBtn._redraw();
   // Alt-3 bloom multiplier pill: visible only during the alt-3 feature.
   if (scene.alt3MultPill) {
     const visible = (ALT_MODE === 'alt3' && player.feature.active);
@@ -6406,6 +6777,48 @@ Buy Feature — 10 Free Spins
   – Bumps +×1 every time a flower fully blooms (across every cascade,
     every free spin — it never resets until the feature ends).
   – Multiplies every Full Bloom payout for the rest of the feature.`
+: (ALT_MODE === 'alt4')
+? `The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Some pots spawn as WILDs — pots holding 4–8 mixed-colour petals.
+
+Transfers — Regular Flowers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Regular flowers do NOT send petals into a WILD.
+
+Transfers — WILDs
+• WILDs only SEND OUT petals; they never receive.
+• Each cascade, a WILD picks one of its petals and sends it to the
+  NEAREST cell (Manhattan distance, grid-wide) of that petal's colour.
+• When a WILD runs out of petals, it dissolves with a puff and a new
+  flower drops in to take its place.
+
+Full Bloom
+• When a regular flower reaches 8 petals, it blooms and pays its
+  colour's base value × bet.
+• WILDs never bloom — they only ever drain.
+• Each bloom also DROPS a multiplier tile on its own cell and HALF of
+  that tile's value on all 8 adjacent cells. Tile values are randomly
+  picked from:
+    4×   8×   10×   20×   50×   100×   500×
+• When more than one bloom spreads onto the same cell, the values SUM.
+
+Bloom on a Multiplier
+• If a later bloom happens on a cell that already has a multiplier, that
+  bloom's payout is multiplied by the cell's accumulated multiplier.
+• Multipliers persist on their cell for the rest of the spin.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers
+  (which can include new WILDs).
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms, empties, or WILD-dissolves keep happening.
+
+Buy Feature
+• Pays 100 × bet for 12 free spins.
+• Accumulated multiplier tiles PERSIST across every free spin — they
+  only reset when the feature ends.`
 : (ALT_MODE === 'alt2')
 ? `The Grid
 • 4 rows × 5 columns of flower pots. Every cell always holds one flower.
@@ -6856,6 +7269,18 @@ function openModeConfirmModal(mode) {
         'Existing flowers stay put; the new row + column are fresh.',
       ],
     },
+    alt4: {
+      title: 'Tile Multiplier with Wilds',
+      lines: [
+        'Every Full Bloom drops a multiplier value on its own cell',
+        'plus half on each of the 8 surrounding cells.',
+        '',
+        'Some pots spawn as WILDs — pots holding mixed-colour petals.',
+        'WILDs only SEND OUT petals (never receive); each petal flies',
+        'to the nearest cell of its own colour. When a WILD runs out',
+        'of petals it vanishes.',
+      ],
+    },
   };
   const m = META[mode];
   if (!m) return;
@@ -6891,12 +7316,17 @@ function openBuyFeatureModal() {
   if (!canBuyFeature()) return;
   const cost  = featureCost();
   const spins = featureSpinCount();
-  const persistLine = (ALT_MODE === 'alt2')
-    ? `Multiplier tiles dropped during the`
-    : `The spin multiplier keeps climbing`;
-  const persistLine2 = (ALT_MODE === 'alt2')
-    ? `feature PERSIST across all ${spins} spins.`
-    : `across all ${spins} free spins.`;
+  let persistLine, persistLine2;
+  if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
+    persistLine  = `Multiplier tiles dropped during the`;
+    persistLine2 = `feature PERSIST across all ${spins} spins.`;
+  } else if (ALT_MODE === 'alt3') {
+    persistLine  = `Grid size + bloom multiplier carry across`;
+    persistLine2 = `all ${spins} spins of the feature.`;
+  } else {
+    persistLine  = `The spin multiplier keeps climbing`;
+    persistLine2 = `across all ${spins} free spins.`;
+  }
   const dialog = _openSimpleModal({
     title: 'Buy Feature',
     bodyLines: [
@@ -7001,7 +7431,7 @@ async function onSpinClick() {
   const runOpts = {};
   if (inFeature) {
     runOpts.freeSpin = true;
-    if (ALT_MODE === 'alt2') runOpts.cellMults          = player.feature.cellMults;
+    if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') runOpts.cellMults = player.feature.cellMults;
     if (ALT_MODE === 'alt1') runOpts.emptyCountStart    = player.feature.emptyCountCarry || 0;
     if (ALT_MODE === 'alt3') {
       // Carry the previous free spin's grid size so we DON'T reset to
@@ -7015,7 +7445,7 @@ async function onSpinClick() {
     }
   }
   const result = BloomSort.runSpin(bet, runOpts);
-  if (inFeature && ALT_MODE === 'alt2' && result.cellMults) {
+  if (inFeature && (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && result.cellMults) {
     player.feature.cellMults = result.cellMults;
   }
   if (inFeature && ALT_MODE === 'alt1' && typeof result.emptyCount === 'number') {
@@ -7056,7 +7486,7 @@ async function onSpinClick() {
         }
       }
       const runningWin = ev.payoutTotal * bet;
-      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt3') {
+      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt3' || ALT_MODE === 'alt4') {
         // Tile-multiplier and Expanding-Reels modes: running total shows
         // in the bottom status text. Counts UP smoothly from whatever
         // value is currently shown to the new running total. During the
@@ -7104,9 +7534,10 @@ async function onSpinClick() {
       updateRtpText();
       currentGrid = finalResult.finalGrid;
 
-      if (ALT_MODE === 'alt2') {
-        // Tile mode: no × reveal (no global multiplier). The bottom status
-        // has already been ticking up during the cascade; just finalise.
+      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
+        // Tile mode (and Tile+Wilds): no × reveal (no global multiplier).
+        // The bottom status has already been ticking up during the
+        // cascade; just finalise.
         if (player.feature.active) {
           // Accumulate this spin's win into the feature total. The status
           // shows the cumulative amount won across the feature so far.
