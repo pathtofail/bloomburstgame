@@ -2284,6 +2284,14 @@ class SpinAnimator {
     const hasEmpties  = ev.newEmpties && ev.newEmpties.length > 0;
     if (!hasMoves && !hasEmpties) return;
 
+    // Each pot fires its petal staggered AFTER the previous pot — gives
+    // the player time to follow individual transfers instead of an
+    // all-at-once burst. Each move within a pass is from a DIFFERENT
+    // source pot (transferPass only sends one petal per cell per pass),
+    // so this stagger spaces pots, not individual petals from a single
+    // pot. Flights are still fire-and-forget — the next pot launches
+    // before the previous petal lands, so a busy cascade still has
+    // multiple petals in the air, just visibly sequenced.
     // Every petal launches with a tiny stagger (30 ms) and the same flight
     // speed — reads as a flurry rather than a march of individuals. Crucially
     // we do NOT await the flights to finish: we fire and forget, yield
@@ -2617,24 +2625,62 @@ class SpinAnimator {
       // out on arrival. Random sign so not every petal bends the same way.
       const bendMax = 0.22 * (Math.random() < 0.5 ? -1 : 1);
 
+      // ── Organic flight params (per-petal randomisation so no two
+      //    flights trace the same path; eliminates the "mechanical
+      //    parade" feel).
+      //   • flightDur : ±15% so petals stagger naturally
+      //   • swayFreq  : 1.5–3 perpendicular oscillations across the arc
+      //   • swayAmp   : 6–14% of cellSize, peak swing at mid-flight,
+      //                 zero at both endpoints (so it still lands accurately)
+      //   • swayPhase : random starting offset
+      //   • flutterFreq/Amp: rotation jitter on top of the tangent —
+      //                 makes the petal look like it's catching air
+      //   • scaleBreath: subtle scale wobble (~3%) during flight
+      const flightDur     = T(0.70 + (Math.random() - 0.5) * 0.22) * speedMul;
+      const swayFreq      = 1.5 + Math.random() * 1.6;
+      const swayAmp       = this.cellSize * (0.06 + Math.random() * 0.08);
+      const swayPhase     = Math.random() * Math.PI * 2;
+      const flutterFreq   = 6 + Math.random() * 5;
+      const flutterAmp    = 0.10 + Math.random() * 0.12;   // radians
+      const scaleBreath   = 0.03 + Math.random() * 0.03;   // ±3-6%
+      const scaleBreathFq = 2.5 + Math.random() * 2;
+      const baseScale     = startScale * 1.18;             // post-pop scale
+
       gsap.to(state, {
         t: 1,
-        duration: T(0.70) * speedMul,
+        duration: flightDur,
         ease: 'power3.inOut',
         onUpdate: () => {
           const t = state.t;
           const omt = 1 - t;
-          // Quadratic bezier position
+          // Quadratic bezier base position
           const px = omt * omt * startPos.x + 2 * omt * t * midX + t * t * endPos.x;
           const py = omt * omt * startPos.y + 2 * omt * t * adjMidY + t * t * endPos.y;
-          petal.x = px;
-          petal.y = py;
-          // Rotation tracks tangent (tip leads the arc)
+          // Tangent (for rotation + perpendicular)
           const dx = 2 * omt * (midX - startPos.x) + 2 * t * (endPos.x - midX);
           const dy = 2 * omt * (adjMidY - startPos.y) + 2 * t * (endPos.y - adjMidY);
-          petal.rotation = Math.atan2(dy, dx) + Math.PI / 2;
-          // Bend — sine ramp 0 → bendMax → 0 over the flight
+          const len = Math.hypot(dx, dy) || 1;
+          // Perpendicular unit vector to the flight direction
+          const perpX = -dy / len, perpY = dx / len;
+          // Sway: oscillating offset, fully decayed at endpoints so the
+          // petal still hits the destination dead-on.
+          const swayBase  = Math.sin(t * swayFreq * Math.PI * 2 + swayPhase);
+          const swayDecay = Math.sin(t * Math.PI);
+          const sway      = swayBase * swayDecay * swayAmp;
+          petal.x = px + perpX * sway;
+          petal.y = py + perpY * sway;
+          // Rotation = tangent + a small fluttering jitter that decays
+          // toward the endpoints so the petal lands cleanly.
+          const flutter = Math.sin(t * flutterFreq + swayPhase) * flutterAmp * swayDecay;
+          petal.rotation = Math.atan2(dy, dx) + Math.PI / 2 + flutter;
+          // Bend — sine ramp 0 → bendMax → 0 over the flight (existing).
           petal.skew.x = Math.sin(t * Math.PI) * bendMax;
+          // Subtle "breathing" on scale so the petal doesn't read as a
+          // rigid sprite — also fully decays toward the endpoints.
+          const breath = 1 + Math.sin(t * scaleBreathFq * Math.PI * 2 + swayPhase)
+                              * scaleBreath * swayDecay;
+          petal.scale.x = baseScale * breath;
+          petal.scale.y = baseScale * breath;
         },
         onComplete: async () => {
           // Straighten before handoff so adopt's reflow tween doesn't fight skew
@@ -2865,6 +2911,7 @@ class SpinAnimator {
   _animateBloomMultiplierDrop(d) {
     const rect = this.scene.cells[d.r] && this.scene.cells[d.r][d.c];
     if (!rect || !d.newTile) return Promise.resolve();
+
     const worldPos = this.scene.flowerLayer.toGlobal(
       new PIXI.Point(rect.x + rect.w / 2, rect.y + rect.h / 2));
     const fxPos = this.scene.fxLayer.toLocal(worldPos);
@@ -7091,7 +7138,6 @@ async function onSpinClick() {
           updateStatusText('Good luck!');
         }
       }
-
       // Outside the feature, reset the pill state baseline. Inside the
       // feature we keep the displayed multiplier so the next free spin
       // picks up where this one left off.
