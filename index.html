@@ -439,8 +439,14 @@ function runSpin(bet = 1, opts = {}) {
   events.push({ type: 'spawn', grid: cloneGrid(grid) });
 
   let totalPayout  = 0;
-  let emptyCount   = 0;   // cumulative empty dissolves — drives multiplier tier
-  let multiplier   = 1;
+  // Alt-1 feature seeds emptyCount from the carry-over so the tier ladder
+  // keeps climbing across the feature's free spins instead of resetting.
+  let emptyCount   = (opts && typeof opts.emptyCountStart === 'number')
+                       ? opts.emptyCountStart
+                       : 0;
+  let multiplier   = (GAME.MULTIPLIER_ENABLED && ALT_MODE === 'alt1')
+                       ? multForEmpties(emptyCount)
+                       : 1;
   let cascadeCount = 0;
 
   // Alt-2 per-cell multipliers. Unused in alt1. Normally fresh per spin, but
@@ -488,7 +494,11 @@ function runSpin(bet = 1, opts = {}) {
     // step below) — a bloom places a canonical tile on its own cell and a
     // half-value on every adjacent cell (including diagonals).
 
-    for (const p of passes) {
+    // Annotate the LAST pass of each cascade with the final grid state so
+    // the animator can heal any petal-count drift even if this cascade has
+    // no dissolves (a dead cascade otherwise skips healing).
+    for (let pi = 0; pi < passes.length; pi++) {
+      const p = passes[pi];
       events.push({
         type: 'transferPass',
         cascadeIndex: cas,
@@ -496,6 +506,8 @@ function runSpin(bet = 1, opts = {}) {
         moves: p.moves,
         gridAfter: p.gridAfter,
         newEmpties: p.newEmpties,
+        isFinalInCascade: (pi === passes.length - 1),
+        gridAtCascadeEnd: (pi === passes.length - 1) ? cloneGrid(finalGrid) : null,
       });
     }
     grid = finalGrid;
@@ -607,8 +619,14 @@ function runSpin(bet = 1, opts = {}) {
   const finalWin = mathWin * bet;               // actual coins paid to player
 
   // ── Update cumulative RTP stats ──────────────────────────────────────────
+  // Free-spin feature rounds don't add to totalWager here — the feature
+  // purchase cost was booked upfront in startFeature() and that IS the
+  // wager for the whole free-spin run. Each free spin still counts as a
+  // spin for stats.spins.
   stats.spins              += 1;
-  stats.totalWager         += bet;
+  if (!opts || !opts.freeSpin) {
+    stats.totalWager       += bet;
+  }
   stats.totalWin           += finalWin;
   stats.totalPayoutPreMult += totalPayout;
   stats.totalMultiplierSum += multiplier;
@@ -628,7 +646,8 @@ function runSpin(bet = 1, opts = {}) {
     events, finalGrid: grid,
     totalPayout, multiplier, mathWin, finalWin, cascadeCount,
     bet,
-    cellMults,            // final per-cell multipliers (alt-2; used by feature)
+    cellMults,            // final per-cell multipliers (alt-2 feature carry)
+    emptyCount,           // cumulative empties this spin (alt-1 feature carry)
     rtp: stats.rtp,
     spinCount: stats.spins,
   };
@@ -2017,6 +2036,89 @@ class SpinAnimator {
     const numMoves = (ev.moves || []).length;
     const lastDetachMs = Math.max(0, (numMoves - 1)) * PETAL_STAGGER_S * 1000;
     await SpinAnimator._wait(lastDetachMs + INTER_PASS_TAIL_MS);
+
+    // If this is the final pass of the cascade, drain every pending flight
+    // and heal any drift against the model's authoritative grid state. This
+    // catches dead cascades (no blooms/empties) which would otherwise skip
+    // the dissolve-time heal and leave visible drift on the grid.
+    if (ev.isFinalInCascade && ev.gridAtCascadeEnd) {
+      if (this._inFlightPetals && this._inFlightPetals.length) {
+        const pending = this._inFlightPetals;
+        this._inFlightPetals = [];
+        await Promise.all(pending);
+      }
+      const canonicalAlpha = 1;
+      for (let r = 0; r < GAME.ROWS; r++) {
+        for (let c = 0; c < GAME.COLS; c++) {
+          const expected = ev.gridAtCascadeEnd[r][c];
+          const f = this.scene.flowers[r][c];
+          if (!expected || !f || f.destroyed) continue;
+
+          // Count drift — hard case: model and animator disagree.
+          if (f.petalCount !== expected.petals) {
+            console.warn(
+              `[heal-eoc] (${r},${c}) animator=${f.petalCount} model=${expected.petals} · ` +
+              `tag=${f._debugTag || '—'} — resyncing (end-of-cascade)`
+            );
+            f.killPetalTweens();
+            f.setPetalCount(expected.petals);
+            continue;
+          }
+
+          // Visual drift — counts agree but a petal is invisible or stuck
+          // at a bad position/rotation. Scan for broken render state AND
+          // for duplicate rotations (two petals at the same slot render
+          // directly on top of each other, so one looks "missing").
+          const kids = f.petalLayer ? f.petalLayer.children.slice() : [];
+          const issues = [];
+          const rotations = [];
+          for (const p of kids) {
+            if (!p) { issues.push('null child'); continue; }
+            if (p.destroyed)          issues.push('destroyed child');
+            if (p.visible === false)  issues.push('visible=false');
+            if (p.renderable === false) issues.push('renderable=false');
+            if (p.alpha < 0.9 * canonicalAlpha) issues.push(`alpha=${p.alpha.toFixed(2)}`);
+            if (p.scale.x < 0.6 * f._scale || p.scale.y < 0.6 * f._scale) {
+              issues.push(`scale=(${p.scale.x.toFixed(2)},${p.scale.y.toFixed(2)})`);
+            }
+            if (!Number.isFinite(p.rotation)) issues.push(`rotation=${p.rotation}`);
+            if (Math.abs(p.x) > f.cellSize || Math.abs(p.y) > f.cellSize) {
+              issues.push(`position=(${p.x.toFixed(0)},${p.y.toFixed(0)})`);
+            }
+            if (Number.isFinite(p.rotation)) rotations.push(p.rotation);
+          }
+          // Duplicate-rotation detection — two petals closer than 10° to
+          // each other render as visually overlapping.
+          const DUP_THRESHOLD = Math.PI / 18;  // 10°
+          const sortedRots = rotations.slice().sort((a, b) => a - b);
+          for (let i = 1; i < sortedRots.length; i++) {
+            if (Math.abs(sortedRots[i] - sortedRots[i - 1]) < DUP_THRESHOLD) {
+              issues.push(`dup-rotation ${sortedRots[i - 1].toFixed(2)}/${sortedRots[i].toFixed(2)}`);
+              break;
+            }
+          }
+          if (issues.length) {
+            console.warn(
+              `[heal-eoc-visual] (${r},${c}) counts OK (${f.petalCount}) — issues: ${issues.join(', ')}` +
+              ` · tag=${f._debugTag || '—'} — force rebuilding`
+            );
+            f.killPetalTweens();
+            f.setPetalCount(f.petalCount);
+            continue;
+          }
+
+          // FINAL SAFETY NET — even if nothing above flagged, force-rebuild
+          // every settled flower at cascade end. Cheap (≤ 20 flowers × 8
+          // sprites per spin cascade) and guarantees the visual matches
+          // the model regardless of any lingering tween weirdness that
+          // slipped past every check. If the bug still happens with this
+          // in place, the drift is happening AFTER cascade end (gravity /
+          // refill / between-spins) and we should look there next.
+          f.killPetalTweens();
+          f.setPetalCount(f.petalCount);
+        }
+      }
+    }
   }
 
   async _animateOneTransfer(move, staggerDelay = 0, speedMul = 1, markDetached = null) {
@@ -2223,6 +2325,14 @@ class SpinAnimator {
           if (!dst.destroyed) {
             dst.adoptFlyingPetal(petal);
           } else {
+            // Silent petal loss — dst was destroyed after the flight started
+            // but before it landed. The animator's dst cell is now short by
+            // one petal vs the model. This is what the [heal] step catches
+            // at the next dissolve.
+            console.warn(
+              `[flight-lost] ${move.from.r},${move.from.c} → ${move.to.r},${move.to.c} · ` +
+              `dst was destroyed mid-flight · dst.tag=${dst._debugTag || '—'}`
+            );
             gsap.killTweensOf(petal);
             gsap.killTweensOf(petal.scale);
             petal.destroy();
@@ -2410,9 +2520,19 @@ class SpinAnimator {
     const oldValue   = Math.max(0, totalValue - rngValue);
 
     return new Promise(resolve => {
-      const bigText = new PIXI.Text(formatTileMult(rngValue), {
+      const rngLabel  = formatTileMult(rngValue);
+      const sumLabel  = formatTileMult(totalValue);
+      const baseBigFS = Math.max(28, Math.floor(this.cellSize * 0.58));
+      // Pick a font size that fits BOTH the RNG label and the final total
+      // so the text doesn't need to shrink mid-animation (jumpy look).
+      const maxW = this.cellSize * 0.85;
+      const fitFS = Math.min(
+        _fitFontSize(rngLabel, baseBigFS, maxW, 22),
+        _fitFontSize(sumLabel, baseBigFS, maxW, 22),
+      );
+      const bigText = new PIXI.Text(rngLabel, {
         fontFamily: FONT,
-        fontSize: Math.max(28, Math.floor(this.cellSize * 0.58)),
+        fontSize: fitFS,
         fill: 0xFFD54F,
         stroke: 0x3D1C02,
         strokeThickness: Math.max(3, 4 * currentGameScale),
@@ -2424,25 +2544,8 @@ class SpinAnimator {
       bigText.scale.set(0.25);
       this.scene.fxLayer.addChild(bigText);
 
-      // Compute final badge position / scale (based on the TOTAL value
-      // since that's what will end up at the corner badge).
-      const measure = new PIXI.Text(formatTileMult(totalValue), {
-        fontFamily: FONT,
-        fontSize: Math.max(13, 15 * currentGameScale),
-      });
-      const finalBadgeW = measure.width + _tileBadgePadX() * 2;
-      measure.destroy();
-      const badgeCentre = _tileBadgeCenterForCell(rect, finalBadgeW);
-      const cornerWorld = this.scene.flowerLayer.toGlobal(
-        new PIXI.Point(badgeCentre.x, badgeCentre.y));
-      const cornerFx = this.scene.fxLayer.toLocal(cornerWorld);
-      const bigH  = bigText.height;
-      const tileH = _tileBadgeHeight();
-      const shrinkScale = Math.max(0.25, tileH / Math.max(1, bigH));
-
       const tl = gsap.timeline({
         onComplete: () => {
-          setCellTileBadge(d.r, d.c, totalValue, { skipEntry: true });
           if (!bigText.destroyed) bigText.destroy();
           resolve();
         },
@@ -2459,44 +2562,38 @@ class SpinAnimator {
           this._spawnSpreadEchoes(fxPos, d.newTile.spreads, rect);
         }
       }, null, 0.48);
-      // 4) Count-up from the RNG value to the new total — this is the
-      //    "adds on top of the old multiplier" visual. Only fires if the
-      //    cell already had a value; otherwise RNG == total and there's
-      //    nothing to count up to.
+      // 4) SLAM — the RNG value hits the old multiplier and the total
+      //    appears instantly with a punch. Also trigger a count-up on the
+      //    corner badge from its old value to the new total (no shrink-
+      //    and-travel animation — the badge just ticks up in place).
       if (oldValue > 0 && totalValue !== rngValue) {
-        const counter = { v: rngValue };
-        tl.to(counter, {
-          v: totalValue,
-          duration: 0.38,
-          ease: 'power2.out',
-          onUpdate: () => {
-            // Round so we don't flash decimals when halves accumulate.
-            const shown = Math.round(counter.v * 10) / 10;
-            bigText.text = formatTileMult(shown);
-          },
-          onComplete: () => { bigText.text = formatTileMult(totalValue); },
-        }, 0.48);
-        // Tiny scale bump on arrival of the sum.
-        tl.to(bigText.scale, { x: 1.2, y: 1.2, duration: 0.12, ease: 'back.out(2)' }, 0.74);
-        tl.to(bigText.scale, { x: 1,   y: 1,   duration: 0.12, ease: 'sine.inOut' }, 0.86);
+        tl.to(bigText.scale, { x: 1.15, y: 1.15, duration: 0.12, ease: 'back.out(2)' }, 0.48);
+        tl.call(() => {
+          bigText.text = formatTileMult(totalValue);
+          bigText.scale.set(1.3);
+          gsap.killTweensOf(bigText.scale);
+          gsap.to(bigText.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' });
+          this._spawnImpactFlash(fxPos.x, fxPos.y, this.cellSize * 0.45);
+          setCellMultText(d.r, d.c, totalValue);
+          setCellTint(d.r, d.c, totalValue);
+          // Count-up the corner badge (small pill) from oldValue → total.
+          countUpCellTileBadge(d.r, d.c, oldValue, totalValue);
+        }, null, 0.60);
+      } else {
+        // No prior multiplier — just spawn the corner badge at the new
+        // value at the moment the big text pops in.
+        tl.call(() => {
+          setCellMultText(d.r, d.c, totalValue);
+          setCellTint(d.r, d.c, totalValue);
+          countUpCellTileBadge(d.r, d.c, 0, totalValue);
+        }, null, 0.48);
       }
-      // 5) Shrink + travel to the corner badge (showing the total).
+      // 5) Big text fades out in place — no shrink/travel to the corner.
       tl.to(bigText, {
-        x: cornerFx.x,
-        y: cornerFx.y,
-        duration: 0.42,
-        ease: 'power2.inOut',
-      }, 0.98);
-      tl.to(bigText.scale, {
-        x: shrinkScale, y: shrinkScale,
-        duration: 0.42,
-        ease: 'power2.inOut',
-      }, 0.98);
-      tl.to(bigText, {
-        alpha: 0.0,
-        duration: 0.12,
+        alpha: 0,
+        duration: 0.25,
         ease: 'power2.in',
-      }, 1.30);
+      }, 1.00);
     });
   }
 
@@ -2514,9 +2611,12 @@ class SpinAnimator {
         new PIXI.Point(nRect.x + nRect.w / 2, nRect.y + nRect.h / 2));
       const targetFx = this.scene.fxLayer.toLocal(targetLocal);
 
-      const echoText = new PIXI.Text(formatTileMult(sp.add), {
+      const echoLabel = formatTileMult(sp.add);
+      const echoBase  = Math.max(18, Math.floor(this.cellSize * 0.30));
+      const echoFS    = _fitFontSize(echoLabel, echoBase, this.cellSize * 0.75, 14);
+      const echoText = new PIXI.Text(echoLabel, {
         fontFamily: FONT,
-        fontSize: Math.max(18, Math.floor(this.cellSize * 0.30)),
+        fontSize: echoFS,
         fill: 0xFFE29A,
         stroke: 0x3D1C02,
         strokeThickness: Math.max(2.5, 3 * currentGameScale),
@@ -2573,81 +2673,74 @@ class SpinAnimator {
     }
   }
 
-  // When an echo lands on a neighbour cell, count-up its big cell text
-  // from the OLD total to the NEW total (so the player visually sees the
-  // addition). Corner badge is updated to the final total at the end.
+  // SLAM handler — when an echo lands on a neighbour cell, instantly snap
+  // the cell's big text + corner badge to the NEW total (no count-up), pop
+  // a flash, and scale-pulse the cell readouts for a punchy impact feel.
   _animateAddToCellMult(r, c, oldTotal, newTotal) {
     const rect = this.scene.cells[r] && this.scene.cells[r][c];
     if (!rect) return;
-    // Ensure the big cell text exists. If the neighbour had no prior tile,
-    // create one starting from 0 (it'll count up in the tween below).
-    if (!scene.cellMultTexts[r][c]) {
-      setCellMultText(r, c, oldTotal > 0 ? oldTotal : 1);
-      // Kill the fresh pop-in animation — we'll drive scale/alpha ourselves.
-      const t = scene.cellMultTexts[r][c];
-      if (t) { gsap.killTweensOf(t); gsap.killTweensOf(t.scale); t.alpha = 0.85; t.scale.set(1); t.text = formatTileMult(oldTotal); }
-    }
-    const bigT = scene.cellMultTexts[r][c];
-    const existingBadge = scene.tileBadges[r][c];
+    const worldPos = this.scene.flowerLayer.toGlobal(
+      new PIXI.Point(rect.x + rect.w / 2, rect.y + rect.h / 2));
+    const fxPos = this.scene.fxLayer.toLocal(worldPos);
 
-    // Count-up the big cell text.
-    if (bigT) {
-      const counter = { v: oldTotal };
-      gsap.killTweensOf(counter);
-      gsap.to(counter, {
-        v: newTotal,
-        duration: 0.32,
-        ease: 'power2.out',
-        onUpdate: () => {
-          const shown = Math.round(counter.v * 10) / 10;
-          bigT.text = formatTileMult(shown);
-        },
-        onComplete: () => {
-          bigT.text = formatTileMult(newTotal);
-        },
-      });
-      gsap.fromTo(bigT.scale,
-        { x: 1.25, y: 1.25 },
-        { x: 1,    y: 1,    duration: 0.35, ease: 'back.out(2)' });
-    }
+    // Small in-cell flash (stays within the cell — half-cell reach).
+    this._spawnImpactFlash(fxPos.x, fxPos.y, this.cellSize * 0.4);
 
-    // Similarly roll up the corner badge (or create it).
-    if (existingBadge) {
-      const counter2 = { v: oldTotal };
-      gsap.killTweensOf(counter2);
-      gsap.to(counter2, {
-        v: newTotal,
-        duration: 0.32,
-        ease: 'power2.out',
-        onUpdate: () => {
-          const shown = Math.round(counter2.v * 10) / 10;
-          existingBadge._badgeText.text = formatTileMult(shown);
-          existingBadge._redraw();
-          const w = existingBadge._computeW();
-          const p = _tileBadgeCenterForCell(rect, w);
-          existingBadge.x = p.x;
-          existingBadge.y = p.y;
-        },
-        onComplete: () => {
-          existingBadge._badgeText.text = formatTileMult(newTotal);
-          existingBadge._redraw();
-          const w = existingBadge._computeW();
-          const p = _tileBadgeCenterForCell(rect, w);
-          existingBadge.x = p.x;
-          existingBadge.y = p.y;
-          existingBadge._value = newTotal;
-        },
-      });
-      gsap.fromTo(existingBadge.scale,
-        { x: 1.35, y: 1.35 },
-        { x: 1,    y: 1,    duration: 0.35, ease: 'back.out(2)' });
-    } else {
-      // No prior badge — drop a fresh one at the new total.
-      setCellTileBadge(r, c, newTotal);
-    }
-
-    // Make sure the underlying tint exists / updates for the new total.
+    // Update the tint + big cell text + corner badge to the new total.
+    // The corner badge ticks up from old → new via countUpCellTileBadge
+    // so the small pill shows a clean value progression.
     setCellTint(r, c, newTotal);
+    setCellMultText(r, c, newTotal);
+    countUpCellTileBadge(r, c, oldTotal, newTotal);
+
+    // Subtle pulse on the big cell text (behind the pot).
+    const bigT = scene.cellMultTexts[r][c];
+    if (bigT) {
+      gsap.killTweensOf(bigT.scale);
+      bigT.scale.set(1.18);
+      gsap.to(bigT.scale, { x: 1, y: 1, duration: 0.28, ease: 'back.out(2.2)' });
+    }
+  }
+
+  // A quick, CELL-CONTAINED impact flash + shockwave ring at (x, y) in
+  // fxLayer coords. `reach` is the maximum radius the effect may grow to
+  // (so the caller can pass e.g. cellSize * 0.4 to keep it inside the cell).
+  _spawnImpactFlash(x, y, reach) {
+    const fxLayer = this.scene.fxLayer;
+    // White core flash — small, fades quickly.
+    const core = new PIXI.Graphics();
+    const coreStart = Math.max(6, reach * 0.22);
+    core.beginFill(0xFFFFFF, 0.85);
+    core.drawCircle(0, 0, coreStart);
+    core.endFill();
+    core.x = x; core.y = y;
+    fxLayer.addChild(core);
+    // Core expands only slightly — ~1.6× of its starting size.
+    gsap.to(core.scale, { x: 1.6, y: 1.6, duration: 0.24, ease: 'power2.out' });
+    gsap.to(core, {
+      alpha: 0,
+      duration: 0.24,
+      ease: 'power2.out',
+      onComplete: () => core.destroy(),
+    });
+    // Gold shockwave ring — starts small, expands out to `reach` max.
+    const ring = new PIXI.Graphics();
+    ring.lineStyle(Math.max(2, 3 * currentGameScale), 0xFFD54F, 0.9);
+    ring.drawCircle(0, 0, 1);
+    ring.x = x; ring.y = y;
+    ring.scale.set(Math.max(4, reach * 0.2));
+    fxLayer.addChild(ring);
+    gsap.to(ring.scale, {
+      x: reach, y: reach,
+      duration: 0.32,
+      ease: 'power2.out',
+    });
+    gsap.to(ring, {
+      alpha: 0,
+      duration: 0.32,
+      ease: 'power2.out',
+      onComplete: () => ring.destroy(),
+    });
   }
 
   async _animateEmptyDissolve(d, index = 0) {
@@ -3056,25 +3149,32 @@ const player = {
   betLevels: [1, 2, 5, 10, 20, 50, 100, 200],
   betIndex: 3,          // starts at 10
   displayedWin: 0,      // last committed WIN value on screen
-  // Tile-mode free-spin feature. When active, bet is locked, spins don't
-  // deduct balance, multiplier tiles persist across spins.
+  // Free-spin feature. Available in both modes. When active, bet is
+  // locked, spins don't deduct balance, and the multiplier state
+  // accumulates across all feature spins:
+  //   alt-2: tile-multiplier grid persists.
+  //   alt-1: chain-multiplier emptyCount persists (tier ladder keeps
+  //          climbing spin-over-spin).
   feature: {
-    active:      false,
-    spinsLeft:   0,
-    cellMults:   null,   // carried over between spins while active (alt-2)
-    lockedBet:   null,   // bet frozen at purchase time
-    totalWin:    0,      // accumulated win across all feature spins
+    active:          false,
+    spinsLeft:       0,
+    lockedBet:       null,
+    totalWin:        0,
+    costPaid:        0,      // cost player paid to enter feature (for popup + net-win)
+    cellMults:       null,   // alt-2: per-cell tile multipliers
+    emptyCountCarry: 0,      // alt-1: cumulative empties across feature
   },
 };
 
-const FEATURE_SPIN_COUNT = 15;
+const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 15 };
 const FEATURE_COST_MULT  = 100;   // cost = 100 × bet
 
+function featureSpinCount() {
+  return FEATURE_SPIN_COUNT_BY_MODE[ALT_MODE] || 10;
+}
 function featureCost() { return player.bet * FEATURE_COST_MULT; }
 function canBuyFeature() {
-  return ALT_MODE === 'alt2'
-      && !player.feature.active
-      && player.balance >= featureCost();
+  return !player.feature.active && player.balance >= featureCost();
 }
 
 function canAffordSpin() {
@@ -3949,11 +4049,12 @@ function buildScene(L) {
     app.stage.addChild(scene.tileBtn);
   }
 
-  // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (alt-2 only) ────────────────
+  // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (both modes) ────────────────
   // Square button sitting to the LEFT of the grid, aligned to the grid's
-  // top edge. Opens a confirmation modal; on confirm, kicks off the
-  // 15-free-spin feature where tile multipliers accumulate across spins.
-  if (ALT_MODE === 'alt2') {
+  // top edge. Opens a confirmation modal; on confirm, kicks off the free-
+  // spin feature. Alt-2 gets 15 spins with tile-multiplier persistence;
+  // alt-1 gets 10 spins with chain-multiplier (emptyCount) persistence.
+  {
     const bfSize = Math.max(120, 140 * gameScale);
     const bfW = bfSize;
     const bfH = bfSize;
@@ -4081,9 +4182,6 @@ function buildScene(L) {
     scene.featureBanner = bannerCont;
     scene.featureBanner._refresh = refreshBanner;
     app.stage.addChild(bannerCont);
-  } else {
-    scene.buyBtn        = null;
-    scene.featureBanner = null;
   }
 
   // ─── STATUS TEXT (replaces the old WIN pill slot in the bottom UI row) ──
@@ -4368,6 +4466,18 @@ const TILE_BADGE_INSET = 10;  // px inset from cell corner (pre-scaling)
 function _tileBadgePadX() { return 10 * currentGameScale; }
 function _tileBadgeHeight() { return Math.max(22, 26 * currentGameScale); }
 
+// Compute a font size that keeps a Fredoka One label within maxWidth —
+// starting from baseFontSize and scaling down if the label would overflow.
+// Uses a fast char-width heuristic (Fredoka One ≈ 0.7 × fontSize per char)
+// so we don't have to create + destroy a probe PIXI.Text each call.
+function _fitFontSize(label, baseFontSize, maxWidth, minFontSize = 16) {
+  const chars = String(label).length || 1;
+  const AVG_CHAR_W = 0.7;     // heuristic for Fredoka One
+  const naturalW = baseFontSize * chars * AVG_CHAR_W;
+  if (naturalW <= maxWidth) return baseFontSize;
+  return Math.max(minFontSize, Math.floor(maxWidth / (chars * AVG_CHAR_W)));
+}
+
 // Paint / clear a gold tint overlay on a cell when it holds a multiplier.
 // Colour intensity nudges up slightly with multiplier value.
 function setCellTint(r, c, value) {
@@ -4437,9 +4547,11 @@ function setCellMultText(r, c, value) {
   }
 
   const cellShort = Math.min(rect.w, rect.h);
-  const fontSize = Math.max(20, Math.floor(cellShort * 0.52));
-  const stroke = Math.max(3, 5 * currentGameScale);
+  const baseFontSize = Math.max(20, Math.floor(cellShort * 0.52));
   const label = formatTileMult(value);
+  // Keep the label inside the cell with a bit of padding on each side.
+  const fontSize = _fitFontSize(label, baseFontSize, cellShort * 0.85, 18);
+  const stroke = Math.max(3, 5 * currentGameScale);
 
   if (existing) {
     existing.text = label;
@@ -4591,6 +4703,61 @@ function setCellTileBadge(r, c, value, opts = {}) {
   return badge;
 }
 
+// Animate a corner tile badge's value from `fromValue` to `toValue`. Used
+// so the small pill at a cell's corner "ticks up" to its new total as the
+// new multiplier lands, instead of snapping in one frame. If the cell has
+// no badge yet, a fresh one is created starting at fromValue and animated
+// up to toValue.
+function countUpCellTileBadge(r, c, fromValue, toValue) {
+  if (!scene.tileBadges) return;
+  const rect = scene.cells[r] && scene.cells[r][c];
+  if (!rect) return;
+  let badge = scene.tileBadges[r][c];
+  if (!badge) {
+    // Create at fromValue (or toValue if fromValue is 0) with no entry pop
+    // so we can drive the tween ourselves.
+    const seed = fromValue > 0 ? fromValue : toValue;
+    setCellTileBadge(r, c, seed, { skipEntry: true });
+    badge = scene.tileBadges[r][c];
+    if (!badge) return;
+    if (fromValue <= 0) {
+      // Already shows toValue — just pulse it.
+      gsap.fromTo(badge.scale, { x: 1.35, y: 1.35 }, { x: 1, y: 1, duration: 0.35, ease: 'back.out(2)' });
+      badge._value = toValue;
+      return;
+    }
+  }
+  const counter = { v: fromValue };
+  gsap.killTweensOf(counter);
+  gsap.killTweensOf(badge.scale);
+  gsap.to(counter, {
+    v: toValue,
+    duration: 0.38,
+    ease: 'power2.out',
+    onUpdate: () => {
+      const shown = Math.round(counter.v * 10) / 10;
+      badge._badgeText.text = formatTileMult(shown);
+      badge._redraw();
+      const w = badge._computeW();
+      const p = _tileBadgeCenterForCell(rect, w);
+      badge.x = p.x;
+      badge.y = p.y;
+    },
+    onComplete: () => {
+      badge._badgeText.text = formatTileMult(toValue);
+      badge._redraw();
+      const w = badge._computeW();
+      const p = _tileBadgeCenterForCell(rect, w);
+      badge.x = p.x;
+      badge.y = p.y;
+      badge._value = toValue;
+    },
+  });
+  gsap.fromTo(badge.scale,
+    { x: 1.25, y: 1.25 },
+    { x: 1, y: 1, duration: 0.4, ease: 'back.out(2)' });
+}
+
 // Wipe every tile badge (spin-end / mode-change). Also clears any cell
 // tints and big multiplier texts painted behind the flowers.
 function clearAllTileBadges() {
@@ -4658,11 +4825,18 @@ function startFeature() {
   const prevBal = player.balance;
   player.balance -= cost;
   updateBalanceText(prevBal);
-  player.feature.active    = true;
-  player.feature.spinsLeft = FEATURE_SPIN_COUNT;
-  player.feature.cellMults = makeEmptyCellMults();
-  player.feature.lockedBet = player.bet;
-  player.feature.totalWin  = 0;
+  // Account for the feature cost in the wager stats — it's a wager in
+  // every sense (player money out, chance to win back) so RTP math would
+  // be wrong without it.
+  BloomSort.stats.totalWager += cost;
+  updateRtpText();
+  player.feature.active          = true;
+  player.feature.spinsLeft       = featureSpinCount();
+  player.feature.cellMults       = makeEmptyCellMults();
+  player.feature.lockedBet       = player.bet;
+  player.feature.totalWin        = 0;
+  player.feature.costPaid        = cost;
+  player.feature.emptyCountCarry = 0;
   // Clear any leftover tile badges from prior spins — feature tiles start
   // fresh and accumulate from here.
   clearAllTileBadges();
@@ -4672,18 +4846,29 @@ function startFeature() {
   setTimeout(() => { onSpinClick(); }, 250);
 }
 
-// Called when the 15th spin finishes (or if feature is cleared otherwise).
-// Shows the "Congratulations" result popup with the total feature winnings.
+// Called when the last spin finishes (or if feature is cleared otherwise).
+// Credits the total feature winnings to balance in one go, then shows the
+// "Congratulations" result popup showing total won + cost paid + net.
 function endFeature() {
   const totalWon = player.feature.totalWin || 0;
-  player.feature.active    = false;
-  player.feature.spinsLeft = 0;
-  player.feature.cellMults = null;
-  player.feature.lockedBet = null;
-  player.feature.totalWin  = 0;
+  const costPaid = player.feature.costPaid || 0;
+  player.feature.active          = false;
+  player.feature.spinsLeft       = 0;
+  player.feature.cellMults       = null;
+  player.feature.lockedBet       = null;
+  player.feature.totalWin        = 0;
+  player.feature.costPaid        = 0;
+  player.feature.emptyCountCarry = 0;
+  // Credit the full feature win to the balance NOW — during the feature
+  // itself the balance was held unchanged.
+  if (totalWon > 0) {
+    const preCreditBal = player.balance;
+    player.balance += totalWon;
+    updateBalanceText(preCreditBal);
+  }
   clearAllTileBadges();
   refreshFeatureUI();
-  openFeatureResultModal(totalWon);
+  openFeatureResultModal(totalWon, costPaid);
 }
 
 // Refresh every bit of UI that depends on feature state.
@@ -5125,7 +5310,12 @@ Cascades
 
 Final Win
 • Final Win  =  Total Payout × Multiplier
-• Total Payout is the sum of every Full Bloom paid during the spin.`;
+• Total Payout is the sum of every Full Bloom paid during the spin.
+
+Buy Feature
+• Pays 100 × bet for 10 free spins.
+• The spin multiplier does NOT reset between free spins — the tier
+  ladder keeps climbing from wherever the previous free spin ended.`;
 
   const rulesBody = new PIXI.Text(rulesText, {
     fontFamily: 'Arial, sans-serif',
@@ -5312,15 +5502,22 @@ function _openSimpleModal({ title, bodyLines, buttons }) {
 
 function openBuyFeatureModal() {
   if (!canBuyFeature()) return;
-  const cost = featureCost();
+  const cost  = featureCost();
+  const spins = featureSpinCount();
+  const persistLine = (ALT_MODE === 'alt2')
+    ? `Multiplier tiles dropped during the`
+    : `The spin multiplier keeps climbing`;
+  const persistLine2 = (ALT_MODE === 'alt2')
+    ? `feature PERSIST across all ${spins} spins.`
+    : `across all ${spins} free spins.`;
   const dialog = _openSimpleModal({
     title: 'Buy Feature',
     bodyLines: [
       `Are you sure you want to buy`,
-      `15 free spins for ${fmtCurrency(cost)}?`,
+      `${spins} free spins for ${fmtCurrency(cost)}?`,
       ` `,
-      `Multiplier tiles dropped during the`,
-      `feature PERSIST across all 15 spins.`,
+      persistLine,
+      persistLine2,
     ],
     buttons: [
       {
@@ -5345,7 +5542,7 @@ function openBuyFeatureModal() {
   scene.buyFeatureModal = dialog.modal;
 }
 
-function openFeatureResultModal(totalWon) {
+function openFeatureResultModal(totalWon /* , costPaid (unused in popup) */) {
   const dialog = _openSimpleModal({
     title: 'Congratulations',
     bodyLines: [
@@ -5388,28 +5585,44 @@ async function onSpinClick() {
   // 2. Reset the spin UI state
   scene.spinButton._setBusy(true);
   if (scene.winPill && scene.winPill.resetPermanent) scene.winPill.resetPermanent();
-  updateMultiplierBar(1, 0);
+  // Chain-mode pill: outside the feature resets to baseline. Inside the
+  // feature, seed with the carried-over emptyCount so the tier ladder
+  // keeps climbing spin-over-spin.
+  if (inFeature && ALT_MODE === 'alt1') {
+    const carry = player.feature.emptyCountCarry || 0;
+    updateMultiplierBar(multForEmpties(carry), carry);
+  } else {
+    updateMultiplierBar(1, 0);
+  }
   updateWinText(0);
   // Status line: blanks between regular spins, but during the feature we
   // keep showing the running cumulative "WIN <total>" so the player can
-  // watch it climb across all 15 spins without a reset each time.
+  // watch it climb across all spins without a reset each time.
   if (inFeature) {
     updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
   } else {
     updateStatusText('');
   }
   // Alt-2: wipe any multiplier tiles from the previous spin — EXCEPT during
-  // the free-spin feature where tiles accumulate across all 15 spins.
+  // the free-spin feature where tiles accumulate across all spins.
   if (!inFeature) clearAllTileBadges();
 
-  // 3. Run the deterministic simulation — animator replays it. In the
-  //    feature, carry tile state across spins via the cellMults handoff.
-  const runOpts = (inFeature && ALT_MODE === 'alt2')
-    ? { cellMults: player.feature.cellMults }
-    : {};
+  // 3. Run the deterministic simulation — animator replays it. Feature
+  //    carry: alt-2 passes cellMults grid; alt-1 passes emptyCountStart.
+  //    freeSpin flag keeps the model from double-counting wager (the
+  //    feature cost already went into stats.totalWager at purchase time).
+  const runOpts = {};
+  if (inFeature) {
+    runOpts.freeSpin = true;
+    if (ALT_MODE === 'alt2') runOpts.cellMults       = player.feature.cellMults;
+    if (ALT_MODE === 'alt1') runOpts.emptyCountStart = player.feature.emptyCountCarry || 0;
+  }
   const result = BloomSort.runSpin(bet, runOpts);
   if (inFeature && ALT_MODE === 'alt2' && result.cellMults) {
     player.feature.cellMults = result.cellMults;
+  }
+  if (inFeature && ALT_MODE === 'alt1' && typeof result.emptyCount === 'number') {
+    player.feature.emptyCountCarry = result.emptyCount;
   }
 
   if (!animator) animator = new SpinAnimator({ scene, app });
@@ -5430,6 +5643,17 @@ async function onSpinClick() {
       } else {
         // Chain-multiplier mode: the top pill shows the running pre-mult win.
         updateWinText(runningWin, true);
+        // During the chain-mode feature, also tick the bottom status with
+        // the cumulative total so the player can watch it climb — the
+        // pill shows THIS spin's running, the status shows the whole run.
+        if (inFeature) {
+          const baseline = player.feature.totalWin || 0;
+          // runningWin here is PRE-multiplier (the count-up on the pill
+          // handles the × reveal at spin end). For an honest running
+          // display of feature earnings, use the pre-mult running.
+          const displayWin = baseline + runningWin;
+          updateStatusText(`WIN ${fmtCurrency(displayWin)}`);
+        }
       }
     }
   };
@@ -5440,7 +5664,10 @@ async function onSpinClick() {
       const baseWin = finalResult.totalPayout * bet;   // pre-multiplier
       const finalWin = finalResult.finalWin;           // post-multiplier
 
-      if (finalWin > 0) {
+      // Balance: outside the feature, credit this spin's win immediately.
+      // Inside the feature, the balance is held frozen through all free
+      // spins and only credited in bulk when the feature ends.
+      if (finalWin > 0 && !player.feature.active) {
         const preCreditBal = player.balance;
         player.balance += finalWin;
         updateBalanceText(preCreditBal);
@@ -5471,15 +5698,26 @@ async function onSpinClick() {
           updateWinText(finalWin, true);
           if (finalWin > 0 && finalWin >= bet) pulseWinPill();
         }
-        if (finalWin > 0) {
+        if (player.feature.active) {
+          // Accumulate this spin's win into the feature total so the end
+          // popup reports the full amount won across all free spins, and
+          // the bottom status stays showing the running cumulative total.
+          player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+          updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+        } else if (finalWin > 0) {
           updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
         } else {
           updateStatusText('Good luck!');
         }
       }
 
-      uiState.multiplier = 1;
-      uiState.emptyCount = 0;
+      // Outside the feature, reset the pill state baseline. Inside the
+      // feature we keep the displayed multiplier so the next free spin
+      // picks up where this one left off.
+      if (!player.feature.active) {
+        uiState.multiplier = 1;
+        uiState.emptyCount = 0;
+      }
 
       // Free-spin feature bookkeeping — decrement counter, end feature on
       // the final spin, or auto-chain to the next spin.
