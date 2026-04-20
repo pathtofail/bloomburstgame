@@ -88,6 +88,22 @@ const GAME = {
   MULT_TIER_STEP_EMPTIES: 5,
   MULT_TIER_STEP_MULT:    5,
 
+  // ─── Alt-2 tile multiplier config ────────────────────────────────────────
+  // When a pot empties in ALT_MODE='alt2', a multiplier tile is dropped on
+  // that cell (value picked from this weighted distribution) and HALF of
+  // that value is added to each of the 4 orthogonal neighbour cells. Any
+  // subsequent empties stack additively. If a Full Bloom later occurs on a
+  // cell with a tile, that bloom's payout is multiplied by the cell's total.
+  MULT_TILE_WEIGHTS: [
+    { value:   4, weight: 40 },
+    { value:   8, weight: 25 },
+    { value:  10, weight: 15 },
+    { value:  20, weight: 10 },
+    { value:  50, weight:  5 },
+    { value: 100, weight:  3 },
+    { value: 500, weight:  2 },
+  ],
+
   // basePay is the actual coins-per-bet-unit a Full Bloom pays out. Tune
   // RTP by editing these values directly — no global multiplier in between.
   COLORS: [
@@ -193,6 +209,44 @@ function multTierProgress(n) {
     progress,
     lowerAt, upperAt,
   };
+}
+
+// ─── Alt-mode selection (chain vs tile multiplier mechanic) ─────────────────
+// 'alt1'  — original: every empty adds to a shared spin multiplier that
+//           multiplies total win at spin end (tier ladder above).
+// 'alt2'  — tile-multiplier: each empty drops a random multiplier tile on
+//           the cell + half-value echoes on orthogonal neighbours. Blooms
+//           on a tile are multiplied per-bloom, no global spin multiplier.
+// Persisted across reloads via localStorage.
+const ALT_MODE_KEY = 'bloom_burst_alt_mode';
+let ALT_MODE = (() => {
+  try {
+    const v = localStorage.getItem(ALT_MODE_KEY);
+    if (v === 'alt1' || v === 'alt2') return v;
+  } catch (_) {}
+  return 'alt1';
+})();
+function setAltMode(m) {
+  if (m !== 'alt1' && m !== 'alt2') return;
+  ALT_MODE = m;
+  try { localStorage.setItem(ALT_MODE_KEY, m); } catch (_) {}
+}
+
+// Pick a tile-multiplier value using the weighted distribution in
+// GAME.MULT_TILE_WEIGHTS. Returns an integer like 4, 8, 50 etc.
+function pickTileMultiplier() {
+  return weightedPick(GAME.MULT_TILE_WEIGHTS).value;
+}
+
+// Fresh per-spin tile-multiplier grid (all zero).
+function makeEmptyCellMults() {
+  const g = [];
+  for (let r = 0; r < GAME.ROWS; r++) {
+    const row = [];
+    for (let c = 0; c < GAME.COLS; c++) row.push(0);
+    g.push(row);
+  }
+  return g;
 }
 
 function generateGrid() {
@@ -379,7 +433,7 @@ function runManySpins(n, bet = 1) {
 // Run a full spin. Accepts optional bet (default 1) — updates cumulative RTP
 // stats. Returns:
 //   { events, finalGrid, totalPayout, multiplier, finalWin, cascadeCount, bet, rtp }
-function runSpin(bet = 1) {
+function runSpin(bet = 1, opts = {}) {
   const events = [];
   let grid = generateGrid();
   events.push({ type: 'spawn', grid: cloneGrid(grid) });
@@ -388,6 +442,16 @@ function runSpin(bet = 1) {
   let emptyCount   = 0;   // cumulative empty dissolves — drives multiplier tier
   let multiplier   = 1;
   let cascadeCount = 0;
+
+  // Alt-2 per-cell multipliers. Unused in alt1. Normally fresh per spin, but
+  // the caller can pass `opts.cellMults` to carry them over (free-spin
+  // feature) so tiles accumulate across multiple spins.
+  const cellMults = (opts && opts.cellMults)
+    ? opts.cellMults.map(row => row.slice())
+    : makeEmptyCellMults();
+  // Snapshot for debugging / animator — emitted with each dissolve event so
+  // the view can render the current state of tiles on the grid.
+  const cloneMults = (g) => g.map(row => row.slice());
 
   for (let cas = 0; cas < GAME.MAX_CASCADES; cas++) {
     // 1. Transfers until stable
@@ -420,6 +484,10 @@ function runSpin(bet = 1) {
       }
     }
 
+    // Alt-2: empties no longer drop multipliers. BLOOMS do (see the dissolve
+    // step below) — a bloom places a canonical tile on its own cell and a
+    // half-value on every adjacent cell (including diagonals).
+
     for (const p of passes) {
       events.push({
         type: 'transferPass',
@@ -436,13 +504,59 @@ function runSpin(bet = 1) {
     const { fullBlooms, emptyDissolves } = findDissolves(grid);
     if (fullBlooms.length === 0 && emptyDissolves.length === 0) break;
 
-    const payoutDelta = fullBlooms.reduce((s, f) => s + f.basePay, 0);
+    // Per-bloom payout uses each cell's multiplier BEFORE this bloom drops
+    // its own tile. A "virgin" cell pays base; a cell already boosted by a
+    // neighbour's previous bloom gets the accumulated multiplier.
+    const perBloomInfo = fullBlooms.map(fb => {
+      const cellMult = (ALT_MODE === 'alt2') ? (cellMults[fb.r][fb.c] || 0) : 0;
+      const effectiveMult = cellMult > 0 ? cellMult : 1;
+      return {
+        ...fb,
+        cellMult,
+        effectiveMult,
+        pay: fb.basePay * effectiveMult,
+      };
+    });
+    const payoutDelta = perBloomInfo.reduce((s, f) => s + f.pay, 0);
+
+    // Alt-2: each bloom now DROPS a multiplier — full canonical value on
+    // its own cell, half on every adjacent cell (8-way, diagonals included).
+    // This happens AFTER payouts are computed so the bloom's own tile can't
+    // pay itself on the same cascade.
+    if (ALT_MODE === 'alt2') {
+      const deltas = [
+        [-1, -1], [-1, 0], [-1, 1],
+        [ 0, -1],          [ 0, 1],
+        [ 1, -1], [ 1, 0], [ 1, 1],
+      ];
+      for (const fb of perBloomInfo) {
+        const value = pickTileMultiplier();
+        cellMults[fb.r][fb.c] += value;
+        const halfValue = value / 2;
+        const spreads = [];
+        for (const [dr, dc] of deltas) {
+          const nr = fb.r + dr, nc = fb.c + dc;
+          if (nr < 0 || nr >= GAME.ROWS || nc < 0 || nc >= GAME.COLS) continue;
+          cellMults[nr][nc] += halfValue;
+          spreads.push({ r: nr, c: nc, add: halfValue, total: cellMults[nr][nc] });
+        }
+        fb.newTile = {
+          value,
+          totalAfter: cellMults[fb.r][fb.c],
+          spreads,
+        };
+      }
+    }
 
     const emptyCountBefore = emptyCount;
     emptyCount += emptyDissolves.length;
 
     const multBefore = multiplier;
-    multiplier = GAME.MULTIPLIER_ENABLED ? multForEmpties(emptyCount) : 1;
+    // Global spin multiplier (alt-1 only). Alt-2 keeps multiplier at 1 since
+    // multiplication happens per-bloom via cell tiles.
+    multiplier = (ALT_MODE === 'alt1' && GAME.MULTIPLIER_ENABLED)
+      ? multForEmpties(emptyCount)
+      : 1;
     const multDelta = multiplier - multBefore;
 
     totalPayout += payoutDelta;
@@ -451,8 +565,14 @@ function runSpin(bet = 1) {
     events.push({
       type: 'dissolve',
       cascadeIndex: cas,
-      fullBlooms: fullBlooms.map(x => ({ ...x })),
+      fullBlooms: perBloomInfo,
       emptyDissolves: emptyDissolves.map(x => ({ ...x })),
+      cellMultsAfter: cloneMults(cellMults),
+      altMode: ALT_MODE,
+      // Authoritative grid state AT dissolve time (after transfers,
+      // before dissolves are applied). Animator uses this to heal any
+      // drift between its petal counts and the model's.
+      gridAtDissolve: cloneGrid(grid),
       payoutDelta,
       multDelta,
       payoutTotal:      totalPayout,
@@ -479,9 +599,10 @@ function runSpin(bet = 1) {
     });
   }
 
-  // Bet scaling. In a real slot, base pays are expressed per unit bet, so the
-  // actual payout to the player is (math × bet). This keeps RTP invariant
-  // across bet sizes: RTP = E[finalWin / bet] = E[totalPayout × multiplier].
+  // Bet scaling. In alt-1 the per-spin multiplier multiplies the whole
+  // totalPayout at the end. In alt-2 multipliers are already baked into the
+  // individual bloom payouts (totalPayout is post-multiplier already), so
+  // the global multiplier is 1 and math simplifies.
   const mathWin  = totalPayout * multiplier;   // pre-bet math result
   const finalWin = mathWin * bet;               // actual coins paid to player
 
@@ -507,6 +628,7 @@ function runSpin(bet = 1) {
     events, finalGrid: grid,
     totalPayout, multiplier, mathWin, finalWin, cascadeCount,
     bet,
+    cellMults,            // final per-cell multipliers (alt-2; used by feature)
     rtp: stats.rtp,
     spinCount: stats.spins,
   };
@@ -1274,6 +1396,12 @@ class FlowerSymbol extends PIXI.Container {
     petal.scale.set(this._scale);
     petal.skew.x = 0;
     this.petalCount -= 1;
+    if (this.petalCount !== this.petalLayer.children.length) {
+      console.warn(
+        `[petal-invariant] DETACH desync on ${this._debugTag || 'flower'}: ` +
+        `petalCount=${this.petalCount} children=${this.petalLayer.children.length}`
+      );
+    }
     this._reflowRemaining();
     return petal;
   }
@@ -1284,7 +1412,18 @@ class FlowerSymbol extends PIXI.Container {
     const angles = PETAL_ANGLES[this.petalCount] || [];
     const kids = this.petalLayer.children.slice();
     kids.sort((a, b) => a.rotation - b.rotation);
+    const canonicalScale = this._scale;
     kids.forEach((p, i) => {
+      // Defensive: any stale alpha/scale/visibility from an interrupted
+      // flight or tween chain gets normalised here so the petal is
+      // guaranteed visible at its canonical size.
+      gsap.killTweensOf(p);
+      gsap.killTweensOf(p.scale);
+      p.alpha = 1;
+      p.visible = true;
+      p.renderable = true;
+      p.scale.set(canonicalScale);
+      p.skew.x = 0;
       gsap.to(p, {
         rotation: angles[i] ?? 0,
         x: 0, y: 0,
@@ -1326,6 +1465,19 @@ class FlowerSymbol extends PIXI.Container {
     }
 
     this.petalCount += 1;
+    if (this.petalCount !== this.petalLayer.children.length) {
+      console.warn(
+        `[petal-invariant] ADOPT desync on ${this._debugTag || 'flower'}: ` +
+        `petalCount=${this.petalCount} children=${this.petalLayer.children.length} ` +
+        `(post-addChild; addChild may have been a no-op)`
+      );
+    }
+    if (this.petalCount > 8) {
+      console.warn(
+        `[petal-invariant] OVER-MAX on ${this._debugTag || 'flower'}: ` +
+        `petalCount=${this.petalCount}. Model shouldn't allow receiving past 8.`
+      );
+    }
     const angles = PETAL_ANGLES[this.petalCount] || [];
 
     // Sort existing petals by rotation to match to slots in angular order.
@@ -1736,7 +1888,11 @@ class SpinAnimator {
             duration: T(0.55),
             delay: colDelay,
             ease: 'power2.in',
-            onComplete: () => { f.destroy({ children: true }); resolve(); },
+            onComplete: () => {
+              if (f.killPetalTweens) f.killPetalTweens();
+              if (!f.destroyed) f.destroy({ children: true });
+              resolve();
+            },
           });
         }));
         this.scene.flowers[r][c] = null;
@@ -1753,6 +1909,7 @@ class SpinAnimator {
         const data = ev.grid[r][c];
         if (!data) continue;
         const flower = new FlowerSymbol(data.color, data.petals, this.cellSize);
+        flower._debugTag = `(${r},${c})@spawn`;
         const rect = this.scene.cells[r][c];
         flower.x = rect.x + rect.w / 2;
         // Stack the 4 flowers for this column above the grid so they fall in
@@ -1834,19 +1991,18 @@ class SpinAnimator {
     if (hasEmpties) {
       if (!this._launchedEmpties) this._launchedEmpties = new Set();
       if (!this._inFlightEmpties) this._inFlightEmpties = [];
+      // Empty flights fire with a small stagger — each pot pops a beat
+      // after the previous one so the cascade reads as sequential, but
+      // they don't strictly wait for each other to finish.
+      const EMPTY_STAGGER_MS = 120;
       ev.newEmpties.forEach((ed, i) => {
         const key = `${ed.r},${ed.c}`;
         if (this._launchedEmpties.has(key)) return;
         this._launchedEmpties.add(key);
         const detachDone = detachDoneByCell.get(key); // may be undefined
-        // Await the ACTUAL detach (not a stagger-based estimate) + then
-        // hold EMPTY_REGISTER_MS so the player sees the pot sit empty before
-        // it flies away. If there's no outbound detach from this cell in
-        // this pass (e.g. it went empty via some other path), skip straight
-        // to the register beat.
         const flight = (async () => {
           if (detachDone) await detachDone;
-          await new Promise(r => setTimeout(r, EMPTY_REGISTER_MS));
+          await new Promise(r => setTimeout(r, EMPTY_REGISTER_MS + i * EMPTY_STAGGER_MS));
           if (!this.scene.flowers[ed.r][ed.c]) return;   // race guard
           await this._animateEmptyDissolve(ed, 0);
         })();
@@ -1870,6 +2026,30 @@ class SpinAnimator {
     const src = this.scene.flowers[move.from.r][move.from.c];
     const dst = this.scene.flowers[move.to.r][move.to.c];
     if (!src || !dst) { finishDetached(); return; }
+
+    // HARD INVARIANT: the model only emits same-colour transfers. If the
+    // animator has somehow ended up with different-coloured flowers at these
+    // cell coords, fire the alarm BEFORE launching a doomed flight — the
+    // colour error downstream makes it hard to tell where the drift started.
+    if (src.colorName !== dst.colorName) {
+      console.warn(
+        `[colour-drift] (${move.from.r},${move.from.c})${src.colorName} → ` +
+        `(${move.to.r},${move.to.c})${dst.colorName}` +
+        ` · move.color=${move.color}`
+      );
+    }
+    if (move.color && src.colorName !== move.color) {
+      console.warn(
+        `[colour-drift] src (${move.from.r},${move.from.c}) is ${src.colorName} ` +
+        `but model says move.color=${move.color}`
+      );
+    }
+    if (move.color && dst.colorName !== move.color) {
+      console.warn(
+        `[colour-drift] dst (${move.to.r},${move.to.c}) is ${dst.colorName} ` +
+        `but model says move.color=${move.color}`
+      );
+    }
 
     // Hold for the stagger so this petal's "tearing" starts a hair later than
     // its siblings — kills the uncanny synchronisation.
@@ -1925,8 +2105,31 @@ class SpinAnimator {
         ` · src.children=${src.petalLayer ? src.petalLayer.children.length : 'n/a'}` +
         ` · src.petalCount=${src.petalCount}` +
         ` · src.destroyed=${src.destroyed}` +
+        ` · src._debugTag=${src._debugTag || '—'}` +
         ` · pending-in-src=${pendingAtSrc ? pendingAtSrc.length : 0}`
       );
+      // Full grid dump: color + petalCount + live children count + any
+      // pending inbound flights per cell. Makes it obvious which flower
+      // the animator is confused about.
+      try {
+        const dump = [];
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
+            const f = this.scene.flowers[r][c];
+            const pend = (this._pendingAdoptsByCell.get(`${r},${c}`) || []).length;
+            dump.push({
+              cell: `${r},${c}`,
+              color: f ? f.colorName : 'null',
+              petalCount: f ? f.petalCount : 0,
+              children: f && f.petalLayer ? f.petalLayer.children.length : 0,
+              destroyed: f ? !!f.destroyed : false,
+              tag: f && f._debugTag ? f._debugTag : '—',
+              pendingIn: pend,
+            });
+          }
+        }
+        console.table(dump);
+      } catch (e) { /* ignore */ }
       // Drop this adopt registration since no flight actually happens.
       const list = this._pendingAdoptsByCell.get(dstKey);
       if (list) {
@@ -2049,18 +2252,43 @@ class SpinAnimator {
       await Promise.all(pending);
     }
 
+    // Heal step — any flower whose petalCount disagrees with the model's
+    // authoritative grid state gets force-corrected via setPetalCount. This
+    // is a safety net: if a flight went silent (destroyed-branch or a race
+    // I haven't tracked), the pot visibly snaps to the right count rather
+    // than triggering downstream [petal-lost] cascades.
+    if (ev.gridAtDissolve) {
+      for (let r = 0; r < GAME.ROWS; r++) {
+        for (let c = 0; c < GAME.COLS; c++) {
+          const expected = ev.gridAtDissolve[r][c];
+          const f = this.scene.flowers[r][c];
+          if (!expected || !f || f.destroyed) continue;
+          if (f.petalCount !== expected.petals) {
+            console.warn(
+              `[heal] (${r},${c}) animator=${f.petalCount} model=${expected.petals} · ` +
+              `tag=${f._debugTag || '—'} — resyncing`
+            );
+            f.killPetalTweens();
+            f.setPetalCount(expected.petals);
+          }
+        }
+      }
+    }
+
     // Held beat so the player can see the pots at their post-transfer state
     // (full blooms with all 8 petals, empties cleared) BEFORE the bloom
     // animation starts and the payout text pops.
     if (ev.fullBlooms.length > 0) {
       // Sanity check — drain should have left every blooming flower at MAX
-      // petals. If not, something slipped through the pending-adopt guard.
+      // petals AND its petalLayer should have exactly MAX children.
       for (const fb of ev.fullBlooms) {
         const f = this.scene.flowers[fb.r][fb.c];
-        if (f && f.petalCount !== GAME.MAX_PETALS) {
+        if (!f) continue;
+        const kids = f.petalLayer ? f.petalLayer.children.length : 0;
+        if (f.petalCount !== GAME.MAX_PETALS || kids !== GAME.MAX_PETALS) {
           console.warn(
-            `[bloom-sync] Flower at (${fb.r},${fb.c}) has ${f.petalCount} petals, expected ${GAME.MAX_PETALS}. ` +
-            `Model/view drift — a petal flight likely no-op'd.`
+            `[bloom-sync] (${fb.r},${fb.c}) petalCount=${f.petalCount} children=${kids} ` +
+            `expected=${GAME.MAX_PETALS} · tag=${f._debugTag || '—'}`
           );
         }
       }
@@ -2108,9 +2336,21 @@ class SpinAnimator {
     spawnBurst(this.scene.fxLayer, fxPos.x, fxPos.y, colorHex, 16, this.cellSize * 0.7);
 
     // Payout text over the dissolving symbol — the coin value this Full Bloom
-    // contributed to the win (basePay × bet).
-    const payoutAmount = d.basePay * this.currentBet;
+    // contributed to the win. Alt-2: already multiplied by the cell tile
+    // (d.pay includes the cellMult); alt-1: just basePay.
+    const payoutAmount = (d.pay !== undefined)
+      ? d.pay * this.currentBet
+      : d.basePay * this.currentBet;
     spawnPayoutText(this.scene.fxLayer, fxPos.x, fxPos.y - 6, payoutAmount);
+    // If a tile multiplier amplified this bloom, flash it as confirmation.
+    if (d.cellMult && d.cellMult > 0) {
+      const badge = scene.tileBadges && scene.tileBadges[d.r] && scene.tileBadges[d.r][d.c];
+      if (badge) {
+        gsap.fromTo(badge.scale,
+          { x: 1.6, y: 1.6 },
+          { x: 1, y: 1, duration: 0.6, ease: 'elastic.out(1, 0.35)' });
+      }
+    }
 
     flower.killPetalTweens();
 
@@ -2121,10 +2361,14 @@ class SpinAnimator {
       //   0.70 → 1.10   shrink + fade away
       const tl = gsap.timeline({
         onComplete: () => {
+          // Kill petal tweens BEFORE destroy — destroy({children:true})
+          // nulls each petal's transform, and any still-running gsap tween
+          // on that petal then errors every frame.
+          flower.killPetalTweens();
           gsap.killTweensOf(flower);
           gsap.killTweensOf(flower.scale);
           gsap.killTweensOf(flower.position);
-          flower.destroy({ children: true });
+          if (!flower.destroyed) flower.destroy({ children: true });
           resolve();
         }
       });
@@ -2137,7 +2381,273 @@ class SpinAnimator {
       // Shrink + fade out.
       tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(0.65));
       tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(0.65));
+    }).then(() => {
+      // Alt-2: after the bloom animates away, drop its multiplier tile
+      // (big reveal at cell centre → shrink to corner) plus half-value
+      // echoes flying to all 8 adjacent cells.
+      if (ALT_MODE === 'alt2' && d.newTile) {
+        return this._animateBloomMultiplierDrop(d);
+      }
     });
+  }
+
+  // Big multiplier reveal that drops ON a bloom cell (alt-2). Runs AFTER
+  // the bloom's own swell/fade sequence has finished. d.newTile carries
+  // { value, totalAfter, spreads } from the model.
+  _animateBloomMultiplierDrop(d) {
+    const rect = this.scene.cells[d.r] && this.scene.cells[d.r][d.c];
+    if (!rect || !d.newTile) return Promise.resolve();
+    const worldPos = this.scene.flowerLayer.toGlobal(
+      new PIXI.Point(rect.x + rect.w / 2, rect.y + rect.h / 2));
+    const fxPos = this.scene.fxLayer.toLocal(worldPos);
+
+    // Values involved:
+    //   rngValue   = the raw tile value the RNG just rolled (e.g. 50).
+    //   oldValue   = whatever this cell was accumulated to BEFORE this bloom.
+    //   totalValue = oldValue + rngValue (what the cell will show after).
+    const rngValue   = d.newTile.value;
+    const totalValue = d.newTile.totalAfter;
+    const oldValue   = Math.max(0, totalValue - rngValue);
+
+    return new Promise(resolve => {
+      const bigText = new PIXI.Text(formatTileMult(rngValue), {
+        fontFamily: FONT,
+        fontSize: Math.max(28, Math.floor(this.cellSize * 0.58)),
+        fill: 0xFFD54F,
+        stroke: 0x3D1C02,
+        strokeThickness: Math.max(3, 4 * currentGameScale),
+      });
+      bigText.anchor.set(0.5);
+      bigText.x = fxPos.x;
+      bigText.y = fxPos.y;
+      bigText.alpha = 0;
+      bigText.scale.set(0.25);
+      this.scene.fxLayer.addChild(bigText);
+
+      // Compute final badge position / scale (based on the TOTAL value
+      // since that's what will end up at the corner badge).
+      const measure = new PIXI.Text(formatTileMult(totalValue), {
+        fontFamily: FONT,
+        fontSize: Math.max(13, 15 * currentGameScale),
+      });
+      const finalBadgeW = measure.width + _tileBadgePadX() * 2;
+      measure.destroy();
+      const badgeCentre = _tileBadgeCenterForCell(rect, finalBadgeW);
+      const cornerWorld = this.scene.flowerLayer.toGlobal(
+        new PIXI.Point(badgeCentre.x, badgeCentre.y));
+      const cornerFx = this.scene.fxLayer.toLocal(cornerWorld);
+      const bigH  = bigText.height;
+      const tileH = _tileBadgeHeight();
+      const shrinkScale = Math.max(0.25, tileH / Math.max(1, bigH));
+
+      const tl = gsap.timeline({
+        onComplete: () => {
+          setCellTileBadge(d.r, d.c, totalValue, { skipEntry: true });
+          if (!bigText.destroyed) bigText.destroy();
+          resolve();
+        },
+      });
+      // 1) Pop in at centre, showing the RAW RNG value (e.g. "50×").
+      tl.to(bigText, { alpha: 1, duration: 0.14, ease: 'power2.out' }, 0);
+      tl.to(bigText.scale, { x: 1, y: 1, duration: 0.34, ease: 'back.out(2.2)' }, 0);
+      // 2) Hold briefly so the player can read the RNG value.
+      tl.to(bigText.scale, { x: 1.08, y: 1.08, duration: 0.14, ease: 'sine.inOut' }, 0.34);
+      // 3) Launch neighbour echoes mid-hold — each echo carries the raw
+      //    HALF-value (not the neighbour's total).
+      tl.call(() => {
+        if (d.newTile.spreads && d.newTile.spreads.length) {
+          this._spawnSpreadEchoes(fxPos, d.newTile.spreads, rect);
+        }
+      }, null, 0.48);
+      // 4) Count-up from the RNG value to the new total — this is the
+      //    "adds on top of the old multiplier" visual. Only fires if the
+      //    cell already had a value; otherwise RNG == total and there's
+      //    nothing to count up to.
+      if (oldValue > 0 && totalValue !== rngValue) {
+        const counter = { v: rngValue };
+        tl.to(counter, {
+          v: totalValue,
+          duration: 0.38,
+          ease: 'power2.out',
+          onUpdate: () => {
+            // Round so we don't flash decimals when halves accumulate.
+            const shown = Math.round(counter.v * 10) / 10;
+            bigText.text = formatTileMult(shown);
+          },
+          onComplete: () => { bigText.text = formatTileMult(totalValue); },
+        }, 0.48);
+        // Tiny scale bump on arrival of the sum.
+        tl.to(bigText.scale, { x: 1.2, y: 1.2, duration: 0.12, ease: 'back.out(2)' }, 0.74);
+        tl.to(bigText.scale, { x: 1,   y: 1,   duration: 0.12, ease: 'sine.inOut' }, 0.86);
+      }
+      // 5) Shrink + travel to the corner badge (showing the total).
+      tl.to(bigText, {
+        x: cornerFx.x,
+        y: cornerFx.y,
+        duration: 0.42,
+        ease: 'power2.inOut',
+      }, 0.98);
+      tl.to(bigText.scale, {
+        x: shrinkScale, y: shrinkScale,
+        duration: 0.42,
+        ease: 'power2.inOut',
+      }, 0.98);
+      tl.to(bigText, {
+        alpha: 0.0,
+        duration: 0.12,
+        ease: 'power2.in',
+      }, 1.30);
+    });
+  }
+
+  // Fire an "echo" of half the multiplier value from a centre fxLayer
+  // position toward each neighbour cell that received a spread. The echo
+  // is a smaller version of the big reveal — it flies into the neighbour
+  // cell, lands with a pulse, and the neighbour's badge is updated to
+  // its new accumulated total on arrival.
+  _spawnSpreadEchoes(originFx, spreads, originRect) {
+    if (!spreads || !spreads.length) return;
+    for (const sp of spreads) {
+      const nRect = this.scene.cells[sp.r] && this.scene.cells[sp.r][sp.c];
+      if (!nRect) continue;
+      const targetLocal = this.scene.flowerLayer.toGlobal(
+        new PIXI.Point(nRect.x + nRect.w / 2, nRect.y + nRect.h / 2));
+      const targetFx = this.scene.fxLayer.toLocal(targetLocal);
+
+      const echoText = new PIXI.Text(formatTileMult(sp.add), {
+        fontFamily: FONT,
+        fontSize: Math.max(18, Math.floor(this.cellSize * 0.30)),
+        fill: 0xFFE29A,
+        stroke: 0x3D1C02,
+        strokeThickness: Math.max(2.5, 3 * currentGameScale),
+      });
+      echoText.anchor.set(0.5);
+      echoText.x = originFx.x;
+      echoText.y = originFx.y;
+      echoText.alpha = 0;
+      echoText.scale.set(0.5);
+      this.scene.fxLayer.addChild(echoText);
+
+      const totalAfter = sp.total;
+      const oldTotal   = Math.max(0, totalAfter - sp.add);
+      const tl = gsap.timeline({
+        onComplete: () => {
+          if (!echoText.destroyed) echoText.destroy();
+        },
+      });
+      // 1) Burst into existence at centre, showing the HALF value (raw).
+      tl.to(echoText, { alpha: 1, duration: 0.12, ease: 'power2.out' }, 0);
+      tl.to(echoText.scale, { x: 1, y: 1, duration: 0.22, ease: 'back.out(2)' }, 0);
+      // 2) Travel to the neighbour.
+      tl.to(echoText, {
+        x: targetFx.x,
+        y: targetFx.y,
+        duration: 0.36,
+        ease: 'power2.inOut',
+      }, 0.14);
+      // 3) Impact: tiny overshoot.
+      tl.to(echoText.scale, {
+        x: 1.25, y: 1.25,
+        duration: 0.10,
+        ease: 'back.out(2.4)',
+      }, 0.50);
+      // 4) Hand off: count-up the neighbour's big cell text from its old
+      //    total to the new total ON ARRIVAL, so the player sees the raw
+      //    half-value merge INTO the cell's displayed number. If the
+      //    neighbour had no prior tile, _animateAddToCellMult just drops
+      //    a fresh big text at the new total.
+      tl.call(() => {
+        this._animateAddToCellMult(sp.r, sp.c, oldTotal, totalAfter);
+      }, null, 0.60);
+      // 5) Echo fades/shrinks out.
+      tl.to(echoText, {
+        alpha: 0,
+        duration: 0.16,
+        ease: 'power2.in',
+      }, 0.60);
+      tl.to(echoText.scale, {
+        x: 0.6, y: 0.6,
+        duration: 0.16,
+        ease: 'power2.in',
+      }, 0.60);
+    }
+  }
+
+  // When an echo lands on a neighbour cell, count-up its big cell text
+  // from the OLD total to the NEW total (so the player visually sees the
+  // addition). Corner badge is updated to the final total at the end.
+  _animateAddToCellMult(r, c, oldTotal, newTotal) {
+    const rect = this.scene.cells[r] && this.scene.cells[r][c];
+    if (!rect) return;
+    // Ensure the big cell text exists. If the neighbour had no prior tile,
+    // create one starting from 0 (it'll count up in the tween below).
+    if (!scene.cellMultTexts[r][c]) {
+      setCellMultText(r, c, oldTotal > 0 ? oldTotal : 1);
+      // Kill the fresh pop-in animation — we'll drive scale/alpha ourselves.
+      const t = scene.cellMultTexts[r][c];
+      if (t) { gsap.killTweensOf(t); gsap.killTweensOf(t.scale); t.alpha = 0.85; t.scale.set(1); t.text = formatTileMult(oldTotal); }
+    }
+    const bigT = scene.cellMultTexts[r][c];
+    const existingBadge = scene.tileBadges[r][c];
+
+    // Count-up the big cell text.
+    if (bigT) {
+      const counter = { v: oldTotal };
+      gsap.killTweensOf(counter);
+      gsap.to(counter, {
+        v: newTotal,
+        duration: 0.32,
+        ease: 'power2.out',
+        onUpdate: () => {
+          const shown = Math.round(counter.v * 10) / 10;
+          bigT.text = formatTileMult(shown);
+        },
+        onComplete: () => {
+          bigT.text = formatTileMult(newTotal);
+        },
+      });
+      gsap.fromTo(bigT.scale,
+        { x: 1.25, y: 1.25 },
+        { x: 1,    y: 1,    duration: 0.35, ease: 'back.out(2)' });
+    }
+
+    // Similarly roll up the corner badge (or create it).
+    if (existingBadge) {
+      const counter2 = { v: oldTotal };
+      gsap.killTweensOf(counter2);
+      gsap.to(counter2, {
+        v: newTotal,
+        duration: 0.32,
+        ease: 'power2.out',
+        onUpdate: () => {
+          const shown = Math.round(counter2.v * 10) / 10;
+          existingBadge._badgeText.text = formatTileMult(shown);
+          existingBadge._redraw();
+          const w = existingBadge._computeW();
+          const p = _tileBadgeCenterForCell(rect, w);
+          existingBadge.x = p.x;
+          existingBadge.y = p.y;
+        },
+        onComplete: () => {
+          existingBadge._badgeText.text = formatTileMult(newTotal);
+          existingBadge._redraw();
+          const w = existingBadge._computeW();
+          const p = _tileBadgeCenterForCell(rect, w);
+          existingBadge.x = p.x;
+          existingBadge.y = p.y;
+          existingBadge._value = newTotal;
+        },
+      });
+      gsap.fromTo(existingBadge.scale,
+        { x: 1.35, y: 1.35 },
+        { x: 1,    y: 1,    duration: 0.35, ease: 'back.out(2)' });
+    } else {
+      // No prior badge — drop a fresh one at the new total.
+      setCellTileBadge(r, c, newTotal);
+    }
+
+    // Make sure the underlying tint exists / updates for the new total.
+    setCellTint(r, c, newTotal);
   }
 
   async _animateEmptyDissolve(d, index = 0) {
@@ -2145,6 +2655,37 @@ class SpinAnimator {
     if (!flower) return;
     this.scene.flowers[d.r][d.c] = null;
     flower.killPetalTweens();
+
+    // Alt-2 empties don't drop multipliers — the pot just poofs in place.
+    // Blooms are what place tiles (see _animateFullBloom for the reveal).
+    if (ALT_MODE === 'alt2') {
+      return new Promise(resolve => {
+        const rect = this.scene.cells[d.r][d.c];
+        const cx   = rect.x + rect.w / 2;
+        const cy   = rect.y + rect.h / 2;
+        const worldPos = this.scene.flowerLayer.toGlobal(new PIXI.Point(cx, cy));
+        const fxPos    = this.scene.fxLayer.toLocal(worldPos);
+        spawnPuff(this.scene.fxLayer, fxPos.x, fxPos.y, 14);
+        gsap.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.30), ease: 'back.in(1.4)' });
+        gsap.to(flower, {
+          alpha: 0,
+          duration: T(0.30),
+          ease: 'power2.in',
+          onComplete: () => {
+            // CRITICAL: kill any tween running on each petal BEFORE the
+            // flower is destroyed. destroy({children:true}) nulls each
+            // petal's .transform; a lingering gsap tween then throws
+            // "Cannot set properties of null (setting 'rotation')" every
+            // frame — which is how petals were silently going missing.
+            flower.killPetalTweens();
+            gsap.killTweensOf(flower);
+            gsap.killTweensOf(flower.scale);
+            if (!flower.destroyed) flower.destroy({ children: true });
+            resolve();
+          },
+        });
+      });
+    }
 
     // The Avalanche pill is permanent — no expand needed. Legacy call kept
     // as a safety net for non-permanent pills.
@@ -2235,6 +2776,9 @@ class SpinAnimator {
             duration: T(0.22),
             ease: 'power2.in',
             onComplete: () => {
+              // Kill petal tweens BEFORE destroy so lingering reflow
+              // tweens don't try to set rotation on null transforms.
+              if (flower.killPetalTweens) flower.killPetalTweens();
               gsap.killTweensOf(flower);
               gsap.killTweensOf(flower.scale);
               gsap.killTweensOf(flower.position);
@@ -2297,6 +2841,8 @@ class SpinAnimator {
     for (const m of moves) {
       if (!m.flower) continue;
       this.scene.flowers[m.to.r][m.to.c] = m.flower;
+      // Re-tag with the new location for petal accounting.
+      m.flower._debugTag = `(${m.to.r},${m.to.c})@gravity<-(${m.from.r},${m.from.c})`;
       const targetRect = this.scene.cells[m.to.r][m.to.c];
       const targetY = targetRect.y + targetRect.h / 2;
       const distRows = m.to.r - m.from.r;
@@ -2337,6 +2883,7 @@ class SpinAnimator {
       byCol[c].forEach((nc, stackIdx) => {
         const rect = this.scene.cells[nc.r][nc.c];
         const flower = new FlowerSymbol(nc.color, nc.petals, this.cellSize);
+        flower._debugTag = `(${nc.r},${nc.c})@refill`;
         flower.x = rect.x + rect.w / 2;
         // Spawn above the top of the grid, stacked so they don't visually overlap
         flower.y = this.scene.cells[0][0].y - rect.h * (1 + stackIdx * 1.05);
@@ -2509,14 +3056,40 @@ const player = {
   betLevels: [1, 2, 5, 10, 20, 50, 100, 200],
   betIndex: 3,          // starts at 10
   displayedWin: 0,      // last committed WIN value on screen
+  // Tile-mode free-spin feature. When active, bet is locked, spins don't
+  // deduct balance, multiplier tiles persist across spins.
+  feature: {
+    active:      false,
+    spinsLeft:   0,
+    cellMults:   null,   // carried over between spins while active (alt-2)
+    lockedBet:   null,   // bet frozen at purchase time
+    totalWin:    0,      // accumulated win across all feature spins
+  },
 };
 
+const FEATURE_SPIN_COUNT = 15;
+const FEATURE_COST_MULT  = 100;   // cost = 100 × bet
+
+function featureCost() { return player.bet * FEATURE_COST_MULT; }
+function canBuyFeature() {
+  return ALT_MODE === 'alt2'
+      && !player.feature.active
+      && player.balance >= featureCost();
+}
+
 function canAffordSpin() {
+  if (player.feature.active) return true;   // free spins during feature
   return player.balance >= player.bet;
 }
 
 function cycleBet(direction = +1) {
-  player.betIndex = (player.betIndex + direction + player.betLevels.length) % player.betLevels.length;
+  // Bet locked while the free-spin feature is active.
+  if (player.feature.active) return;
+  // Clamp, don't wrap — minus at the lowest level and plus at the highest
+  // are no-ops rather than cycling around to the opposite end.
+  const next = player.betIndex + direction;
+  if (next < 0 || next >= player.betLevels.length) return;
+  player.betIndex = next;
   player.bet = player.betLevels[player.betIndex];
   updateBetText();
   updateSpinButtonState();
@@ -2661,6 +3234,57 @@ function buildScene(L) {
   }
   // Flowers sit on top of the frame image.
   app.stage.addChild(scene.flowerLayer);
+
+  // ─── CELL TINT LAYER (alt-2 only) ──────────────────────────────────────
+  // A soft gold overlay painted on cells that currently hold a multiplier.
+  // Sits BEHIND the flower layer so flowers render over it.
+  scene.cellTintLayer = new PIXI.Container();
+  scene.cellTints = [];
+  for (let r = 0; r < ROWS; r++) {
+    scene.cellTints[r] = [];
+    for (let c = 0; c < COLS; c++) scene.cellTints[r][c] = null;
+  }
+  // Layer order (back to front): cellTintLayer → cellMultTextLayer →
+  // flowerLayer. The big multiplier text renders OVER the tint and UNDER
+  // the pot so the pot stays readable on top.
+  const flowerLayerIdx = app.stage.getChildIndex(scene.flowerLayer);
+  app.stage.addChildAt(scene.cellTintLayer, flowerLayerIdx);
+
+  // ─── CELL MULT TEXT LAYER (alt-2 only) ──────────────────────────────────
+  // Big multiplier value drawn behind the pot on every multiplied cell.
+  scene.cellMultTextLayer = new PIXI.Container();
+  scene.cellMultTexts = [];
+  for (let r = 0; r < ROWS; r++) {
+    scene.cellMultTexts[r] = [];
+    for (let c = 0; c < COLS; c++) scene.cellMultTexts[r][c] = null;
+  }
+  // Insert between tintLayer and flowerLayer.
+  const flowerLayerIdx2 = app.stage.getChildIndex(scene.flowerLayer);
+  app.stage.addChildAt(scene.cellMultTextLayer, flowerLayerIdx2);
+
+  // ─── TILE BADGE LAYER (alt-2 only) ─────────────────────────────────────
+  // A 2-D grid of small multiplier badges rendered on top of each cell.
+  // Each entry is either null (no tile) or a PIXI.Container for that cell.
+  scene.tileBadgeLayer = new PIXI.Container();
+  scene.tileBadges = [];
+  for (let r = 0; r < ROWS; r++) {
+    scene.tileBadges[r] = [];
+    for (let c = 0; c < COLS; c++) scene.tileBadges[r][c] = null;
+  }
+  app.stage.addChild(scene.tileBadgeLayer);
+
+  // If we're mid-feature and the scene is being rebuilt (resize, mode swap
+  // — though the mode swap is blocked during the feature), restore the
+  // accumulated tile multipliers so they survive the rebuild. This also
+  // redraws the cell tints behind the flowers via setCellTileBadge.
+  if (ALT_MODE === 'alt2' && player.feature.active && player.feature.cellMults) {
+    const cm = player.feature.cellMults;
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (cm[r][c] > 0) setCellTileBadge(r, c, cm[r][c], { skipEntry: true });
+      }
+    }
+  }
 
   // Grid mask — anything drawn to flowerLayer outside the cell grid area is
   // hidden. Symbols spawning above the grid or falling out the bottom are
@@ -3219,22 +3843,248 @@ function buildScene(L) {
   //   pill centerY = pill bottom - pillH/2 = gridTop - 0.25 * pillH
   const avalancheCY = gridTop - 0.25 * avalanchePillH;
   const avalancheCX = (gridLeft + gridRight) / 2;
-  scene.winPill = makeSplitPill({
-    x: avalancheCX,
-    y: avalancheCY,
-    width: avalanchePillW,
-    height: avalanchePillH,
-    leftLabel:  'BLOOM WIN',
-    leftValue:  fmtCurrency(0),
-    leftAccent: 0x7FE080,        // green for the win side
-    rightLabel: 'MULTIPLIER',
-    rightValue: '1\u00D7',
-    rightAccent: 0xFFD700,       // gold for the multiplier side
-    permanent:  true,
-    labelFontSize: Math.max(14, 17 * gameScale),
-    valueFontSize: Math.max(22, 34 * gameScale),
-  });
-  app.stage.addChild(scene.winPill);
+  // The top "Bloom Win / Multiplier" pill is only used in Alt-1 (chain-
+  // multiplier mode). Alt-2 (tile-multiplier mode) multiplies per-bloom and
+  // counts running wins in the bottom status text instead.
+  if (ALT_MODE === 'alt1') {
+    scene.winPill = makeSplitPill({
+      x: avalancheCX,
+      y: avalancheCY,
+      width: avalanchePillW,
+      height: avalanchePillH,
+      leftLabel:  'BLOOM WIN',
+      leftValue:  fmtCurrency(0),
+      leftAccent: 0x7FE080,        // green for the win side
+      rightLabel: 'MULTIPLIER',
+      rightValue: '\u2013',
+      rightAccent: 0xFFD700,       // gold for the multiplier side
+      permanent:  true,
+      labelFontSize: Math.max(14, 17 * gameScale),
+      valueFontSize: Math.max(22, 34 * gameScale),
+    });
+    app.stage.addChild(scene.winPill);
+  } else {
+    scene.winPill = null;
+  }
+
+  // ─── MECHANIC BUTTONS (top-right) ────────────────────────────────────────
+  // Two separate buttons for the two mechanics — the active one is shown
+  // highlighted, the inactive one dimmed. Clicking the inactive one switches
+  // modes and rebuilds the scene. Disabled while a spin is in flight.
+  {
+    const btnW = Math.max(150, 190 * gameScale);
+    const btnH = Math.max(38, 48 * gameScale);
+    const gap  = 10 * gameScale;
+    // Right-align the pair, with a 24px margin from the right edge.
+    const rightEdge = L.sw - 24 * gameScale;
+    const topY      = btnH / 2 + 24 * gameScale;
+
+    function makeMechanicButton(mode, label, cx) {
+      const cont = new PIXI.Container();
+      cont.x = cx; cont.y = topY;
+
+      const bg   = new PIXI.Graphics();
+      const text = new PIXI.Text(label, {
+        fontFamily: FONT,
+        fontSize: Math.max(13, 15 * gameScale),
+        fill: 0xFFECB3,
+        letterSpacing: 0.4,
+      });
+      text.anchor.set(0.5);
+      cont.addChild(bg);
+      cont.addChild(text);
+
+      const drawBg = (hover) => {
+        const active = (ALT_MODE === mode);
+        bg.clear();
+        const stroke = active ? 0xFFD54F : 0xC08050;
+        const strokeA = active ? 1 : 0.6;
+        const fill = active ? 0x5C3318 : 0x2A1808;
+        const fillA = hover ? 1 : (active ? 0.95 : 0.75);
+        bg.lineStyle((active ? 2.5 : 1.5) * gameScale, stroke, strokeA);
+        bg.beginFill(fill, fillA);
+        bg.drawRoundedRect(-btnW / 2, -btnH / 2, btnW, btnH, btnH * 0.35);
+        bg.endFill();
+      };
+      const renderText = () => {
+        const active = (ALT_MODE === mode);
+        text.style.fill = active ? 0xFFD54F : 0xE8D5B0;
+        text.alpha = active ? 1 : 0.7;
+      };
+
+      cont._redraw = () => { drawBg(false); renderText(); };
+      cont._redraw();
+
+      cont.eventMode = 'static';
+      cont.cursor = 'pointer';
+      cont.hitArea = new PIXI.RoundedRectangle(-btnW / 2, -btnH / 2, btnW, btnH, btnH * 0.35);
+      cont.on('pointerover', () => {
+        if (scene.spinButton && scene.spinButton.busy) return;
+        if (ALT_MODE === mode) return;
+        drawBg(true);
+        gsap.to(cont.scale, { x: 1.04, y: 1.04, duration: 0.12, ease: 'sine.out' });
+      });
+      cont.on('pointerout', () => {
+        drawBg(false);
+        gsap.to(cont.scale, { x: 1, y: 1, duration: 0.12 });
+      });
+      cont.on('pointertap', () => {
+        if (scene.spinButton && scene.spinButton.busy) return;
+        if (player.feature.active) return;   // locked during free spins
+        if (ALT_MODE === mode) return;       // already active — no-op
+        setAltMode(mode);
+        rebuild();                           // redraws everything for the new mode
+      });
+
+      return cont;
+    }
+
+    // Right-to-left: Tile Multiplier (rightmost), then Chain Multiplier.
+    const tileCX  = rightEdge - btnW / 2;
+    const chainCX = tileCX - btnW - gap;
+
+    scene.chainBtn = makeMechanicButton('alt1', 'Chain Multiplier', chainCX);
+    scene.tileBtn  = makeMechanicButton('alt2', 'Tile Multiplier',  tileCX);
+    app.stage.addChild(scene.chainBtn);
+    app.stage.addChild(scene.tileBtn);
+  }
+
+  // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (alt-2 only) ────────────────
+  // Square button sitting to the LEFT of the grid, aligned to the grid's
+  // top edge. Opens a confirmation modal; on confirm, kicks off the
+  // 15-free-spin feature where tile multipliers accumulate across spins.
+  if (ALT_MODE === 'alt2') {
+    const bfSize = Math.max(120, 140 * gameScale);
+    const bfW = bfSize;
+    const bfH = bfSize;
+    // Position: left of grid, top-aligned with grid top. Center of the
+    // button is placed so the button's right edge sits ~24px left of the
+    // grid's left edge (or at the left edge of the canvas if that would
+    // clip off-screen).
+    const gridLeftEdge = scene.gridBounds.left;
+    const leftGap = 24 * gameScale;
+    let bfX = gridLeftEdge - leftGap - bfW / 2;
+    if (bfX - bfW / 2 < 8 * gameScale) bfX = bfW / 2 + 8 * gameScale;
+    const bfY = scene.gridBounds.top + bfH / 2;
+
+    const buyCont = new PIXI.Container();
+    buyCont.x = bfX; buyCont.y = bfY;
+
+    const buyBg = new PIXI.Graphics();
+    // Three-line centred layout for the square button: BUY / FEATURE / price.
+    const buyLineTop = new PIXI.Text('BUY', {
+      fontFamily: FONT,
+      fontSize: Math.max(14, 17 * gameScale),
+      fill: 0xFFECB3,
+      letterSpacing: 0.6,
+    });
+    buyLineTop.anchor.set(0.5);
+    buyLineTop.y = -bfH * 0.28;
+    const buyLineMid = new PIXI.Text('FEATURE', {
+      fontFamily: FONT,
+      fontSize: Math.max(14, 17 * gameScale),
+      fill: 0xFFECB3,
+      letterSpacing: 0.6,
+    });
+    buyLineMid.anchor.set(0.5);
+    buyLineMid.y = -bfH * 0.07;
+    const priceLbl = new PIXI.Text('', {
+      fontFamily: FONT,
+      fontSize: Math.max(16, 22 * gameScale),
+      fill: 0xFFD54F,
+    });
+    priceLbl.anchor.set(0.5);
+    priceLbl.y = bfH * 0.22;
+    buyCont.addChild(buyBg);
+    buyCont.addChild(buyLineTop);
+    buyCont.addChild(buyLineMid);
+    buyCont.addChild(priceLbl);
+
+    const drawBuyBg = (hover) => {
+      const enabled = canBuyFeature() && !(scene.spinButton && scene.spinButton.busy);
+      buyBg.clear();
+      const stroke = enabled ? 0xFFD54F : 0xC08050;
+      const strokeA = enabled ? 1 : 0.45;
+      const fill = enabled ? (hover ? 0x7A3E16 : 0x5C2E10) : 0x2A1808;
+      const fillA = enabled ? (hover ? 1 : 0.95) : 0.5;
+      buyBg.lineStyle((enabled ? 2.5 : 1.5) * gameScale, stroke, strokeA);
+      buyBg.beginFill(fill, fillA);
+      buyBg.drawRoundedRect(-bfW / 2, -bfH / 2, bfW, bfH, bfH * 0.3);
+      buyBg.endFill();
+    };
+    const refreshBuy = () => {
+      const enabled = canBuyFeature() && !(scene.spinButton && scene.spinButton.busy);
+      const visible = !player.feature.active;
+      buyCont.visible = visible;
+      buyCont.eventMode = visible && enabled ? 'static' : 'none';
+      buyCont.cursor    = visible && enabled ? 'pointer' : 'default';
+      priceLbl.text = fmtCurrency(featureCost());
+      buyLineTop.alpha = enabled ? 1 : 0.55;
+      buyLineMid.alpha = enabled ? 1 : 0.55;
+      priceLbl.alpha   = enabled ? 1 : 0.55;
+      drawBuyBg(false);
+    };
+
+    buyCont.hitArea = new PIXI.RoundedRectangle(-bfW / 2, -bfH / 2, bfW, bfH, bfH * 0.3);
+    buyCont.on('pointerover', () => {
+      if (!canBuyFeature() || (scene.spinButton && scene.spinButton.busy)) return;
+      drawBuyBg(true);
+      gsap.to(buyCont.scale, { x: 1.04, y: 1.04, duration: 0.12, ease: 'sine.out' });
+    });
+    buyCont.on('pointerout', () => {
+      drawBuyBg(false);
+      gsap.to(buyCont.scale, { x: 1, y: 1, duration: 0.12 });
+    });
+    buyCont.on('pointertap', () => {
+      if (!canBuyFeature() || (scene.spinButton && scene.spinButton.busy)) return;
+      openBuyFeatureModal();
+    });
+
+    refreshBuy();
+    scene.buyBtn = buyCont;
+    scene.buyBtn._refresh = refreshBuy;
+    app.stage.addChild(buyCont);
+
+    // Banner shown while the feature is active: "FREE SPINS · N LEFT".
+    const bannerCont = new PIXI.Container();
+    bannerCont.x = bfX; bannerCont.y = bfY;
+    bannerCont.visible = false;
+    const bBg = new PIXI.Graphics();
+    bBg.lineStyle(2.5 * gameScale, 0xFFD54F, 1);
+    bBg.beginFill(0x7A3E16, 0.95);
+    bBg.drawRoundedRect(-bfW / 2, -bfH / 2, bfW, bfH, bfH * 0.3);
+    bBg.endFill();
+    bannerCont.addChild(bBg);
+    const bTitle = new PIXI.Text('FREE SPINS', {
+      fontFamily: FONT,
+      fontSize: Math.max(13, 15 * gameScale),
+      fill: 0xFFECB3,
+      letterSpacing: 0.6,
+    });
+    bTitle.anchor.set(0.5);
+    bTitle.y = -bfH * 0.22;
+    bannerCont.addChild(bTitle);
+    const bCount = new PIXI.Text('', {
+      fontFamily: FONT,
+      fontSize: Math.max(18, 22 * gameScale),
+      fill: 0xFFD54F,
+    });
+    bCount.anchor.set(0.5);
+    bCount.y = bfH * 0.17;
+    bannerCont.addChild(bCount);
+
+    const refreshBanner = () => {
+      bannerCont.visible = player.feature.active;
+      bCount.text = `${player.feature.spinsLeft} LEFT`;
+    };
+    refreshBanner();
+    scene.featureBanner = bannerCont;
+    scene.featureBanner._refresh = refreshBanner;
+    app.stage.addChild(bannerCont);
+  } else {
+    scene.buyBtn        = null;
+    scene.featureBanner = null;
+  }
 
   // ─── STATUS TEXT (replaces the old WIN pill slot in the bottom UI row) ──
   // Reads "Good luck!" before a spin; once a spin completes we swap the text
@@ -3346,6 +4196,7 @@ function buildScene(L) {
   updateRtpText();
   updateSpinButtonState();
   updateStatusText('Good luck!');
+  refreshFeatureUI();
 
   // Lift the FX layer to the top of the z-stack so in-flight petals, pot
   // flights to the multiplier, and other effects always render above every
@@ -3396,10 +4247,10 @@ function updateMultiplierBar(mult, emptyCount) {
   const isBaseline = mult <= 1;
 
   if (scene.winPill.rightValText) {
-    // Permanent pill always shows a value — default to "1×" at baseline
-    // rather than going blank (which only made sense for the old collapsed
-    // pill that hid the multiplier half).
-    scene.winPill.rightValText.text = `${mult}\u00D7`;
+    // Baseline (no empties yet) reads as a dash, so "1×" doesn't look like
+    // the player already built a multiplier. Real tier values still show
+    // as "N×".
+    scene.winPill.rightValText.text = isBaseline ? '\u2013' : `${mult}\u00D7`;
   }
 
   if (scene.winPill.setMultiplierProgress) {
@@ -3429,8 +4280,8 @@ function bumpMultiplierOnPotLanded() {
   uiState.multiplier = newMult;
 
   if (scene.winPill.rightValText) {
-    // Permanent pill: always show a value, default "1×" at baseline.
-    scene.winPill.rightValText.text = `${newMult}\u00D7`;
+    // Baseline (no empties yet) reads as a dash; tier values show as "N×".
+    scene.winPill.rightValText.text = newMult <= 1 ? '\u2013' : `${newMult}\u00D7`;
   }
 
   if (scene.winPill.setMultiplierProgress) {
@@ -3504,6 +4355,259 @@ function updateWinText(n, animate = false) {
   player.displayedWin = n;
 }
 
+// ─── Alt-2 multiplier tile badges ──────────────────────────────────────────
+// A small pill with "N×" floating at the top-right corner of a cell.
+// Persistent until the spin ends (or the scene is rebuilt).
+function formatTileMult(v) {
+  // Integers show plainly ("8×"); halves show as decimals ("2.5×") for the
+  // edge case where a neighbour contribution is odd/2.
+  if (Number.isInteger(v)) return `${v}\u00D7`;
+  return `${v.toFixed(1)}\u00D7`;
+}
+const TILE_BADGE_INSET = 10;  // px inset from cell corner (pre-scaling)
+function _tileBadgePadX() { return 10 * currentGameScale; }
+function _tileBadgeHeight() { return Math.max(22, 26 * currentGameScale); }
+
+// Paint / clear a gold tint overlay on a cell when it holds a multiplier.
+// Colour intensity nudges up slightly with multiplier value.
+function setCellTint(r, c, value) {
+  if (!scene.cellTints) return;
+  const rect = scene.cells[r] && scene.cells[r][c];
+  if (!rect) return;
+  const existing = scene.cellTints[r][c];
+  if (value <= 0) {
+    if (existing) {
+      gsap.killTweensOf(existing);
+      existing.destroy();
+      scene.cellTints[r][c] = null;
+    }
+    return;
+  }
+  // Stronger wash for bigger multipliers; capped so it never dominates.
+  const alphaTarget = Math.min(0.48, 0.18 + Math.log10(1 + value) * 0.08);
+
+  if (existing) {
+    gsap.to(existing, { alpha: alphaTarget, duration: 0.2, ease: 'sine.out' });
+    return;
+  }
+  const g = new PIXI.Graphics();
+  // Circle centred on the cell, sized to the cell's short side. Sits behind
+  // the flower and doesn't fight the frame's 3-D cell border.
+  const cx = rect.x + rect.w / 2;
+  const cy = rect.y + rect.h / 2;
+  const radius = Math.min(rect.w, rect.h) * 0.44;
+  g.beginFill(0xFFC837, 1);
+  g.drawCircle(cx, cy, radius);
+  g.endFill();
+  g.alpha = 0;
+  scene.cellTintLayer.addChild(g);
+  scene.cellTints[r][c] = g;
+  gsap.to(g, { alpha: alphaTarget, duration: 0.24, ease: 'sine.out' });
+}
+
+function clearAllCellTints() {
+  if (!scene.cellTints) return;
+  for (let r = 0; r < scene.cellTints.length; r++) {
+    for (let c = 0; c < scene.cellTints[r].length; c++) {
+      const t = scene.cellTints[r][c];
+      if (t) {
+        gsap.killTweensOf(t);
+        t.destroy();
+        scene.cellTints[r][c] = null;
+      }
+    }
+  }
+}
+
+// Big multiplier text on the cell — rendered BEHIND the pot so the pot art
+// stays readable on top. `value` of 0 (or less) clears the text.
+function setCellMultText(r, c, value) {
+  if (!scene.cellMultTexts) return;
+  const rect = scene.cells[r] && scene.cells[r][c];
+  if (!rect) return;
+  const existing = scene.cellMultTexts[r][c];
+  if (value <= 0) {
+    if (existing) {
+      gsap.killTweensOf(existing);
+      gsap.killTweensOf(existing.scale);
+      existing.destroy();
+      scene.cellMultTexts[r][c] = null;
+    }
+    return;
+  }
+
+  const cellShort = Math.min(rect.w, rect.h);
+  const fontSize = Math.max(20, Math.floor(cellShort * 0.52));
+  const stroke = Math.max(3, 5 * currentGameScale);
+  const label = formatTileMult(value);
+
+  if (existing) {
+    existing.text = label;
+    // Resize if we went past a digit boundary (e.g. 50× → 100×).
+    if (existing.style.fontSize !== fontSize) {
+      existing.style.fontSize = fontSize;
+    }
+    existing.x = rect.x + rect.w / 2;
+    existing.y = rect.y + rect.h / 2;
+    gsap.fromTo(existing.scale,
+      { x: 1.25, y: 1.25 },
+      { x: 1, y: 1, duration: 0.32, ease: 'back.out(2)' });
+    return;
+  }
+
+  const t = new PIXI.Text(label, {
+    fontFamily: FONT,
+    fontSize,
+    fill: 0xFFD54F,
+    stroke: 0x3D1C02,
+    strokeThickness: stroke,
+    letterSpacing: 0.4,
+  });
+  t.anchor.set(0.5);
+  t.x = rect.x + rect.w / 2;
+  t.y = rect.y + rect.h / 2;
+  t.alpha = 0;
+  t.scale.set(0.6);
+  scene.cellMultTextLayer.addChild(t);
+  scene.cellMultTexts[r][c] = t;
+  gsap.to(t, { alpha: 0.85, duration: 0.2, ease: 'power2.out' });
+  gsap.to(t.scale, { x: 1, y: 1, duration: 0.34, ease: 'back.out(2)' });
+}
+
+function clearAllCellMultTexts() {
+  if (!scene.cellMultTexts) return;
+  for (let r = 0; r < scene.cellMultTexts.length; r++) {
+    for (let c = 0; c < scene.cellMultTexts[r].length; c++) {
+      const t = scene.cellMultTexts[r][c];
+      if (t) {
+        gsap.killTweensOf(t);
+        gsap.killTweensOf(t.scale);
+        t.destroy();
+        scene.cellMultTexts[r][c] = null;
+      }
+    }
+  }
+}
+
+function _makeTileBadge(value) {
+  const cont = new PIXI.Container();
+  const pad = _tileBadgePadX();
+  const h   = _tileBadgeHeight();
+
+  const bg = new PIXI.Graphics();
+  const text = new PIXI.Text(formatTileMult(value), {
+    fontFamily: FONT,
+    fontSize: Math.max(13, 15 * currentGameScale),
+    fill: 0xFFECB3,
+    stroke: 0x3D1C02,
+    strokeThickness: 2.5 * currentGameScale,
+  });
+  text.anchor.set(0.5);
+  const drawBg = () => {
+    const w = text.width + pad * 2;
+    bg.clear();
+    bg.lineStyle(1.5 * currentGameScale, 0xFFD54F, 0.9);
+    bg.beginFill(0x3D1C02, 0.92);
+    bg.drawRoundedRect(-w / 2, -h / 2, w, h, h * 0.5);
+    bg.endFill();
+  };
+  drawBg();
+  cont.addChild(bg);
+  cont.addChild(text);
+
+  cont._badgeBg   = bg;
+  cont._badgeText = text;
+  cont._redraw    = drawBg;
+  cont._value     = value;
+  cont._computeW  = () => text.width + pad * 2;
+  cont._height    = h;
+  return cont;
+}
+
+// Compute the (centre) x/y the badge sits at for top-right-of-cell anchoring.
+function _tileBadgeCenterForCell(rect, badgeWidth) {
+  const inset = TILE_BADGE_INSET * currentGameScale;
+  const h     = _tileBadgeHeight();
+  return {
+    x: rect.x + rect.w - inset - badgeWidth / 2,
+    y: rect.y + inset + h / 2,
+  };
+}
+
+// Place or update a tile badge at (r,c) showing `value`. If the cell already
+// has a badge, animate the value change. If `value` is 0 or negative, clears
+// the badge. `opts.skipEntry` skips the pop-in tween (used when an upstream
+// reveal animation is handling the entrance).
+function setCellTileBadge(r, c, value, opts = {}) {
+  if (!scene.tileBadges) return null;
+  const rect = scene.cells[r] && scene.cells[r][c];
+  if (!rect) return null;
+  const existing = scene.tileBadges[r][c];
+  if (value <= 0) {
+    if (existing) {
+      existing.destroy({ children: true });
+      scene.tileBadges[r][c] = null;
+    }
+    setCellTint(r, c, 0);
+    setCellMultText(r, c, 0);
+    return null;
+  }
+
+  // Tint the cell + paint the big multiplier text behind the flower.
+  setCellTint(r, c, value);
+  setCellMultText(r, c, value);
+
+  if (existing) {
+    existing._badgeText.text = formatTileMult(value);
+    existing._redraw();
+    existing._value = value;
+    const w = existing._computeW();
+    const p = _tileBadgeCenterForCell(rect, w);
+    existing.x = p.x;
+    existing.y = p.y;
+    // Quick scale pulse to sell the update.
+    gsap.fromTo(existing.scale,
+      { x: 1.35, y: 1.35 },
+      { x: 1, y: 1, duration: 0.35, ease: 'back.out(2)' });
+    return existing;
+  }
+
+  const badge = _makeTileBadge(value);
+  const w = badge._computeW();
+  const p = _tileBadgeCenterForCell(rect, w);
+  badge.x = p.x;
+  badge.y = p.y;
+  scene.tileBadgeLayer.addChild(badge);
+  scene.tileBadges[r][c] = badge;
+  if (opts.skipEntry) {
+    badge.alpha = 1;
+    badge.scale.set(1);
+  } else {
+    badge.alpha = 0;
+    badge.scale.set(0.4);
+    gsap.to(badge, { alpha: 1, duration: 0.25, ease: 'power2.out' });
+    gsap.to(badge.scale, { x: 1, y: 1, duration: 0.45, ease: 'back.out(2.2)' });
+  }
+  return badge;
+}
+
+// Wipe every tile badge (spin-end / mode-change). Also clears any cell
+// tints and big multiplier texts painted behind the flowers.
+function clearAllTileBadges() {
+  if (!scene.tileBadges) return;
+  for (let r = 0; r < scene.tileBadges.length; r++) {
+    for (let c = 0; c < scene.tileBadges[r].length; c++) {
+      const b = scene.tileBadges[r][c];
+      if (b) {
+        b.destroy({ children: true });
+        scene.tileBadges[r][c] = null;
+      }
+    }
+  }
+  clearAllCellTints();
+  clearAllCellMultTexts();
+}
+
 // Update the bottom status line. Shows "Good luck!" before a spin and
 // "WIN <amount>" once a spin has paid out.
 function updateStatusText(text) {
@@ -3531,6 +4635,66 @@ function updateSpinButtonState() {
   // with flashInsufficientBalance() or returns silently if busy. This gives
   // the player clear feedback instead of silently-dead buttons.
   scene.spinButton.eventMode = 'static';
+}
+
+// Grey out / re-enable the bet adjust buttons based on feature state.
+function refreshBetControlsEnabled() {
+  const locked = player.feature.active;
+  const btns = [scene.betMinusBtn, scene.betPlusBtn];
+  for (const b of btns) {
+    if (!b) continue;
+    b.alpha = locked ? 0.4 : 1;
+    b.eventMode = locked ? 'none' : 'static';
+    b.cursor    = locked ? 'default' : 'pointer';
+  }
+  if (scene.betPill) scene.betPill.alpha = locked ? 0.65 : 1;
+}
+
+// Called when the player confirms the BUY FEATURE modal. Deducts cost,
+// flips into free-spin mode, auto-starts the first spin.
+function startFeature() {
+  if (!canBuyFeature()) return;
+  const cost = featureCost();
+  const prevBal = player.balance;
+  player.balance -= cost;
+  updateBalanceText(prevBal);
+  player.feature.active    = true;
+  player.feature.spinsLeft = FEATURE_SPIN_COUNT;
+  player.feature.cellMults = makeEmptyCellMults();
+  player.feature.lockedBet = player.bet;
+  player.feature.totalWin  = 0;
+  // Clear any leftover tile badges from prior spins — feature tiles start
+  // fresh and accumulate from here.
+  clearAllTileBadges();
+  refreshFeatureUI();
+  updateStatusText('WIN 0,00');
+  // Auto-start the first spin — feature spins play back-to-back.
+  setTimeout(() => { onSpinClick(); }, 250);
+}
+
+// Called when the 15th spin finishes (or if feature is cleared otherwise).
+// Shows the "Congratulations" result popup with the total feature winnings.
+function endFeature() {
+  const totalWon = player.feature.totalWin || 0;
+  player.feature.active    = false;
+  player.feature.spinsLeft = 0;
+  player.feature.cellMults = null;
+  player.feature.lockedBet = null;
+  player.feature.totalWin  = 0;
+  clearAllTileBadges();
+  refreshFeatureUI();
+  openFeatureResultModal(totalWon);
+}
+
+// Refresh every bit of UI that depends on feature state.
+function refreshFeatureUI() {
+  if (scene.buyBtn && scene.buyBtn._refresh)             scene.buyBtn._refresh();
+  if (scene.featureBanner && scene.featureBanner._refresh) scene.featureBanner._refresh();
+  refreshBetControlsEnabled();
+  // Mechanic toggle disabled mid-feature — redraw to reflect.
+  if (scene.chainBtn && scene.chainBtn._redraw) scene.chainBtn._redraw();
+  if (scene.tileBtn  && scene.tileBtn._redraw)  scene.tileBtn._redraw();
+  updateSpinButtonState();
 }
 
 // Flash the balance pill red briefly when the player tries to spin without
@@ -3897,8 +5061,45 @@ function openPaytableModal(L) {
   rulesHeader.y = panelY + 102 * scale;
   rulesContent.addChild(rulesHeader);
 
-  const rulesText =
-`The Grid
+  const rulesText = (ALT_MODE === 'alt2')
+? `The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Each flower has a colour and starts with 1 – 4 petals.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• When a flower reaches 8 petals, it blooms and pays its colour's base
+  value × bet.
+• Each bloom also DROPS a multiplier tile on its own cell and HALF of
+  that tile's value on all 8 adjacent cells (up, down, left, right and
+  diagonals). Tile values are randomly picked from:
+    4×   8×   10×   20×   50×   100×   500×
+• When more than one bloom spreads onto the same cell, the values SUM.
+
+Bloom on a Multiplier
+• If a later bloom happens on a cell that already has a multiplier, that
+  bloom's payout is multiplied by the cell's accumulated multiplier.
+• Multipliers persist on their cell for the rest of the spin — they don't
+  disappear after a bloom, so a new flower growing there can cash them in.
+
+Empty Dissolve
+• A flower that gives away all its petals just poofs away. In this mode
+  empties do NOT add multipliers — only blooms do.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers.
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms or empties keep happening.
+
+Buy Feature
+• Pays 100 × bet for 15 free spins.
+• Accumulated multiplier tiles PERSIST across every free spin — they
+  only reset when the feature ends.`
+: `The Grid
 • 4 rows × 5 columns of flower pots. Every cell always holds one flower.
 • Each flower has a colour and starts with 1 – 4 petals.
 
@@ -3971,6 +5172,199 @@ function closePaytableModal() {
   });
 }
 
+// ─── GENERIC CONFIRM / ANNOUNCEMENT MODAL ───────────────────────────────────
+// Builds a centred rounded-panel dialog with a title, body text, and any
+// number of coloured action buttons. Returns the modal container; caller is
+// responsible for destroying via the `close()` method attached to each
+// button's handler.
+function _openSimpleModal({ title, bodyLines, buttons }) {
+  const L = calculateLayout(app.screen.width, app.screen.height);
+  const scale = Math.min(1, Math.min(L.sw / 900, L.sh / 900));
+
+  const modal = new PIXI.Container();
+  modal.alpha = 0;
+  app.stage.addChild(modal);
+
+  // Dim backdrop
+  const backdrop = new PIXI.Graphics();
+  backdrop.beginFill(0x000000, 0.72);
+  backdrop.drawRect(0, 0, L.sw, L.sh);
+  backdrop.endFill();
+  backdrop.eventMode = 'static';
+  modal.addChild(backdrop);
+
+  // Panel sized relative to content.
+  const panelW = Math.min(L.sw * 0.8, 480 * scale);
+  const titleFS = Math.max(24, 32 * scale);
+  const bodyFS  = Math.max(16, 22 * scale);
+  const btnH    = Math.max(44, 56 * scale);
+  const btnFS   = Math.max(16, 20 * scale);
+  const padY    = 28 * scale;
+  const lineGap = 8 * scale;
+
+  // Measure body height
+  const titleH = titleFS + lineGap;
+  const bodyH  = (bodyLines.length) * (bodyFS + lineGap);
+  const btnRowH = btnH + padY;
+  const panelH = padY + titleH + padY * 0.5 + bodyH + padY + btnRowH;
+
+  const panelX = (L.sw - panelW) / 2;
+  const panelY = (L.sh - panelH) / 2;
+
+  const panel = new PIXI.Graphics();
+  panel.lineStyle(3 * scale, 0xC08050, 0.95);
+  panel.beginFill(0x2A1808, 0.98);
+  panel.drawRoundedRect(panelX, panelY, panelW, panelH, 24 * scale);
+  panel.endFill();
+  modal.addChild(panel);
+
+  // Title
+  if (title) {
+    const t = new PIXI.Text(title, {
+      fontFamily: FONT,
+      fontSize: titleFS,
+      fill: 0xFFD54F,
+      letterSpacing: 0.8,
+      align: 'center',
+    });
+    t.anchor.set(0.5, 0);
+    t.x = panelX + panelW / 2;
+    t.y = panelY + padY;
+    modal.addChild(t);
+  }
+
+  // Body lines
+  let lineY = panelY + padY + titleH + padY * 0.5;
+  for (const line of bodyLines) {
+    const isEmphasis = line.emphasis === true;
+    const t = new PIXI.Text(line.text ?? line, {
+      fontFamily: FONT,
+      fontSize: isEmphasis ? bodyFS * 1.4 : bodyFS,
+      fill: isEmphasis ? 0xFFD54F : 0xFFECB3,
+      align: 'center',
+      wordWrap: true,
+      wordWrapWidth: panelW - padY * 2,
+    });
+    t.anchor.set(0.5, 0);
+    t.x = panelX + panelW / 2;
+    t.y = lineY;
+    modal.addChild(t);
+    lineY += (isEmphasis ? bodyFS * 1.4 : bodyFS) + lineGap;
+  }
+
+  // Buttons row
+  const close = () => {
+    gsap.to(modal, {
+      alpha: 0,
+      duration: 0.15,
+      ease: 'power2.in',
+      onComplete: () => modal.destroy({ children: true }),
+    });
+  };
+
+  const btnCount = buttons.length;
+  const btnGap = 16 * scale;
+  const btnW = (panelW - padY * 2 - btnGap * (btnCount - 1)) / btnCount;
+  const btnY = panelY + panelH - padY - btnH / 2;
+  buttons.forEach((b, i) => {
+    const bx = panelX + padY + btnW * i + btnGap * i + btnW / 2;
+    const bcont = new PIXI.Container();
+    bcont.x = bx; bcont.y = btnY;
+    const bbg = new PIXI.Graphics();
+    const drawBtnBg = (hover) => {
+      bbg.clear();
+      bbg.lineStyle(2 * scale, b.stroke || 0xFFFFFF, 0.9);
+      bbg.beginFill(hover ? (b.hoverFill || b.fill) : b.fill, 1);
+      bbg.drawRoundedRect(-btnW / 2, -btnH / 2, btnW, btnH, btnH * 0.3);
+      bbg.endFill();
+    };
+    drawBtnBg(false);
+    const btxt = new PIXI.Text(b.label, {
+      fontFamily: FONT,
+      fontSize: btnFS,
+      fill: 0xFFFFFF,
+      letterSpacing: 0.5,
+    });
+    btxt.anchor.set(0.5);
+    bcont.addChild(bbg);
+    bcont.addChild(btxt);
+    bcont.eventMode = 'static';
+    bcont.cursor = 'pointer';
+    bcont.hitArea = new PIXI.RoundedRectangle(-btnW / 2, -btnH / 2, btnW, btnH, btnH * 0.3);
+    bcont.on('pointerover', () => {
+      drawBtnBg(true);
+      gsap.to(bcont.scale, { x: 1.04, y: 1.04, duration: 0.12 });
+    });
+    bcont.on('pointerout', () => {
+      drawBtnBg(false);
+      gsap.to(bcont.scale, { x: 1, y: 1, duration: 0.12 });
+    });
+    bcont.on('pointertap', () => {
+      if (b.onTap) b.onTap(close);
+      else close();
+    });
+    modal.addChild(bcont);
+  });
+
+  gsap.to(modal, { alpha: 1, duration: 0.18, ease: 'power2.out' });
+  return { modal, close };
+}
+
+function openBuyFeatureModal() {
+  if (!canBuyFeature()) return;
+  const cost = featureCost();
+  const dialog = _openSimpleModal({
+    title: 'Buy Feature',
+    bodyLines: [
+      `Are you sure you want to buy`,
+      `15 free spins for ${fmtCurrency(cost)}?`,
+      ` `,
+      `Multiplier tiles dropped during the`,
+      `feature PERSIST across all 15 spins.`,
+    ],
+    buttons: [
+      {
+        label: 'CANCEL',
+        fill:  0xB22A2A,
+        hoverFill: 0xD43C3C,
+        stroke: 0xFF6B6B,
+        onTap: (close) => close(),
+      },
+      {
+        label: 'YES',
+        fill:  0x2E7D32,
+        hoverFill: 0x3FA143,
+        stroke: 0x7FE080,
+        onTap: (close) => {
+          close();
+          startFeature();
+        },
+      },
+    ],
+  });
+  scene.buyFeatureModal = dialog.modal;
+}
+
+function openFeatureResultModal(totalWon) {
+  const dialog = _openSimpleModal({
+    title: 'Congratulations',
+    bodyLines: [
+      { text: 'You won' },
+      { text: fmtCurrency(totalWon), emphasis: true },
+    ],
+    buttons: [
+      {
+        label: 'OK',
+        fill:  0x2E7D32,
+        hoverFill: 0x3FA143,
+        stroke: 0x7FE080,
+        onTap: (close) => close(),
+      },
+    ],
+  });
+  scene.featureResultModal = dialog.modal;
+}
+
 // ─── SPIN FLOW ───────────────────────────────────────────────────────────────
 
 async function onSpinClick() {
@@ -3980,12 +5374,15 @@ async function onSpinClick() {
     return;
   }
 
-  const bet = player.bet;
+  const inFeature = player.feature.active;
+  const bet = inFeature ? player.feature.lockedBet : player.bet;
 
-  // 1. Deduct the bet up front (count-up animation)
-  const prevBal = player.balance;
-  player.balance -= bet;
-  updateBalanceText(prevBal);
+  // 1. Deduct the bet up front (skip during free spins).
+  if (!inFeature) {
+    const prevBal = player.balance;
+    player.balance -= bet;
+    updateBalanceText(prevBal);
+  }
   updateSpinButtonState();
 
   // 2. Reset the spin UI state
@@ -3993,22 +5390,47 @@ async function onSpinClick() {
   if (scene.winPill && scene.winPill.resetPermanent) scene.winPill.resetPermanent();
   updateMultiplierBar(1, 0);
   updateWinText(0);
-  // Clear the bottom status line while the spin is running — the WIN /
-  // Good luck readout populates at the end, after the result is in.
-  updateStatusText('');
+  // Status line: blanks between regular spins, but during the feature we
+  // keep showing the running cumulative "WIN <total>" so the player can
+  // watch it climb across all 15 spins without a reset each time.
+  if (inFeature) {
+    updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+  } else {
+    updateStatusText('');
+  }
+  // Alt-2: wipe any multiplier tiles from the previous spin — EXCEPT during
+  // the free-spin feature where tiles accumulate across all 15 spins.
+  if (!inFeature) clearAllTileBadges();
 
-  // 3. Run the deterministic simulation — animator replays it.
-  const result = BloomSort.runSpin(bet);
+  // 3. Run the deterministic simulation — animator replays it. In the
+  //    feature, carry tile state across spins via the cellMults handoff.
+  const runOpts = (inFeature && ALT_MODE === 'alt2')
+    ? { cellMults: player.feature.cellMults }
+    : {};
+  const result = BloomSort.runSpin(bet, runOpts);
+  if (inFeature && ALT_MODE === 'alt2' && result.cellMults) {
+    player.feature.cellMults = result.cellMults;
+  }
 
   if (!animator) animator = new SpinAnimator({ scene, app });
 
   animator.onProgress = (ev) => {
     if (ev.type === 'dissolve') {
-      // The multiplier UI is now driven per-pot-landing (see
-      // bumpMultiplierOnPotLanded inside the empty-dissolve animation), so
-      // the dissolve event only updates the running WIN count-up here.
       const runningWin = ev.payoutTotal * bet;
-      updateWinText(runningWin, true);
+      if (ALT_MODE === 'alt2') {
+        // Tile-multiplier mode: running total shows in the bottom status
+        // text. During the free-spin feature, it's cumulative across all
+        // 15 spins (feature.totalWin baseline + this spin's running).
+        const displayWin = inFeature
+          ? player.feature.totalWin + runningWin
+          : runningWin;
+        if (displayWin > 0) {
+          updateStatusText(`WIN ${fmtCurrency(displayWin)}`);
+        }
+      } else {
+        // Chain-multiplier mode: the top pill shows the running pre-mult win.
+        updateWinText(runningWin, true);
+      }
     }
   };
 
@@ -4027,35 +5449,67 @@ async function onSpinClick() {
       updateRtpText();
       currentGrid = finalResult.finalGrid;
 
-      // Only run the × multiplication reveal if there's actually a win to
-      // multiply. When the spin ended with a multiplier but 0 payout, skip
-      // the animation — just settle on the final (0) WIN value.
-      if (mult > 1 && finalWin > 0) {
-        await animateMultiplication(baseWin, finalWin);
-        if (finalWin >= bet) pulseWinPill();
+      if (ALT_MODE === 'alt2') {
+        // Tile mode: no × reveal (no global multiplier). The bottom status
+        // has already been ticking up during the cascade; just finalise.
+        if (player.feature.active) {
+          // Accumulate this spin's win into the feature total. The status
+          // shows the cumulative amount won across the feature so far.
+          player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+          updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+        } else if (finalWin > 0) {
+          updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+        } else {
+          updateStatusText('Good luck!');
+        }
       } else {
-        updateWinText(finalWin, true);
-        if (finalWin > 0 && finalWin >= bet) pulseWinPill();
-      }
-
-      // Bottom status readout: "WIN <amount>" sticks around until the next
-      // spin starts if the player actually won something; otherwise fall
-      // back to "Good luck!" for dead spins.
-      if (finalWin > 0) {
-        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
-      } else {
-        updateStatusText('Good luck!');
+        // Chain mode: original × reveal, then final readout in the status.
+        if (mult > 1 && finalWin > 0) {
+          await animateMultiplication(baseWin, finalWin);
+          if (finalWin >= bet) pulseWinPill();
+        } else {
+          updateWinText(finalWin, true);
+          if (finalWin > 0 && finalWin >= bet) pulseWinPill();
+        }
+        if (finalWin > 0) {
+          updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+        } else {
+          updateStatusText('Good luck!');
+        }
       }
 
       uiState.multiplier = 1;
       uiState.emptyCount = 0;
+
+      // Free-spin feature bookkeeping — decrement counter, end feature on
+      // the final spin, or auto-chain to the next spin.
+      let chainNext = false;
+      if (player.feature.active) {
+        player.feature.spinsLeft -= 1;
+        if (player.feature.spinsLeft <= 0) {
+          endFeature();
+        } else {
+          refreshFeatureUI();
+          chainNext = true;   // more spins to play — auto-spin next
+        }
+      }
+      // Stash for the finally block.
+      this._chainNext = chainNext;
     } finally {
       // Always re-enable the spin button, even if something threw above.
       // The error (if any) still propagates to the console.
+      const doAutoSpin = this._chainNext;
+      this._chainNext = false;
       setTimeout(() => {
         if (scene.spinButton) {
           scene.spinButton._setBusy(false);
           updateSpinButtonState();
+        }
+        // Buy-feature affordability can change as balance changes.
+        if (scene.buyBtn && scene.buyBtn._refresh) scene.buyBtn._refresh();
+        // Auto-chain the next free spin after a short breather.
+        if (doAutoSpin && player.feature.active) {
+          setTimeout(() => { onSpinClick(); }, 400);
         }
       }, 200);
     }
