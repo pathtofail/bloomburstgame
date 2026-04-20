@@ -191,17 +191,18 @@ const GAME = {
   ],
 
   // Drop weights for alt-1 (Chain) and alt-2 (Tile). Total = 100, so each
-  // weight equals its drop percentage. 3- and 4-petal cells are rare so
-  // the grid mostly starts low and the player has time to read transfers.
-  //   1 petal  → 44%
-  //   2 petals → 39%
-  //   3 petals → 12%
-  //   4 petals →  5%
+  // weight equals its drop percentage. 3- and 4-petal cells are uncommon
+  // so the grid mostly starts low and the player has time to read
+  // transfers — but a 4-petal cell can still seed a quick early bloom.
+  //   1 petal  → 42%
+  //   2 petals → 37%
+  //   3 petals → 15%
+  //   4 petals →  6%
   PETAL_WEIGHTS: [
-    { count: 1, weight: 44 },
-    { count: 2, weight: 39 },
-    { count: 3, weight: 12 },
-    { count: 4, weight:  5 },
+    { count: 1, weight: 42 },
+    { count: 2, weight: 37 },
+    { count: 3, weight: 15 },
+    { count: 4, weight:  6 },
   ],
 };
 
@@ -368,7 +369,7 @@ let ALT_MODE = (() => {
     const v = localStorage.getItem(ALT_MODE_KEY);
     if (v === 'alt1' || v === 'alt2' || v === 'alt3') return v;
   } catch (_) {}
-  return 'alt1';
+  return 'alt2';
 })();
 function setAltMode(m) {
   if (m !== 'alt1' && m !== 'alt2' && m !== 'alt3') return;
@@ -2050,28 +2051,45 @@ function spawnAbsorbHalo(container, x, y) {
 // Floating payout text — scales in, lifts ~50px, fades out. Used for Full
 // Bloom dissolves to communicate the coin reward visually.
 function spawnPayoutText(container, x, y, amount) {
+  // The bloom payout pops over the spinning flower — must be visually
+  // DISTINCT from the gold tile-multiplier value/badge that lives on the
+  // same cell in alt-2. We use bright GREEN ("you won money") with a
+  // chunky dark stroke + drop shadow, much larger size than the
+  // multiplier text, and a softer back-out scale-pop. Reads as "+25"
+  // unmissable, never confused with "×8" tile values nearby.
   const txt = new PIXI.Text(`+${amount}`, {
     fontFamily: FONT,
-    fontSize: 34,
-    fill: 0xFFD700,
-    stroke: 0x3D1C02,
-    strokeThickness: 5,
+    fontSize: 56,                    // was 34 — much more prominent
+    fill: 0x7FE57F,                  // bright "win" green, not gold
+    stroke: 0x0A2E0A,                // deep forest green stroke
+    strokeThickness: 7,
+    dropShadow: true,
+    dropShadowColor: 0x000000,
+    dropShadowAlpha: 0.6,
+    dropShadowBlur: 6,
+    dropShadowDistance: 3,
+    dropShadowAngle: Math.PI / 2,
+    letterSpacing: 1,
   });
   txt.anchor.set(0.5);
   txt.x = x; txt.y = y;
   txt.alpha = 0;
-  txt.scale.set(0.5);
+  txt.scale.set(0.4);
+  // Render ABOVE everything else in the container — payout must never be
+  // hidden behind another flower's swelling bloom or a tile badge.
+  txt.zIndex = 9999;
+  if (container.sortableChildren !== undefined) container.sortableChildren = true;
   container.addChild(txt);
 
   // 2× duration on the payout text — keeps it on screen long enough to
   // match the slowed-down bloom spin/win animation.
   const S = 2;
   const tl = gsap.timeline({ onComplete: () => txt.destroy() });
-  tl.to(txt,       { alpha: 1,   duration: 0.15 * S, ease: 'power2.out' }, 0);
-  tl.to(txt.scale, { x: 1.25, y: 1.25, duration: 0.25 * S, ease: 'back.out(2.2)' }, 0);
-  tl.to(txt.scale, { x: 1, y: 1, duration: 0.15 * S }, 0.25 * S);
-  tl.to(txt,       { y: y - 50, duration: 0.95 * S, ease: 'power2.out' }, 0);
-  tl.to(txt,       { alpha: 0,  duration: 0.4 * S,  ease: 'power2.in' }, 0.55 * S);
+  tl.to(txt,       { alpha: 1,    duration: 0.15 * S, ease: 'power2.out' }, 0);
+  tl.to(txt.scale, { x: 1.35, y: 1.35, duration: 0.30 * S, ease: 'back.out(2.6)' }, 0);
+  tl.to(txt.scale, { x: 1.15, y: 1.15, duration: 0.20 * S, ease: 'sine.inOut' }, 0.30 * S);
+  tl.to(txt,       { y: y - 70, duration: 1.10 * S, ease: 'power2.out' }, 0);
+  tl.to(txt,       { alpha: 0,   duration: 0.40 * S, ease: 'power2.in' }, 0.55 * S);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4049,7 +4067,7 @@ const player = {
   },
 };
 
-const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 15, alt3: 10 };
+const FEATURE_SPIN_COUNT_BY_MODE = { alt1: 10, alt2: 12, alt3: 10 };
 // Alt-3 free-spin multiplier: starts at 2x, +1x for every Full Bloom
 // during the feature. Persists across all 10 free spins.
 const ALT3_FEATURE_MULT_START = 2;
@@ -5046,7 +5064,7 @@ function buildScene(L) {
   // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (both modes) ────────────────
   // Square button sitting to the LEFT of the grid, aligned to the grid's
   // top edge. Opens a confirmation modal; on confirm, kicks off the free-
-  // spin feature. Alt-2 gets 15 spins with tile-multiplier persistence;
+  // spin feature. Alt-2 gets 12 spins with tile-multiplier persistence;
   // alt-1 gets 10 spins with chain-multiplier (emptyCount) persistence.
   {
     // Pure gameScale (no rigid pixel floor) — the giant "BUY FEATURE"
@@ -6376,7 +6394,7 @@ Cascades
   new blooms or empties keep happening.
 
 Buy Feature
-• Pays 100 × bet for 15 free spins.
+• Pays 100 × bet for 12 free spins.
 • Accumulated multiplier tiles PERSIST across every free spin — they
   only reset when the feature ends.`
 : `The Grid
