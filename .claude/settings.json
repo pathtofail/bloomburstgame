@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "mcp__Claude_Preview__preview_screenshot",
-      "Bash(node scripts/check.mjs)"
+      "mcp__Claude_Preview__preview_resize",
+      "Bash(node scripts/check.mjs)",
+      "Bash(node scripts/sim-alt6.mjs)",
+      "Bash(node scripts/sim-alt6.mjs *)",
+      "Bash(npx tsc)",
+      "Bash(npx tsc *)",
+      "Bash(node_modules/.bin/tsc)",
+      "Bash(node_modules/.bin/tsc *)",
+      "Bash(./node_modules/.bin/tsc)",
+      "Bash(./node_modules/.bin/tsc *)"
     ]
   }
 }

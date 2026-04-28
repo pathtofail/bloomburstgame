@@ -215,17 +215,14 @@ const COLOR_BY_NAME = Object.fromEntries(GAME.COLORS.map(c => [c.name, c]));
 // change we mirror it into GAME.ROWS/GAME.COLS so the rest of the model
 // (transfer, gravity, refill, tests, animator loops) keeps working unchanged.
 // Outside alt-3 the dims default to 4×5 with MAX_PETALS=8.
-let currentGridSize = 4;
+// `currentGridSize` is no longer a base-engine global — Bloom Reels
+// owns it inside HOOKS_ALT3._currentGridSize. The engine asks the
+// active mode for its grid dims via `getModeHooks().getGridDims()`.
 function syncGameDimsForMode() {
-  if (ALT_MODE === 'alt3') {
-    GAME.ROWS       = currentGridSize;
-    GAME.COLS       = currentGridSize;
-    GAME.MAX_PETALS = GAME.ALT3_MAX_PETALS;
-  } else {
-    GAME.ROWS       = 4;
-    GAME.COLS       = 5;
-    GAME.MAX_PETALS = 8;
-  }
+  const dims = getModeHooks().getGridDims();
+  GAME.ROWS       = dims.rows;
+  GAME.COLS       = dims.cols;
+  GAME.MAX_PETALS = dims.maxPetals;
 }
 
 // Grow an alt-3 grid from oldSize×oldSize to newSize×newSize, anchoring
@@ -307,9 +304,10 @@ const ALT4_WILD_PETAL_WEIGHTS = [
 function isWildCell(cell) { return !!(cell && cell.wild); }
 function isScatterCell(cell) { return !!(cell && cell.scatter); }
 
-// How many WILDs have been spawned during the current spin. Capped at 1
-// — see spawnCell(). Reset at the top of runSpin().
-let _alt4WildsThisSpin = 0;
+// (Per-mode spin-scoped counters live on each mode's hooks now —
+// Bloom Wilds tracks `_wildsThisSpin` inside HOOKS_ALT4. The base
+// engine asks the active mode to reset its counters at the top of
+// every runSpin via `getModeHooks().resetForSpin()`.)
 
 // ─── Scatters ───────────────────────────────────────────────────────────────
 // Scatter symbols spawn at a per-cell rate; they pay anywhere on the grid
@@ -366,11 +364,10 @@ function spawnWildCell() {
 // range across all modes.
 function getScatterSpawnChance() {
   const inFeature = !!(player && player.feature && player.feature.active);
-  // Alt-3 base rate stays low (its cascades refill many cells per spin).
-  const baseChance = (ALT_MODE === 'alt3') ? 0.015 : SCATTER_SPAWN_CHANCE;
-  // Scatters in free spins are capped at 1/4 of base so retriggers stop
-  // stacking. Scatters already on the board at feature start persist
-  // normally; we just slow NEW scatter spawns during the run.
+  // Base chance comes from the active mode (default SCATTER_SPAWN_CHANCE
+  // for most; Bloom Reels overrides to a lower rate). Scatters in free
+  // spins are capped at 1/4 of base so retriggers stop stacking.
+  const baseChance = getModeHooks().getScatterChance();
   return inFeature ? baseChance * 0.25 : baseChance;
 }
 
@@ -382,35 +379,17 @@ function spawnCell() {
     _scattersOnGrid++;
     return spawnScatterCell();
   }
-  // Alt-4 sprinkles WILDs in at a small per-cell rate. The
-  // _alt4WildsThisSpin counter caps the total WILDs created during a
-  // single spin to ONE — once one has spawned (initial grid OR refill),
-  // subsequent rolls fall through to the regular flower path. runSpin
-  // resets the counter at the top of each spin.
-  if (ALT_MODE === 'alt4'
-      && _alt4WildsThisSpin === 0
-      && _rng() < ALT4_WILD_SPAWN_CHANCE) {
-    _alt4WildsThisSpin++;
-    return spawnWildCell();
-  }
-  // Alt-3 (Expanding Reels) blooms at 6 petals — cap initial petal counts
-  // at 3 AND lock the 3-petal share at 10% (so a freshly-spawned half-
-  // bloom is rare). The remaining 90% is split between 1 and 2 in the
-  // same 40:35 (≈ 8:7) ratio as the base game.
-  //   3 petals → 10  → 10%
-  //   2 petals → 42  → 42%
-  //   1 petal  → 48  → 48%
-  let petalWeights = GAME.PETAL_WEIGHTS;
-  if (ALT_MODE === 'alt3') {
-    petalWeights = [
-      { count: 1, weight: 48 },
-      { count: 2, weight: 42 },
-      { count: 3, weight: 10 },
-    ];
-  }
+  // First chance for the active mode to inject a special cell (e.g.
+  // Bloom Wilds rolls for a WILD pot here, capped to one per spin).
+  // Returning null falls through to a regular flower spawn.
+  const special = getModeHooks().rollSpecialSpawn?.();
+  if (special) return special;
+  // Regular flower — colour from GAME.COLORS, petal count from the
+  // active mode's petal-weight table (Bloom Reels uses a 1-3 spread
+  // for its 6-petal blooms; everyone else uses GAME.PETAL_WEIGHTS).
   return {
     color:  weightedPick(GAME.COLORS).name,
-    petals: weightedPick(petalWeights).count,
+    petals: weightedPick(getModeHooks().getSpawnPetalWeights()).count,
   };
 }
 
@@ -485,15 +464,20 @@ let ALT_MODE = (() => {
 function setAltMode(m) {
   if (m !== 'alt1' && m !== 'alt2' && m !== 'alt3' && m !== 'alt4' && m !== 'alt5' && m !== 'alt6') return;
   ALT_MODE = m;
-  // Reset alt-3 grid back to 4×4 whenever we (re-)enter alt-3 from another
-  // mode. Mirror the new dims into GAME.* so model + tests + scene agree.
-  if (m === 'alt3') currentGridSize = GAME.ALT3_SIZES[0];
+  // Reset the new mode's engine state (Bloom Reels' grid size, Bloom
+  // Wilds' wild quota, etc.) so re-entering a mode starts from its
+  // canonical baseline. Then mirror dims into GAME.* so model +
+  // tests + scene agree.
+  getModeHooks().resetForSpin?.();
+  getModeHooks().onModeEnter?.();
   syncGameDimsForMode();
   try { localStorage.setItem(ALT_MODE_KEY, m); } catch (_) {}
 }
-// Boot-time sync — if ALT_MODE was restored as 'alt3' from localStorage,
-// the GAME dims must be resized BEFORE buildScene runs.
-syncGameDimsForMode();
+// Boot-time GAME-dim sync deferred — `syncGameDimsForMode` now reads
+// the active mode's `getGridDims` hook, which doesn't exist yet at
+// this point in the file (MODE_HOOKS is defined further down). The
+// sync runs from `_initEngineForBoot` below, called once MODE_HOOKS
+// is in scope.
 
 // Pick a tile-multiplier value using the weighted distribution in
 // GAME.MULT_TILE_WEIGHTS. Returns an integer like 4, 8, 50 etc.
@@ -1318,6 +1302,41 @@ const MODE_HOOKS_DEFAULT = {
   afterDissolve(_state, _ctx) {},
   finalMultiplier(state) { return state.multiplier || 1; },
   resultExtras(_state) { return {}; },
+
+  // ── Base-engine config (mode-blind defaults) ──────────────────────
+  // The base engine NEVER references ALT_MODE — these hooks let each
+  // mode override the parts of grid geometry / spawn behaviour that
+  // differ from the canonical 4×5 grid with 8-petal blooms.
+
+  // Grid dimensions for the current spin.
+  getGridDims() {
+    return { rows: 4, cols: 5, maxPetals: 8 };
+  },
+  // Base scatter spawn chance per cell (in-feature dampening is
+  // applied generically by the engine on top of this).
+  getScatterChance() {
+    return SCATTER_SPAWN_CHANCE;
+  },
+  // Petal-count weights for fresh cells.
+  getSpawnPetalWeights() {
+    return GAME.PETAL_WEIGHTS;
+  },
+  // First chance to override regular cell spawn (e.g. inject a WILD
+  // pot). Return a cell `{ color, petals, isWild?, ... }` to short-
+  // circuit, or null/undefined to fall through to a regular flower.
+  rollSpecialSpawn() {
+    return null;
+  },
+  // Called at the top of every runSpin — modes use it to reset any
+  // spin-scoped counters they own (e.g. Bloom Wilds' wild-quota).
+  resetForSpin() {},
+  // Called from runSpin AFTER initState but BEFORE generateGrid, so a
+  // mode can mutate currentGridSize / GAME dims based on opts (Bloom
+  // Reels reads opts.gridSizeStart here).
+  setupGridForSpin(_opts) {},
+  // Extra transfer passes after regular stabilisation (Bloom Wilds
+  // runs WILD-out-petal passes here). Default no-op leaves grid as-is.
+  runExtraTransfers(_ctx) {},
 };
 
 // ─── alt-1: Chain Multiplier ────────────────────────────────────────────────
@@ -1385,6 +1404,37 @@ const HOOKS_ALT2 = _tileHooksBase();
 // ─── alt-3: Expanding Reels ─────────────────────────────────────────────────
 const HOOKS_ALT3 = {
   ...MODE_HOOKS_DEFAULT,
+  // Bloom Reels owns its live grid size + initial petal-count weights.
+  // The grid grows on bloom (4 → 5 → 6) and resets to its smallest
+  // size at base-game spin start.
+  _currentGridSize: 4,
+  _spawnPetalWeights: [
+    { count: 1, weight: 48 },
+    { count: 2, weight: 42 },
+    { count: 3, weight: 10 },
+  ],
+  // Reset the live grid size to the smallest available whenever the
+  // player switches INTO this mode, so they always start at 4×4
+  // regardless of where the previous Bloom Reels session left off.
+  onModeEnter() {
+    this._currentGridSize = GAME.ALT3_SIZES[0];
+  },
+  // ── Base-engine config overrides ──
+  getGridDims() {
+    return {
+      rows: this._currentGridSize,
+      cols: this._currentGridSize,
+      maxPetals: GAME.ALT3_MAX_PETALS,
+    };
+  },
+  // Lower scatter chance — cascades refill many cells per spin so a
+  // base-game rate would land too many.
+  getScatterChance() {
+    return 0.015;
+  },
+  getSpawnPetalWeights() {
+    return this._spawnPetalWeights;
+  },
   initState(opts) {
     const base = MODE_HOOKS_DEFAULT.initState(opts);
     base.alt3FeatureActive = !!(opts && opts.alt3FeatureActive);
@@ -1393,6 +1443,17 @@ const HOOKS_ALT3 = {
                           ? opts.alt3BloomMultStart : 1;
     base.alt3BloomCount = 0;
     return base;
+  },
+  // Reset the grid to the carried-over size before generation. In the
+  // base game and at the start of a feature, that's the smallest size;
+  // mid-feature it's whatever previous spin grew to.
+  setupGridForSpin(opts) {
+    const start = (opts && typeof opts.gridSizeStart === 'number')
+      ? Math.min(opts.gridSizeStart,
+                 GAME.ALT3_SIZES[GAME.ALT3_SIZES.length - 1])
+      : GAME.ALT3_SIZES[0];
+    this._currentGridSize = start;
+    syncGameDimsForMode();
   },
   computeBloomPay(state, fb) {
     // Alt-3 applies a GLOBAL bloom multiplier (active only during the
@@ -1420,11 +1481,11 @@ const HOOKS_ALT3 = {
     if (ctx.fullBlooms.length === 0) return;
     const sizes = GAME.ALT3_SIZES;
     const maxSz = sizes[sizes.length - 1];
-    if (currentGridSize >= maxSz) return;
-    const oldSize = currentGridSize;
-    const newSize = currentGridSize + 1;
+    if (this._currentGridSize >= maxSz) return;
+    const oldSize = this._currentGridSize;
+    const newSize = this._currentGridSize + 1;
     ctx.setGrid(expandGrid(ctx.grid, newSize));
-    currentGridSize = newSize;
+    this._currentGridSize = newSize;
     syncGameDimsForMode();
     ctx.events.push({
       type: 'gridExpand',
@@ -1438,7 +1499,7 @@ const HOOKS_ALT3 = {
   },
   resultExtras(state) {
     return {
-      alt3GridSizeEnd:  currentGridSize,
+      alt3GridSizeEnd:  this._currentGridSize,
       alt3BloomMultEnd: state.alt3BloomMult,
       alt3BloomCount:   state.alt3BloomCount,
     };
@@ -1448,6 +1509,48 @@ const HOOKS_ALT3 = {
 // ─── alt-4: Tile + Wilds ────────────────────────────────────────────────────
 const HOOKS_ALT4 = {
   ..._tileHooksBase(),
+  // Bloom Wilds owns its per-spin wild-quota counter + spawn rate.
+  _wildsThisSpin: 0,
+  WILD_SPAWN_CHANCE: 0.05,
+  resetForSpin() {
+    this._wildsThisSpin = 0;
+  },
+  // Override base spawn: roll for a WILD pot once per spin (capped at
+  // one). After the cap we fall through to the regular flower spawn.
+  rollSpecialSpawn() {
+    if (this._wildsThisSpin > 0) return null;
+    if (_rng() >= this.WILD_SPAWN_CHANCE) return null;
+    this._wildsThisSpin++;
+    return spawnWildCell();
+  },
+  // After regular transfers stabilise, run WILD-out-petal passes
+  // interleaved with regular re-stabilisations until both phases are
+  // stable. Each WILD pass pulls one petal from each WILD and lands
+  // it on its nearest same-colour grid-wide cell. Returns the final
+  // grid; the original `passes` array is mutated in place to record
+  // every wild-pass and intermediate regular re-runs.
+  runExtraTransfers({ cur, passes, runTransfers, transferPass, cloneGrid }) {
+    let grid = cur;
+    for (let wpi = 0; wpi < GAME.MAX_TRANSFER_PASSES; wpi++) {
+      const { nextGrid, moves } = transferPass(grid, { kind: 'wild' });
+      if (moves.length === 0) break;
+      passes.push({
+        passIndex: passes.length,
+        moves,
+        gridAfter: cloneGrid(nextGrid),
+        kind: 'wild',
+      });
+      grid = nextGrid;
+      // After a wild petal lands, regulars may have new moves.
+      const reRun = runTransfers(grid);
+      for (const rp of reRun.passes) {
+        rp.passIndex = passes.length;
+        passes.push(rp);
+      }
+      grid = reRun.finalGrid;
+    }
+    return { finalGrid: grid };
+  },
   applyWildBumps(state, passes) {
     // Every WILD petal that landed this cascade bumps the destination
     // cell's tile multiplier by +2×. cellMults is mutated so any
@@ -1530,11 +1633,23 @@ const ALT5_MAX_THRESHOLD = ALT5_REWARDS[ALT5_REWARDS.length - 1].threshold;
 //
 // Bloom multiplier is a flat ×5 throughout the feature (no climbing
 // ladder). Feature lasts 15 free spins, retriggers at 3+ scatters add +5.
+// AND-fill 2-pot model: each tier has TWO color pots, each holds 8
+// petals. Tier pays only when BOTH pots reach 8. On payout, both
+// pots zero. Industry-standard "must-hit-both-colors" jackpot.
+//
+// Sim @ 50k features (750k spins) verified:
+//   Tier   Hit/feat   Hit/spin       Payout   EV/feat
+//   Tiny    2.98       1 in   5      5×        14.9× bet
+//   Mini    0.91       1 in  16     15×        13.7× bet
+//   Major   0.163      1 in  92    100×        16.3× bet
+//   Grand   0.009      1 in 1689  1200×        10.7× bet  (target 1 in 1000)
+//   bloom + scatter contribute 40.1× bet
+//   total feature RTP = 95.67%
 const ALT6_JACKPOTS = [
-  { tier: 'tiny',  label: 'TINY',  colors: ['Sky',     'Pearl'],   threshold: 10, payout: 20  },
-  { tier: 'mini',  label: 'MINI',  colors: ['Teal',    'Lime'],    threshold: 15, payout: 50  },
-  { tier: 'major', label: 'MAJOR', colors: ['Magenta', 'Gold'],    threshold: 20, payout: 200 },
-  { tier: 'grand', label: 'GRAND', colors: ['Scarlet', 'Indigo'],  threshold: 25, payout: 1000 },
+  { tier: 'tiny',  label: 'TINY',  colors: ['Sky',     'Pearl'],   potCapacity: 8, payout: 5    },
+  { tier: 'mini',  label: 'MINI',  colors: ['Teal',    'Lime'],    potCapacity: 8, payout: 15   },
+  { tier: 'major', label: 'MAJOR', colors: ['Magenta', 'Gold'],    potCapacity: 8, payout: 100  },
+  { tier: 'grand', label: 'GRAND', colors: ['Scarlet', 'Indigo'],  potCapacity: 8, payout: 1200 },
 ];
 
 // Quick lookup: colour → tier index in ALT6_JACKPOTS (or -1).
@@ -1550,8 +1665,48 @@ const ALT6_FEATURE_BLOOM_MULT = 5;
 // chain blooms can form from them.
 const ALT6_RIPPLE_CHANCE_FEATURE = 1.0;
 
+// Alt-6 FEATURE-ONLY ripple petal color weights — its own "reelset".
+// Decoupled from GAME.COLORS. AND-fill model with potCapacity=8 means
+// a tier fills when EACH of its two colors hits 8. With ~108 petals
+// per feature, the per-color expected count λ drives hit rate via
+// P(N_A ≥ 8) × P(N_B ≥ 8) (Poisson-ish, weakly correlated):
+//   Tiny  : λ ≈ 30 → weight 30 per color (combined 60 → 56% of supply)
+//   Mini  : λ ≈ 12 → weight 12 per color (combined 24 → 22%)
+//   Major : λ ≈  7 → weight  7 per color (combined 14 → 13%)
+//   Grand : λ ≈  5 → weight  5 per color (combined 10 →  9%)
+// Total weight 108 across 8 colors. Hit rates verified by sim.
+const ALT6_FEATURE_RIPPLE_WEIGHTS = {
+  Sky:     60, Pearl:   60,
+  Teal:    24, Lime:    24,
+  Magenta: 11, Gold:    11,
+  Scarlet:  6, Indigo:   6,
+};
+const ALT6_FEATURE_RIPPLE_TOTAL_W = (() => {
+  let s = 0; for (const k in ALT6_FEATURE_RIPPLE_WEIGHTS) s += ALT6_FEATURE_RIPPLE_WEIGHTS[k]; return s;
+})();
+function _alt6PickFeatureRippleColor() {
+  let r = _rng() * ALT6_FEATURE_RIPPLE_TOTAL_W;
+  for (const k in ALT6_FEATURE_RIPPLE_WEIGHTS) {
+    r -= ALT6_FEATURE_RIPPLE_WEIGHTS[k];
+    if (r <= 0) return k;
+  }
+  return 'Pearl';
+}
+// Alt-6 feature petals-per-ripple — separate from RIPPLE_PETALS_FEATURE.
+// Bumped from 4 → 10 so total petal supply per feature lands near ~108
+// (avg ~2 ripples/spin × 15 spins × 10 petals × ~50% bloom hit rate).
+// AND-fill model needs this much petal volume to give Tiny enough
+// headroom to fill ~3× per feature.
+const ALT6_RIPPLE_PETALS_FEATURE = 10;
+
 function _alt6BlankJackpots() {
-  return ALT6_JACKPOTS.map(j => ({ tier: j.tier, count: 0 }));
+  // Each tier tracks per-color counts (one entry per color in colors[]).
+  // Tier fills when ALL color counts reach potCapacity.
+  return ALT6_JACKPOTS.map(j => {
+    const counts = {};
+    for (const c of j.colors) counts[c] = 0;
+    return { tier: j.tier, counts };
+  });
 }
 
 function _alt5BlankProgress() {
@@ -1817,7 +1972,14 @@ const HOOKS_ALT6 = {
     base.alt6FeatureActive = !!(opts && opts.alt6FeatureActive);
     // Jackpot fill counts carry across feature spins.
     base.alt6Jackpots = (opts && opts.alt6Jackpots)
-      ? opts.alt6Jackpots.map(j => ({ tier: j.tier, count: j.count | 0 }))
+      ? opts.alt6Jackpots.map((j, i) => {
+          const tierDef = ALT6_JACKPOTS[i];
+          const counts = {};
+          for (const c of tierDef.colors) {
+            counts[c] = (j.counts && j.counts[c] | 0) || 0;
+          }
+          return { tier: j.tier, counts };
+        })
       : _alt6BlankJackpots();
     base.alt6JackpotPaysThisSpin = [];   // [{ tier, payout, atRippleIdx }]
     return base;
@@ -1891,28 +2053,45 @@ const HOOKS_ALT6 = {
       if (_rng() >= chance) continue;
       let n;
       if (inFeature) {
-        n = RIPPLE_PETALS_FEATURE;
+        n = ALT6_RIPPLE_PETALS_FEATURE;
       } else {
         const span = RIPPLE_PETALS_MAX - RIPPLE_PETALS_MIN + 1;
         n = RIPPLE_PETALS_MIN + Math.floor(_rng() * span);
       }
       for (let i = 0; i < n; i++) {
-        const color = weightedPick(GAME.COLORS).name;
+        // Feature uses its own color reelset (weights heavily skewed to
+        // Tiny/Mini so Major/Grand fill rarely). Base game keeps the
+        // standard GAME.COLORS distribution.
+        const color = inFeature
+          ? _alt6PickFeatureRippleColor()
+          : weightedPick(GAME.COLORS).name;
         if (inFeature) {
-          // Feature: every stray petal feeds a jackpot pot.
+          // Feature: every stray petal feeds the matching color pot
+          // inside its tier. Tier pays only when ALL color pots in the
+          // tier reach potCapacity (AND-fill model).
           const tIdx  = ALT6_COLOR_TO_TIER_IDX[color];
           const tier  = (tIdx != null) ? ALT6_JACKPOTS[tIdx].tier : null;
           if (tier != null) {
+            const tierDef = ALT6_JACKPOTS[tIdx];
             const jp = state.alt6Jackpots[tIdx];
-            jp.count += 1;
-            // Did this petal fill the pot? Queue payout + reset.
-            if (jp.count >= ALT6_JACKPOTS[tIdx].threshold) {
+            // Cap per-pot count at potCapacity — overflow into a
+            // single pot doesn't carry over and doesn't help fill the
+            // tier (the *other* pot must catch up).
+            if (jp.counts[color] < tierDef.potCapacity) {
+              jp.counts[color] += 1;
+            }
+            // Tier fills when every color pot in the tier is full.
+            let allFull = true;
+            for (const c of tierDef.colors) {
+              if (jp.counts[c] < tierDef.potCapacity) { allFull = false; break; }
+            }
+            if (allFull) {
               state.alt6JackpotPaysThisSpin.push({
                 tier,
-                payout: ALT6_JACKPOTS[tIdx].payout,
+                payout: tierDef.payout,
                 atRippleIdx: ripplePetals.length,
               });
-              jp.count = 0;
+              for (const c of tierDef.colors) jp.counts[c] = 0;
             }
           }
           ripplePetals.push({
@@ -1952,7 +2131,7 @@ const HOOKS_ALT6 = {
       alt6FeatureActive: !!state.alt6FeatureActive,
       // Final jackpot fill state for the client to persist between spins.
       alt6Jackpots: (state.alt6Jackpots || _alt6BlankJackpots()).map(
-        j => ({ tier: j.tier, count: j.count })
+        j => ({ tier: j.tier, counts: { ...j.counts } })
       ),
       // Total of all jackpot payouts THIS SPIN (sum across cascades).
       // Each entry: { tier, payout }.
@@ -1976,29 +2155,1224 @@ function getModeHooks() {
   return MODE_HOOKS[ALT_MODE] || MODE_HOOKS_DEFAULT;
 }
 
+// Boot-time engine init — runs ONCE here, now that MODE_HOOKS is in
+// scope. Mirrors GAME.* dims to whatever the saved mode says.
+syncGameDimsForMode();
+
+// ─── PER-MODE CLIENT DEFINITION ──────────────────────────────────────────────
+// Parallel structure to MODE_HOOKS: hooks above cover engine-side math; this
+// covers client-side concerns — scene construction, animator dispatch, run
+// orchestration, paytable text, etc. Methods are progressively populated as
+// ALT_MODE branches throughout the file are migrated into per-mode methods.
+//
+// Every method is OPTIONAL — call sites use `MODE_DEF[ALT_MODE].method?.(...)`
+// so a missing method silently no-ops for modes that don't need that hook.
+//
+// Mode display names match the player-facing labels (Bloom Chain / Tiles /
+// Reels / Wilds / Ripple / Jackpot).
+const MODE_DEF = {
+  alt1: {
+    key: 'alt1', name: 'Bloom Chain', displayOrder: 2,
+    // Animator flag: Bloom Chain has a top BLOOM WIN pill that
+    // receives flying payout text (rather than the classic
+    // float-up-and-fade over the bloom).
+    winPillReceivesPayoutFlights: true,
+    populateRunOpts(player, runOpts) {
+      runOpts.emptyCountStart = player.feature.emptyCountCarry || 0;
+    },
+    applyFeatureResult(player, result) {
+      if (typeof result.emptyCount === 'number') {
+        player.feature.emptyCountCarry = result.emptyCount;
+      }
+    },
+    getBuyFeatureLines(player, spins) {
+      return [`The spin multiplier keeps climbing across all ${spins} free spins.`];
+    },
+    // Chain-multiplier mode: BLOOM WIN pill is ticked per-bloom by the
+    // payout flight's onArrive callback. We do NOT update the pill
+    // here — doing so would jump it ahead of the per-bloom flights and
+    // clobber the count-up sync. During the feature we still want the
+    // bottom status to show the cumulative running total.
+    onCascadeDissolve(player, scene, ev, ctx) {
+      if (!ctx.inFeature) return;
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const baseline   = player.feature.totalWin || 0;
+      updateStatusText(`WIN ${fmtCurrency(baseline + runningWin)}`);
+    },
+    // Inside the feature, seed the multiplier bar from the carried
+    // emptyCount so the tier ladder picks up where the previous spin
+    // left off. Returns true to signal the caller "I handled it,
+    // don't reset to baseline."
+    resetSpinStartUI(player, scene, ctx) {
+      if (!ctx.inFeature) return false;
+      const carry = player.feature.emptyCountCarry || 0;
+      updateMultiplierBar(multForEmpties(carry), carry);
+      return true;
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Each flower has a colour and starts with 1 – 4 petals.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• When a flower reaches 8 petals, it blooms and dissolves.
+• A Full Bloom pays its colour's base value × bet.
+
+Empty Dissolve
+• When a flower gives away all its petals, it dissolves.
+• Empty Dissolves grow the spin multiplier along a tier ladder:
+    1 empty → 2×   3 empties → 3×   6 empties → 5×   10 empties → 10×
+    every +5 empties beyond that → +5× more
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers.
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms or empties keep happening.
+
+Final Win
+• Final Win  =  Total Payout × Multiplier
+• Total Payout is the sum of every Full Bloom paid during the spin.
+
+The Feature
+• The spin multiplier does NOT reset between free spins — the tier
+  ladder keeps climbing from wherever the previous free spin ended.
+• Empty dissolves keep feeding the ladder across the whole run.
+• Each free spin's Final Win adds to the cumulative feature total.`
++ TRIGGER_RULES;
+    },
+    // Chain-style spin end: × reveal if the spin had a multiplier and
+    // a non-zero final win, otherwise just snap the win text. Then
+    // finalise status (cumulative inside feature, single-spin outside).
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { bet, baseWin, finalWin, mult } = ctx;
+      if (mult > 1 && finalWin > 0) {
+        await animateMultiplication(baseWin, finalWin);
+        if (finalWin >= bet) pulseWinPill();
+      } else {
+        updateWinText(finalWin, true);
+        if (finalWin > 0 && finalWin >= bet) pulseWinPill();
+      }
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+  },
+  alt2: {
+    key: 'alt2', name: 'Bloom Tiles', displayOrder: 0,
+    // Animator flag: every Full Bloom drops a multiplier tile on its
+    // cell + half-value echoes to neighbours.
+    dropsMultiplierTilesOnBloom: true,
+    populateRunOpts(player, runOpts) {
+      runOpts.cellMults = player.feature.cellMults;
+    },
+    applyFeatureResult(player, result) {
+      if (result.cellMults) player.feature.cellMults = result.cellMults;
+    },
+    getBuyFeatureLines(player, spins) {
+      return [`Multiplier tiles dropped during the feature PERSIST across all ${spins} spins.`];
+    },
+    // Tile-multiplier mode: running win counts up smoothly in the
+    // bottom status text on every dissolve. Inside the feature this
+    // is cumulative across all free spins.
+    onCascadeDissolve(player, scene, ev, ctx) {
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const displayWin = ctx.inFeature
+        ? (player.feature.totalWin || 0) + runningWin
+        : runningWin;
+      if (displayWin > 0) countUpStatusWin(displayWin);
+    },
+    // Tile-style spin end: NO × reveal (no global multiplier). Status
+    // bar already ticked up during the cascade — just finalise.
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { finalWin } = ctx;
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+    // Mid-feature scene rebuild: re-paint the accumulated cellMults
+    // tile badges so they survive the rebuild.
+    restoreFeatureGridState(player, scene, ctx) {
+      const cm = player.feature.cellMults;
+      if (!cm) return;
+      const { ROWS, COLS } = ctx;
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (cm[r][c] > 0) setCellTileBadge(r, c, cm[r][c], { skipEntry: true });
+        }
+      }
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Each flower has a colour and starts with 1 – 4 petals.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• When a flower reaches 8 petals, it blooms and pays its colour's base
+  value × bet.
+• Each bloom also DROPS a multiplier tile on its own cell and HALF of
+  that tile's value on all 8 adjacent cells (up, down, left, right and
+  diagonals). Tile values are randomly picked from:
+    4×   8×   10×   20×   50×   100×   500×
+• When more than one bloom spreads onto the same cell, the values SUM.
+
+Bloom on a Multiplier
+• If a later bloom happens on a cell that already has a multiplier, that
+  bloom's payout is multiplied by the cell's accumulated multiplier.
+• Multipliers persist on their cell for the rest of the spin — they don't
+  disappear after a bloom, so a new flower growing there can cash them in.
+
+Empty Dissolve
+• A flower that gives away all its petals just poofs away. In this mode
+  empties do NOT add multipliers — only blooms do.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers.
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms or empties keep happening.
+
+The Feature
+• The grid clears of any base-game tile multipliers when the feature
+  begins.
+• Multiplier tiles dropped during the feature PERSIST across every free
+  spin — every bloom keeps adding to the cells, and a later bloom on
+  a tiled cell pays at the accumulated rate.`
++ TRIGGER_RULES;
+    },
+  },
+  alt3: {
+    key: 'alt3', name: 'Bloom Reels', displayOrder: 3,
+    // Animator flag: this mode resizes the grid mid-game (4×4 → 5×5
+    // → 6×6 on bloom; reset to 4×4 on new spin), so the spawn
+    // animation needs the shrink branch.
+    gridShrinksOnSpawn: true,
+    initFeatureState(player) {
+      player.feature.gridSizeCarry = GAME.ALT3_SIZES[0];
+      player.feature.bloomMult     = ALT3_FEATURE_MULT_START;
+    },
+    populateRunOpts(player, runOpts) {
+      runOpts.gridSizeStart      = player.feature.gridSizeCarry || GAME.ALT3_SIZES[0];
+      runOpts.alt3BloomMultStart = player.feature.bloomMult     || ALT3_FEATURE_MULT_START;
+      runOpts.alt3FeatureActive  = true;
+    },
+    applyFeatureResult(player, result) {
+      if (typeof result.alt3GridSizeEnd === 'number') {
+        player.feature.gridSizeCarry = result.alt3GridSizeEnd;
+      }
+      if (typeof result.alt3BloomMultEnd === 'number') {
+        player.feature.bloomMult = result.alt3BloomMultEnd;
+      }
+      player.feature.bloomCount = (player.feature.bloomCount || 0)
+                                + (result.alt3BloomCount || 0);
+    },
+    getBuyFeatureLines(player, spins) {
+      return [`Grid size and bloom multiplier carry across all ${spins} spins of the feature.`];
+    },
+    // Bloom multiplier pill: visible only during the feature, displays
+    // the current run-wide multiplier value.
+    refreshFeatureUI(player, scene) {
+      if (!scene.alt3MultPill) return;
+      const visible = !!player.feature.active;
+      scene.alt3MultPill.visible = visible;
+      if (visible && scene.alt3MultPill.valueText) {
+        const mult = player.feature.bloomMult || ALT3_FEATURE_MULT_START;
+        scene.alt3MultPill.valueText.text = `×${mult}`;
+      }
+    },
+    // Bumps the visible multiplier pill ONLY when the value actually
+    // changed — empty-only cascades emit a dissolve event with the
+    // unchanged multiplier, and we'd otherwise pulse the animation
+    // for nothing (reads as a false "you got a bloom" signal).
+    // Also updates the running-win status text (tile-mode style).
+    onCascadeDissolve(player, scene, ev, ctx) {
+      if (player.feature.active && scene.alt3MultPill
+          && typeof ev.alt3BloomMult === 'number') {
+        const pill = scene.alt3MultPill;
+        pill.visible = true;
+        if (pill.valueText) {
+          const newLabel = `×${ev.alt3BloomMult}`;
+          if (pill.valueText.text !== newLabel) {
+            pill.valueText.text = newLabel;
+            gsap.fromTo(pill.valueText.scale,
+              { x: 1.4, y: 1.4 },
+              { x: 1, y: 1, duration: 0.45, ease: 'elastic.out(1, 0.4)' });
+          }
+        }
+      }
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const displayWin = ctx.inFeature
+        ? (player.feature.totalWin || 0) + runningWin
+        : runningWin;
+      if (displayWin > 0) countUpStatusWin(displayWin);
+    },
+    // Bloom Reels uses tile-style status (running cascade win), but
+    // visually has its own multiplier pill — the × reveal animation
+    // is reserved for the chain-style modes that have a global mult
+    // applied at end-of-spin. So Bloom Reels matches alt2/alt4 here.
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { finalWin } = ctx;
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+    // Per-grid-size frame asset and an extra texture scale so every
+    // size renders with the same outer footprint as the 4×4 frame.
+    getActiveFrameTexture(rows) {
+      return frameTexturesBySize[rows] || frameTexturesBySize[4];
+    },
+    getFrameTexScale(rows) {
+      return alt3FrameScale(rows);
+    },
+    // Bloom Reels caps blooms at 6 petals (vs. 8 for other modes), so
+    // the paytable preview must show 6 petals.
+    getPaytablePreviewPetals() {
+      return GAME.ALT3_MAX_PETALS;
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• Spins start on a 4×4 grid of flower pots. Each flower has a colour and
+  starts with 1–3 petals.
+• Every cascade that produces a Full Bloom EXPANDS the grid by one row
+  and one column, anchored at the bottom-left corner:
+    4×4  →  5×5  →  6×6 (max)
+• Existing flowers stay in place; the freshly-revealed row (top) and
+  column (right) are filled with brand-new random flowers.
+• In the base game the grid resets to 4×4 at the start of every new spin.
+
+Transfers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Transfers keep going until no more can be made.
+
+Full Bloom
+• A flower blooms at 6 petals (instead of 8).
+• A Full Bloom pays its colour's base value × bet, and triggers the next
+  grid expansion (if the grid is below 6×6).
+
+Empty Dissolve
+• When a flower gives away all its petals, it dissolves with a puff.
+• Empty dissolves do NOT trigger expansions on their own.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers
+  (along with the new row/column when the grid grew this cascade).
+• Transfers run again on the new (possibly larger) grid; cascades keep
+  going as long as new blooms or empties happen.
+
+The Feature
+• The grid size DOES NOT reset between free spins — once the grid grows
+  to 5×5 or 6×6, it stays there for the rest of the feature.
+• A persistent BLOOM MULTIPLIER appears at the top of the grid:
+  – Starts at ×${ALT3_FEATURE_MULT_START}.
+  – Bumps +×${ALT3_FEATURE_MULT_STEP} every time a flower fully blooms (across every cascade,
+    every free spin — it never resets until the feature ends).
+  – Multiplies every Full Bloom payout for the rest of the feature.`
++ TRIGGER_RULES;
+    },
+  },
+  alt4: {
+    key: 'alt4', name: 'Bloom Wilds', displayOrder: 1,
+    // Same as Bloom Tiles: blooms drop multiplier tiles.
+    dropsMultiplierTilesOnBloom: true,
+    populateRunOpts(player, runOpts) {
+      runOpts.cellMults = player.feature.cellMults;
+    },
+    applyFeatureResult(player, result) {
+      if (result.cellMults) player.feature.cellMults = result.cellMults;
+    },
+    getBuyFeatureLines(player, spins) {
+      return [`Multiplier tiles dropped during the feature PERSIST across all ${spins} spins.`];
+    },
+    // Same tile-mode running win as Bloom Tiles.
+    onCascadeDissolve(player, scene, ev, ctx) {
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const displayWin = ctx.inFeature
+        ? (player.feature.totalWin || 0) + runningWin
+        : runningWin;
+      if (displayWin > 0) countUpStatusWin(displayWin);
+    },
+    // Same tile-style spin end as Bloom Tiles.
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { finalWin } = ctx;
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+    // Same cellMults tile re-paint as Bloom Tiles.
+    restoreFeatureGridState(player, scene, ctx) {
+      const cm = player.feature.cellMults;
+      if (!cm) return;
+      const { ROWS, COLS } = ctx;
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (cm[r][c] > 0) setCellTileBadge(r, c, cm[r][c], { skipEntry: true });
+        }
+      }
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
+• Some pots spawn as WILDs — pots holding 4–8 mixed-colour petals.
+
+Transfers — Regular Flowers
+• Adjacent same-colour flowers exchange petals — a petal moves from one
+  flower to a same-colour neighbour to its right or directly below.
+• Regular flowers do NOT send petals into a WILD.
+
+Transfers — WILDs
+• WILDs only SEND OUT petals; they never receive.
+• Each cascade, a WILD picks one of its petals and sends it to the
+  NEAREST cell (Manhattan distance, grid-wide) of that petal's colour.
+• When a WILD runs out of petals, it dissolves with a puff and a new
+  flower drops in to take its place.
+
+Full Bloom
+• When a regular flower reaches 8 petals, it blooms and pays its
+  colour's base value × bet.
+• WILDs never bloom — they only ever drain.
+• Each bloom also DROPS a multiplier tile on its own cell and HALF of
+  that tile's value on all 8 adjacent cells. Tile values are randomly
+  picked from:
+    4×   8×   10×   20×   50×   100×   500×
+• When more than one bloom spreads onto the same cell, the values SUM.
+
+Bloom on a Multiplier
+• If a later bloom happens on a cell that already has a multiplier, that
+  bloom's payout is multiplied by the cell's accumulated multiplier.
+• Multipliers persist on their cell for the rest of the spin.
+
+Cascades
+• Dissolved cells are refilled from above with fresh random flowers
+  (which can include new WILDs).
+• Transfers run again on the new grid; cascades continue as long as
+  new blooms, empties, or WILD-dissolves keep happening.
+
+The Feature
+• Multiplier tiles dropped during the feature PERSIST across every free
+  spin — they only reset when the feature ends.
+• WILDs continue to spawn naturally during free spins, feeding tile
+  values into the grid as they drain.`
++ TRIGGER_RULES;
+    },
+  },
+  alt5: {
+    key: 'alt5', name: 'Bloom Ripple', displayOrder: 4,
+    // Animator feature flags: ripple petals fly to GRID CELLS (so
+    // heal must skip those cells) and sympathy tracers play.
+    routesRipplesToGridCells: true,
+    playsSympathyTracers:     true,
+    initFeatureState(player) {
+      player.feature.alt5Progress = _alt5BlankProgress();
+    },
+    populateRunOpts(player, runOpts) {
+      runOpts.alt5FeatureActive = true;
+      runOpts.alt5Progress      = player.feature.alt5Progress || _alt5BlankProgress();
+    },
+    applyFeatureResult(player, result) {
+      player.feature._alt5PendingProgress = result.alt5Progress || null;
+      player.feature._alt5RewardsThisSpin = result.alt5Rewards || [];
+    },
+    // Commit pending progression state once the bar animation has
+    // caught up with the engine.
+    commitFeatureResult(player, finalResult, bet) {
+      if (player.feature._alt5PendingProgress) {
+        player.feature.alt5Progress = player.feature._alt5PendingProgress;
+        player.feature._alt5PendingProgress = null;
+      }
+    },
+    // If the progression bar hit a reward marker during this spin,
+    // pause the auto-spin chain on a celebratory popup. On OK we
+    // grant bonus spins, advance the bar's reward index, and bump
+    // the per-bloom multiplier. Engine caps at one phase per spin
+    // so `rewards` typically holds at most one entry; sum-and-take-
+    // latest is a safety net.
+    tryOpenFeatureRewardPopup(player, kickNextSpin) {
+      const rewards = player.feature._alt5RewardsThisSpin;
+      if (!rewards || !rewards.length) return false;
+      player.feature._alt5RewardsThisSpin = [];
+      const totalSpins     = rewards.reduce((s, r) => s + (r.spins || 0), 0);
+      const latestMult     = rewards[rewards.length - 1].mult;
+      const rewardAdvances = rewards.length;
+      openAlt5ProgressionRewardModal(totalSpins, latestMult, () => {
+        player.feature.spinsLeft += totalSpins;
+        if (player.feature.alt5Progress) {
+          player.feature.alt5Progress.rewardIdx += rewardAdvances;
+          player.feature.alt5Progress.bloomMult  = latestMult;
+        }
+        refreshFeatureUI();
+        kickNextSpin();
+      });
+      return true;
+    },
+    getBuyFeatureLines(player, spins) {
+      return [
+        `A vertical progression bar fills as petal transfers happen during the feature.`,
+        `Reaching each marker awards more free spins and a bigger bloom multiplier.`,
+        `Reach the top marker for the maximum reward.`,
+      ];
+    },
+    // Progression bar: visible only during the feature. Intentionally
+    // does NOT `_restore` — that's a destructive snap that would wipe
+    // petals lit by the animator's per-landing advances mid-spin. The
+    // bar is restored only at scene-rebuild time (in buildScene).
+    refreshFeatureUI(player, scene) {
+      if (!scene.alt5ProgressBar) return;
+      scene.alt5ProgressBar.visible = !!player.feature.active;
+    },
+    // Same chain-style running win as Bloom Chain — BLOOM WIN pill
+    // is ticked by per-bloom flights, only the cumulative status
+    // text updates here (and only inside the feature).
+    onCascadeDissolve(player, scene, ev, ctx) {
+      if (!ctx.inFeature) return;
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const baseline   = player.feature.totalWin || 0;
+      updateStatusText(`WIN ${fmtCurrency(baseline + runningWin)}`);
+    },
+    // Same chain-style end as Bloom Chain.
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { bet, baseWin, finalWin, mult } = ctx;
+      if (mult > 1 && finalWin > 0) {
+        await animateMultiplication(baseWin, finalWin);
+        if (finalWin >= bet) pulseWinPill();
+      } else {
+        updateWinText(finalWin, true);
+        if (finalWin > 0 && finalWin >= bet) pulseWinPill();
+      }
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• 4 × 5 grid. Each pot holds a coloured flower with 1–4 petals.
+
+Transfers
+• Same-colour neighbours pass petals until no more moves are possible.
+
+Full Bloom
+• A pot at 8 petals blooms and pays its colour's base value × bet.
+
+Ripple
+• 40% chance per bloom: spawns 1–4 stray petals in random colours.
+• Each stray flies to a random same-colour pot with room and adds 1 petal.
+• If no same-colour pot has room, the petal vanishes.
+
+Chain Blooms
+• A stray that pushes a pot to 8 blooms next cascade. Chains can roll on.
+
+Empty Dissolve
+• A pot that loses all its petals just puffs away. Empties don't ripple.
+
+The Feature
+• A 12-square PROGRESSION BAR appears above the grid:
+    Squares  1– 3  │  Empty pots — 16 petals each (any colour)
+    Square      4  │  REWARD: +5 FREESPINS, all blooms pay ×5
+    Squares  5– 7  │  Empty pots — 16 petals each
+    Square      8  │  REWARD: +10 FREESPINS, all blooms pay ×10
+    Squares  9–11  │  Empty pots — 16 petals each
+    Square     12  │  REWARD: +12 FREESPINS, all blooms pay ×25
+• Every petal that lands during a transfer fills the active pot one
+  petal at a time — regular cluster transfers AND ripple-petal landings
+  both count, regardless of colour.
+• When a row of three pots fills, the next reward square activates with
+  a popup awarding free spins + a new bloom multiplier. The bar then
+  starts filling the next row.
+• Ripple chance climbs to 60% during the feature, with 8 stray petals
+  per ripple. Every bloom also has a 50% chance to fire a SYMPATHY bloom
+  (a random same-colour pot anywhere on the grid blooms alongside the
+  original). A bloom fires Ripple OR Sympathy, never both.
+• Reach square 12 for the maximum: ×25 on every bloom for the rest of
+  the run.`
++ TRIGGER_RULES;
+    },
+  },
+  alt6: {
+    key: 'alt6', name: 'Bloom Jackpot', displayOrder: 5,
+    initFeatureState(player) {
+      player.feature.alt6Jackpots = _alt6BlankJackpots();
+    },
+    populateRunOpts(player, runOpts) {
+      runOpts.alt6FeatureActive = true;
+      runOpts.alt6Jackpots      = player.feature.alt6Jackpots || _alt6BlankJackpots();
+    },
+    applyFeatureResult(player, result) {
+      player.feature._alt6PendingJackpots     = result.alt6Jackpots || null;
+      player.feature._alt6JackpotPaysThisSpin = result.alt6JackpotPays || [];
+    },
+    // Commit pending pot state once the visual fill has caught up.
+    // Tier-payout cash is credited IMMEDIATELY by the animator at the
+    // moment the pots fill (see _alt6OnPotLanding), so we don't add
+    // it again here — that'd double-count.
+    commitFeatureResult(player, finalResult, bet) {
+      if (player.feature._alt6PendingJackpots) {
+        player.feature.alt6Jackpots = player.feature._alt6PendingJackpots;
+        player.feature._alt6PendingJackpots = null;
+      }
+    },
+    getBuyFeatureLines(player, spins) {
+      // Pulls live payouts from ALT6_JACKPOTS so the modal matches
+      // the actual game math (not stale hardcoded numbers).
+      const _b = player.bet || 1;
+      const tier = (key) => ALT6_JACKPOTS.find(j => j.tier === key);
+      const tinyP  = tier('tiny').payout  * _b;
+      const miniP  = tier('mini').payout  * _b;
+      const majorP = tier('major').payout * _b;
+      const grandP = tier('grand').payout * _b;
+      return [
+        `Four jackpot tiers above the grid each have TWO empty colour pots that fill with ripple petals.`,
+        `Fill BOTH pots in a tier to claim its cash jackpot — Tiny ${fmtCurrency(tinyP)}, Mini ${fmtCurrency(miniP)}, Major ${fmtCurrency(majorP)}, Grand ${fmtCurrency(grandP)}.`,
+        `All blooms pay ×5 throughout the feature.`,
+      ];
+    },
+    // Jackpot pots: visible only during the feature. Cash labels are
+    // refreshed so they reflect the locked feature bet (or current
+    // player bet if outside the feature).
+    refreshFeatureUI(player, scene) {
+      if (!scene.alt6JackpotPots) return;
+      scene.alt6JackpotPots.visible = !!player.feature.active;
+      if (scene.alt6JackpotPots._refreshAllPayLabels) {
+        const b = (player.feature && player.feature.lockedBet) || player.bet || 1;
+        scene.alt6JackpotPots._refreshAllPayLabels(b);
+      }
+    },
+    // Same chain-style running win as Bloom Ripple.
+    onCascadeDissolve(player, scene, ev, ctx) {
+      if (!ctx.inFeature) return;
+      const runningWin = ev.payoutTotal * ctx.bet;
+      const baseline   = player.feature.totalWin || 0;
+      updateStatusText(`WIN ${fmtCurrency(baseline + runningWin)}`);
+    },
+    // Same chain-style end as Bloom Chain.
+    async onSpinEnd(player, scene, finalResult, ctx) {
+      const { bet, baseWin, finalWin, mult } = ctx;
+      if (mult > 1 && finalWin > 0) {
+        await animateMultiplication(baseWin, finalWin);
+        if (finalWin >= bet) pulseWinPill();
+      } else {
+        updateWinText(finalWin, true);
+        if (finalWin > 0 && finalWin >= bet) pulseWinPill();
+      }
+      if (player.feature.active) {
+        player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
+        updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
+      } else if (finalWin > 0) {
+        updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
+      } else {
+        updateStatusText('Good luck!');
+      }
+    },
+    getRulesText(TRIGGER_RULES) {
+      return `The Grid
+• 4 × 5 grid. Each pot holds a coloured flower with 1–4 petals.
+
+Transfers / Full Bloom / Ripple
+• Same as Bloom Ripple: same-colour neighbours pass petals; a pot at
+  8 petals blooms; every bloom rolls a chance to spawn random-colour
+  stray petals (Ripple).
+
+The Feature
+• Four JACKPOT TIERS sit above the grid. Each tier has TWO empty
+  pots — one per colour — and each pot holds up to 8 petals:
+    TIER    Pots                          Pays (× bet)
+    TINY    Sky pot   + Pearl pot          ×5
+    MINI    Teal pot  + Lime pot           ×15
+    MAJOR   Magenta pot + Gold pot         ×100
+    GRAND   Scarlet pot + Indigo pot       ×1200
+• During free spins, every Ripple stray petal flies UP to its colour's
+  pot instead of landing on a grid cell.
+• A tier pays ONLY when BOTH of its pots are full (8 + 8 = 16 petals,
+  one full bloom of each colour). When that happens, the tier pays its
+  jackpot and BOTH pots reset to empty.
+• All blooms pay ×5 for the duration of the feature.
+• 50% sympathy chance per bloom (same as Bloom Ripple feature).
+• Jackpot pots reset to empty when a feature buy starts — fills DO NOT
+  carry across feature buys.
+• Tier hit rates per 15-spin feature buy:
+    TINY  ≈ 3 fills      MINI  ≈ 1 fill
+    MAJOR ≈ 1 in 7 buys  GRAND ≈ 1 in 67 buys`
++ TRIGGER_RULES;
+    },
+  },
+};
+
+function getModeDef() {
+  return MODE_DEF[ALT_MODE] || MODE_DEF.alt1;
+}
+
+// ─── PER-MODE SCENE WIDGET BUILDERS ──────────────────────────────────────────
+// `buildScene` calls `getModeDef().buildSceneFeatureWidget?.(scene, app, ctx)`
+// once, after the grid layout is known. Each mode owns its own widget
+// construction below — a 7th mode would just register an entry on
+// MODE_DEF.alt7 with its own builder. NO buildScene edits required.
+
+MODE_DEF.alt3.buildSceneFeatureWidget = function (scene, app, ctx) {
+  // Compact pill above the grid showing the persistent global bloom
+  // multiplier during the Bloom Reels feature. Only visible while
+  // the feature is active. Starts at ×2 and bumps +1 per Full Bloom.
+  // Text-driven sizing so "BLOOM MULT  ×88" etc. never clips.
+  const cont = new PIXI.Container();
+  cont.x = ctx.avalancheCX;
+
+  const label = new PIXI.Text('BLOOM MULT', {
+    fontFamily: FONT,
+    fontSize: 16 * ctx.gameScale,
+    fill: 0xFFECB3,
+    letterSpacing: 1.5,
+  });
+  const valueText = new PIXI.Text('×2', {
+    fontFamily: FONT,
+    fontSize: 32 * ctx.gameScale,
+    fill: 0xFFD54F,
+  });
+  const innerGap = 12 * ctx.gameScale;
+  const padX     = 22 * ctx.gameScale;
+  const contentW = label.width + innerGap + valueText.width;
+  const pillW    = Math.max(220 * ctx.gameScale, contentW + padX * 2);
+  const pillH    = 56 * ctx.gameScale;
+
+  const bg = new PIXI.Graphics();
+  bg.lineStyle(2 * ctx.gameScale, 0xFFD54F, 1);
+  bg.beginFill(0x2A1808, 0.95);
+  bg.drawRoundedRect(-pillW / 2, -pillH / 2, pillW, pillH, pillH * 0.45);
+  bg.endFill();
+  cont.addChild(bg);
+
+  const blockW    = contentW;
+  const blockLeft = -blockW / 2;
+  label.anchor.set(0, 0.5);
+  label.x = blockLeft;
+  label.y = 0;
+  cont.addChild(label);
+  valueText.anchor.set(0, 0.5);
+  valueText.x = blockLeft + label.width + innerGap;
+  valueText.y = -1 * ctx.gameScale;
+  cont.addChild(valueText);
+  cont.valueText = valueText;
+
+  cont.y = ctx.gridTop - 0.25 * pillH;
+  cont.visible = !!(player.feature.active);
+  if (cont.visible) {
+    valueText.text = `×${player.feature.bloomMult || ALT3_FEATURE_MULT_START}`;
+  }
+  scene.alt3MultPill = cont;
+  app.stage.addChild(cont);
+};
+
+
+MODE_DEF.alt5.buildSceneFeatureWidget = function (scene, app, ctx) {
+    const cont = new PIXI.Container();
+    const barW = Math.max(28, 38 * ctx.gameScale);
+    const barX = scene.gridBounds.right + Math.max(10, 16 * ctx.gameScale);
+    const barY = scene.gridBounds.top;
+    const barH = scene.gridBounds.bottom - scene.gridBounds.top;
+    cont.x = barX;
+    cont.y = barY;
+  
+    const maxThreshold = ALT5_MAX_THRESHOLD;
+  
+    // Outline + dim background.
+    const outline = new PIXI.Graphics();
+    outline.lineStyle(2 * ctx.gameScale, 0x6FD2FF, 0.95);
+    outline.beginFill(0x0A2A3E, 0.85);
+    outline.drawRoundedRect(0, 0, barW, barH, barW * 0.45);
+    outline.endFill();
+    cont.addChild(outline);
+  
+    // Live fill — drawn from bottom up. Inset 2px from outline so the
+    // outline edge stays visible.
+    const fillInset = 3 * ctx.gameScale;
+    const fillW     = barW - fillInset * 2;
+    const fillBaseY = barH - fillInset;
+    const fillMaxH  = barH - fillInset * 2;
+    const fill = new PIXI.Graphics();
+    cont.addChild(fill);
+  
+    // Smooth-tweened display value. Engine value can leap by 1 per
+    // landing but we tween the displayed fill so it looks fluid.
+    const fillState = { v: 0 };
+    const drawFill = () => {
+      const ratio = Math.max(0, Math.min(1, fillState.v / maxThreshold));
+      const h = fillMaxH * ratio;
+      fill.clear();
+      if (h > 0.5) {
+        // Hard-cornered rectangle so the top edge of the fill aligns
+        // exactly with the milestone marker lines — rounded corners
+        // made it ambiguous whether progress had crossed a marker.
+        fill.beginFill(0x6FD2FF, 0.92);
+        fill.drawRect(fillInset, fillBaseY - h, fillW, h);
+        fill.endFill();
+      }
+    };
+    drawFill();
+  
+    // Marker lines + reward labels (to the LEFT of the bar so we don't
+    // bleed off the canvas's right edge on narrow viewports).
+    const markers = [];
+    for (let i = 0; i < ALT5_REWARDS.length; i++) {
+      const r = ALT5_REWARDS[i];
+      const ratio = r.threshold / maxThreshold;
+      const my = fillBaseY - fillMaxH * ratio;
+  
+      const mark = new PIXI.Graphics();
+      cont.addChild(mark);
+  
+      // Two-line label on the RIGHT side of the bar — "+N FREESPINS"
+      // on top, "×M MULTIPLIER" underneath. Bigger than the petal
+      // labels so the reward reads at a glance.
+      const labelFs = Math.max(14, 19 * ctx.gameScale);
+      const label = new PIXI.Text(
+        `+${r.spins} FREESPINS\n×${r.mult} MULTIPLIER`,
+        {
+          fontFamily: FONT,
+          fontSize: labelFs,
+          fill: 0xFFECB3,
+          align: 'left',
+          stroke: 0x2A1808,
+          strokeThickness: Math.max(2, 3.5 * ctx.gameScale),
+          lineHeight: labelFs * 1.15,
+          letterSpacing: 0.4,
+        }
+      );
+      label.anchor.set(0, 0.5);   // left-anchored so it grows rightward
+      label.x = barW + Math.max(8, 12 * ctx.gameScale);
+      label.y = my;
+      label.alpha = 0.55;
+      cont.addChild(label);
+  
+      const m = { mark, label, y: my, threshold: r.threshold, activated: false };
+      const drawMarker = () => {
+        const lw = m.activated ? 3 * ctx.gameScale : 2 * ctx.gameScale;
+        const a  = m.activated ? 1 : 0.55;
+        const c  = m.activated ? 0xFFD54F : 0xFFE082;
+        m.mark.clear();
+        m.mark.lineStyle(lw, c, a);
+        m.mark.moveTo(0, m.y);
+        m.mark.lineTo(barW, m.y);
+      };
+      m._draw = drawMarker;
+      drawMarker();
+      markers.push(m);
+    }
+  
+    cont._fillState   = fillState;
+    cont._drawFill    = drawFill;
+    cont._markers     = markers;
+    cont._maxThresh   = maxThreshold;
+  
+    // Smoothly tween the bar fill toward `target`. Each landing calls
+    // _setFillTarget(currentEngineCount). gsap kills any in-flight
+    // tween so back-to-back landings chain naturally.
+    cont._setFillTarget = (target) => {
+      if (cont._fillTween) cont._fillTween.kill();
+      cont._fillTween = gsap.to(fillState, {
+        v: target,
+        duration: 0.35,
+        ease: 'power2.out',
+        onUpdate: drawFill,
+      });
+    };
+  
+    // Activate marker `idx` — bright gold + scale-pop on the label.
+    cont._activateMarker = (idx) => {
+      const m = markers[idx];
+      if (!m || m.activated) return;
+      m.activated = true;
+      m._draw();
+      m.label.alpha = 1;
+      gsap.fromTo(m.label.scale,
+        { x: 1.4, y: 1.4 },
+        { x: 1, y: 1, duration: 0.5, ease: 'back.out(2.4)' });
+    };
+  
+    // Snap-to-state for scene rebuild (mid-feature resize). Sets fill
+    // height + activates any markers that have already been crossed.
+    cont._restore = (progress) => {
+      if (!progress) return;
+      fillState.v = progress.transferCount || 0;
+      drawFill();
+      for (let i = 0; i < markers.length; i++) {
+        const m = markers[i];
+        const wasActivated = (i < progress.rewardIdx);
+        if (wasActivated && !m.activated) {
+          m.activated = true;
+          m._draw();
+          m.label.alpha = 1;
+        } else if (!wasActivated && m.activated) {
+          m.activated = false;
+          m._draw();
+          m.label.alpha = 0.55;
+        }
+      }
+    };
+  
+    cont.visible = !!(player.feature.active);
+    if (cont.visible && player.feature.alt5Progress) {
+      cont._restore(player.feature.alt5Progress);
+    }
+    scene.alt5ProgressBar = cont;
+    app.stage.addChild(cont);
+};
+
+MODE_DEF.alt6.buildSceneFeatureWidget = function (scene, app, ctx) {
+    const cont = new PIXI.Container();
+    const gridLeftEdge  = scene.gridBounds.left;
+    const gridRightEdge = scene.gridBounds.right;
+    const rowW = (gridRightEdge - gridLeftEdge);
+    const gap  = Math.max(4, 8 * ctx.gameScale);
+    const slotW = (rowW - gap * (ALT6_JACKPOTS.length - 1)) / ALT6_JACKPOTS.length;
+    // Taller widget — needs vertical space for the two pot-shaped
+    // containers and the petals piling inside them.
+    const slotH = Math.max(120, 160 * ctx.gameScale);
+  
+    cont.x = gridLeftEdge;
+    cont.y = ctx.gridTop - slotH - Math.max(8, 12 * ctx.gameScale);
+  
+    const slots = [];
+    for (let i = 0; i < ALT6_JACKPOTS.length; i++) {
+      const def = ALT6_JACKPOTS[i];
+      const sx = i * (slotW + gap);
+      const slot = new PIXI.Container();
+      slot.x = sx; slot.y = 0;
+  
+      // Pot background frame.
+      const bg = new PIXI.Graphics();
+      const drawBg = (highlight) => {
+        bg.clear();
+        bg.lineStyle(2 * ctx.gameScale, highlight ? 0xFFD54F : 0x6B4521, 0.95);
+        bg.beginFill(highlight ? 0x3D2A0E : 0x1F1409, 0.95);
+        bg.drawRoundedRect(0, 0, slotW, slotH, 8 * ctx.gameScale);
+        bg.endFill();
+      };
+      drawBg(false);
+      slot.addChild(bg);
+  
+      // Tier label (TINY / MINI / MAJOR / GRAND).
+      const tierTxt = new PIXI.Text(def.label, {
+        fontFamily: FONT,
+        fontSize: Math.max(11, 14 * ctx.gameScale),
+        fill: 0xFFD54F,
+        stroke: 0x2A1808,
+        strokeThickness: Math.max(1, 2 * ctx.gameScale),
+        letterSpacing: 1.2,
+      });
+      tierTxt.anchor.set(0.5, 0);
+      tierTxt.x = slotW / 2;
+      tierTxt.y = 4 * ctx.gameScale;
+      slot.addChild(tierTxt);
+  
+      // Payout — shown as a CASH value (× current bet), not a multiplier.
+      // Updated on demand via slot._refreshPayLabel(bet) when the bet
+      // changes (e.g. at feature start with the locked bet).
+      const payTxt = new PIXI.Text('', {
+        fontFamily: FONT,
+        fontSize: Math.max(16, 22 * ctx.gameScale),
+        fill: 0x6FD2FF,
+        stroke: 0x0A2A3E,
+        strokeThickness: Math.max(1.5, 3 * ctx.gameScale),
+      });
+      payTxt.anchor.set(0.5, 0.5);
+      payTxt.x = slotW / 2;
+      // Sit the payout right below the tier label (no big empty gap)
+      // and well clear of the pots beneath.
+      payTxt.y = slotH * 0.20;
+      slot.addChild(payTxt);
+  
+      // Two color pots side-by-side — actual pot-shaped containers
+      // that fill with stylized petal blobs as ripples land. Tier
+      // fills (and pays) only when BOTH pots reach potCapacity (AND-
+      // fill model).
+      const NCOLS = def.colors.length;
+      const innerPadX = 8 * ctx.gameScale;
+      // Pots start below tier label + payout text (which now sits at
+      // slotH * 0.20). 0.32 leaves a small breathing gap.
+      const innerPadTop = slotH * 0.32;
+      const innerPadBot = 14 * ctx.gameScale;        // leave room for color label
+      const potGap = 6 * ctx.gameScale;
+      const innerW = slotW - innerPadX * 2;
+      const potOuterW = (innerW - potGap * (NCOLS - 1)) / NCOLS;
+      const potTop = innerPadTop;
+      const potOuterH = slotH - innerPadTop - innerPadBot;
+      const cap    = def.potCapacity;
+  
+      const colorPots = {};
+      // pot.png is 400×467 with the rim ~y=80, body bulge centered
+      // around y=240, base ~y=400 (shadow extends to y=467). When
+      // anchored at (0.5, 0.43) — same as grid pots — (0,0) sits at
+      // the body center. We size by setting height to potOuterH and
+      // letting width follow aspect.
+      for (let c = 0; c < NCOLS; c++) {
+        const colorName = def.colors[c];
+        const px = innerPadX + c * (potOuterW + potGap);
+        const cx = px + potOuterW / 2;
+        const cy = potTop + potOuterH * 0.45;
+  
+        // Pot sprite — uses the real pot.png art (asset is 400×467,
+        // aspect ≈ 0.857). Set width/height DIRECTLY (in px) instead
+        // of via scale — PIXI handles the underlying transform and
+        // we avoid any texture-load timing weirdness with .width/.height.
+        const POT_AR = 400 / 467;        // hard fact about pot.png
+        const potSprite = new PIXI.Sprite(potTexture);
+        potSprite.anchor.set(0.5, 0.43);
+        const fitByH = potOuterH * 0.95;
+        const fitByW = potOuterW * 0.95 / POT_AR;
+        const potDispH = Math.min(fitByH, fitByW);
+        const potDispW = potDispH * POT_AR;
+        potSprite.height = potDispH;
+        potSprite.width  = potDispW;
+        potSprite.x = cx;
+        potSprite.y = cy;
+        slot.addChild(potSprite);
+  
+        // Petal layer sits at the SAME local origin as the pot sprite
+        // (cx, cy) so radial-arranged petals (anchored at their base)
+        // pivot from the pot's body center — identical to how grid
+        // FlowerSymbols lay out their blooms.
+        const petalLayer = new PIXI.Container();
+        petalLayer.x = cx;
+        petalLayer.y = cy;
+        slot.addChild(petalLayer);
+  
+        // Color name label below pot.
+        const lbl = new PIXI.Text(colorName, {
+          fontFamily: FONT,
+          fontSize: Math.max(9, 11 * ctx.gameScale),
+          fill: hexToNumber(COLOR_BY_NAME[colorName].hex),
+          stroke: 0x2A1808,
+          strokeThickness: Math.max(1, 1.2 * ctx.gameScale),
+        });
+        lbl.anchor.set(0.5, 1);
+        lbl.x = cx;
+        lbl.y = slotH - 2 * ctx.gameScale;
+        slot.addChild(lbl);
+  
+        // Pot body bowl — interior region where petals visually pile.
+        // Now derived from the explicit potDispW/H we set above.
+        const spriteTop    = cy - potDispH * 0.43;
+        const spriteBottom = cy + potDispH * 0.57 - potDispH * 0.20;
+        const interior = {
+          cx,
+          top:    spriteTop + potDispH * 0.04,
+          bottom: spriteBottom,
+          widthAtTop:    potDispW * 0.62,
+          widthAtBottom: potDispW * 0.50,
+        };
+  
+        // Per-pot uniform scale, derived from the pot art's natural
+        // height — matches FlowerSymbol's `_scale = cellSize / 540`
+        // pattern so jackpot petals look proportionally identical to
+        // grid petals (same petal:pot size ratio).
+        const potScale = potDispH / 467;
+  
+        colorPots[colorName] = {
+          color: colorName,
+          petalLayer,
+          interior,
+          potScale,
+          count: 0,
+          centerX: cx,
+          centerY: cy - potDispH * 0.10,
+        };
+      }
+  
+      const s = {
+        cont: slot,
+        bg, drawBg,
+        tierTxt, payTxt,
+        slotW, slotH,
+        capacity: cap,
+        payout:   def.payout,
+        tier:     def.tier,
+        colors:   def.colors.slice(),
+        pots:     colorPots,
+      };
+      s._refreshPayLabel = (bet) => {
+        s.payTxt.text = fmtCurrency(s.payout * (bet || 1));
+      };
+      // Petal sprite — same conventions as grid FlowerSymbol's
+      // `_layoutPetals`: anchor at the petal BASE (0.5, 0.95) so it
+      // pivots from the flower's center, uniform `scale.set(s, s)`
+      // matched to the pot's height ratio. Placed at (0, 0) of the
+      // petalLayer (which sits at the pot's body center) and rotated
+      // by the petal angle.
+      const _makePetalSprite = (colorName, scale) => {
+        const tex = petalTextures[colorName];
+        const sp = new PIXI.Sprite(tex);
+        sp.anchor.set(0.5, 0.95);
+        sp.scale.set(scale, scale);
+        return sp;
+      };
+  
+      // Petal angles match grid 8-petal mode: 0°, 45°, 90°, 135°,
+      // 180°, 225°, 270°, 315°. Each successive landing fills the
+      // next radial position, so a full 8-petal pot looks like a
+      // complete flower bloom.
+      const _petalAngle = (k) => k * Math.PI / 4;
+  
+      s._setColorCount = (colorName, n) => {
+        const pot = s.pots[colorName];
+        if (!pot) return;
+        const clamped = Math.max(0, Math.min(cap, n | 0));
+        const prev = pot.count;
+        pot.count = clamped;
+  
+        // Shrinking (payAndReset) — drop trailing petals.
+        if (clamped < prev) {
+          while (pot.petalLayer.children.length > clamped) {
+            const last = pot.petalLayer.children[pot.petalLayer.children.length - 1];
+            pot.petalLayer.removeChild(last);
+            last.destroy();
+          }
+          return;
+        }
+        // Growing — add petals at fixed radial angles around the
+        // pot's center so the pot fills into a full flower bloom.
+        for (let k = pot.petalLayer.children.length; k < clamped; k++) {
+          const sp = _makePetalSprite(pot.color, pot.potScale);
+          sp.x = 0;
+          sp.y = 0;
+          sp.rotation = _petalAngle(k);
+          pot.petalLayer.addChild(sp);
+        }
+      };
+      s._setCounts = (countsByColor) => {
+        if (!countsByColor) return;
+        for (const c of s.colors) {
+          if (countsByColor[c] != null) s._setColorCount(c, countsByColor[c]);
+        }
+      };
+      s._pulsePot = (colorName) => {
+        const pot = s.pots[colorName];
+        if (!pot || pot.count <= 0) return;
+        // Pop the most-recently-added petal so the player sees *which*
+        // petal just landed. Pulse MULTIPLICATIVELY around the petal's
+        // current scale (which is small — driven by targetWidthPx /
+        // PETAL_W). Earlier this used absolute {x:1,y:1} which left
+        // the petal at FULL asset size after the animation finished —
+        // hence the giant teardrops covering the pots.
+        const last = pot.petalLayer.children[pot.petalLayer.children.length - 1];
+        if (!last) return;
+        const baseSx = last.scale.x;
+        const baseSy = last.scale.y;
+        gsap.fromTo(last.scale,
+          { x: baseSx * 1.6, y: baseSy * 1.6 },
+          { x: baseSx, y: baseSy, duration: 0.32, ease: 'back.out(2.4)' });
+      };
+      s._payAndReset = () => {
+        // Tier filled — gold flash on bg + payout text pop, then both
+        // color pots zero out together.
+        drawBg(true);
+        gsap.fromTo(s.payTxt.scale,
+          { x: 1.7, y: 1.7 },
+          { x: 1, y: 1, duration: 0.60, ease: 'back.out(2.4)' });
+        gsap.delayedCall(0.60, () => drawBg(false));
+        for (const c of s.colors) s._setColorCount(c, 0);
+      };
+      cont.addChild(slot);
+      slots.push(s);
+    }
+  
+    cont._slots = slots;
+    cont._restore = (jackpots) => {
+      if (!jackpots) return;
+      for (let i = 0; i < slots.length; i++) {
+        const j = jackpots[i];
+        if (j && j.counts) slots[i]._setCounts(j.counts);
+        else {
+          const zero = {};
+          for (const c of slots[i].colors) zero[c] = 0;
+          slots[i]._setCounts(zero);
+        }
+      }
+    };
+    cont._refreshAllPayLabels = (bet) => {
+      for (const s of slots) s._refreshPayLabel(bet);
+    };
+    // Prime the cash labels with the active bet (locked feature bet
+    // takes precedence, otherwise current player bet).
+    cont._refreshAllPayLabels(
+      (player.feature && player.feature.lockedBet) || player.bet || 1
+    );
+    cont.visible = !!(player.feature.active);
+    if (cont.visible && player.feature.alt6Jackpots) {
+      cont._restore(player.feature.alt6Jackpots);
+    }
+    scene.alt6JackpotPots = cont;
+    app.stage.addChild(cont);
+};
+MODE_DEF.alt1.buildSceneFeatureWidget = function (scene, app, ctx) {
+  // BLOOM WIN / MULTIPLIER pill — large split pill at the top of the
+  // grid, overlapping by 25% of its own height. Permanent (both
+  // halves always on).
+  scene.winPill = makeSplitPill({
+    x: ctx.avalancheCX,
+    y: ctx.avalancheCY,
+    width: ctx.avalanchePillW,
+    height: ctx.avalanchePillH,
+    leftLabel:  'BLOOM WIN',
+    leftValue:  fmtCurrency(0),
+    leftAccent: 0x7FE080,
+    rightLabel: 'MULTIPLIER',
+    rightValue: '–',
+    rightAccent: 0xFFD700,
+    permanent:  true,
+    labelFontSize: 17 * ctx.gameScale,
+    valueFontSize: 34 * ctx.gameScale,
+  });
+  app.stage.addChild(scene.winPill);
+};
+
 // Run a full spin. Accepts optional bet (default 1) — updates cumulative RTP
 // stats. Returns:
 //   { events, finalGrid, totalPayout, multiplier, finalWin, cascadeCount, bet, rtp }
 function runSpin(bet = 1, opts = {}) {
   const events = [];
   const hooks = getModeHooks();
-  // Reset the alt-4 WILD counter so each spin can spawn at most one
-  // WILD across its initial grid + every refill.
-  _alt4WildsThisSpin = 0;
+  // Let the active mode reset any per-spin counters it owns (Bloom
+  // Wilds resets its WILD-quota here so each spin can spawn at most
+  // one WILD across its initial grid + every refill).
+  hooks.resetForSpin?.();
   // Scatter count: fresh grid per spin, so reset the live tally.
   // Scatters spawned during the spin (initial generate + refills) are
   // bounded by SCATTER_MAX_ON_GRID via spawnCell().
   _scattersOnGrid = 0;
-  // Alt-3 resets the grid size before spawning. This is mode-specific
-  // grid geometry (not economy) so it stays in runSpin, not hooks.
-  if (ALT_MODE === 'alt3') {
-    const start = (opts && typeof opts.gridSizeStart === 'number')
-      ? Math.min(opts.gridSizeStart,
-                 GAME.ALT3_SIZES[GAME.ALT3_SIZES.length - 1])
-      : GAME.ALT3_SIZES[0];
-    currentGridSize = start;
-    syncGameDimsForMode();
-  }
+  // Per-mode pre-spawn grid setup. Bloom Reels resets the grid size
+  // to its starting/feature-carry size before generating the grid.
+  // Other modes no-op.
+  hooks.setupGridForSpin?.(opts);
   let grid = generateGrid();
   events.push({ type: 'spawn', grid: cloneGrid(grid), gridSize: GAME.ROWS });
 
@@ -2020,27 +3394,15 @@ function runSpin(bet = 1, opts = {}) {
     // open up new regular transfers. Repeat until both phases are
     // stable at the same time.
     let { finalGrid, passes } = runTransfers(grid);
-    let cur = finalGrid;
-    if (ALT_MODE === 'alt4') {
-      for (let wpi = 0; wpi < GAME.MAX_TRANSFER_PASSES; wpi++) {
-        const { nextGrid, moves } = transferPass(cur, { kind: 'wild' });
-        if (moves.length === 0) break;
-        passes.push({
-          passIndex: passes.length,
-          moves,
-          gridAfter: cloneGrid(nextGrid),
-          kind: 'wild',
-        });
-        cur = nextGrid;
-        // After a wild petal lands, regulars may have new moves.
-        const reRun = runTransfers(cur);
-        for (const rp of reRun.passes) {
-          rp.passIndex = passes.length;
-          passes.push(rp);
-        }
-        cur = reRun.finalGrid;
-      }
-      finalGrid = cur;
+    // Per-mode extra transfer passes after the regular stabilisation.
+    // Bloom Wilds runs WILD-out-petal passes interleaved with regular
+    // re-stabilisations until both phases are stable. Other modes
+    // no-op and leave finalGrid as-is.
+    if (hooks.runExtraTransfers) {
+      const out = hooks.runExtraTransfers({
+        cur: finalGrid, passes, runTransfers, transferPass, cloneGrid,
+      });
+      if (out && out.finalGrid) finalGrid = out.finalGrid;
     }
 
     // Hook: mode-specific side effects from transfer moves (alt-4 WILDs
@@ -3810,7 +5172,10 @@ class SpinAnimator {
     // the player's eye registers them, which feels broken.
     const expectedSize  = ev.grid.length;
     const sceneSize     = this.scene.flowers.length;
-    const needsShrink   = (ALT_MODE === 'alt3' && expectedSize !== sceneSize);
+    // Only modes that resize the grid mid-game (Bloom Reels) need the
+    // shrink-on-spawn animation; for everyone else expectedSize ===
+    // sceneSize always.
+    const needsShrink   = (!!getModeDef().gridShrinksOnSpawn && expectedSize !== sceneSize);
 
     const bounds = this.scene.gridBounds;
     const cellH = this.scene.cells[0][0].h;
@@ -4519,8 +5884,13 @@ class SpinAnimator {
       // finish — adoptFlyingPetal will bring animator in line with
       // model at that point. Skipping these cells here prevents heal
       // from snapping the petal on early + spamming [heal] warnings.
+      // Modes that route ripple petals to grid cells (Bloom Ripple)
+      // need their target cells skipped during heal so we don't snap
+      // the petal in early. Bloom Jackpot routes ripples to jackpot
+      // pots (rp.target is null), so it has nothing to skip even
+      // though it also emits ripplePetals.
       const rippleSkip = new Set();
-      if (ALT_MODE === 'alt5' && ev.ripplePetals) {
+      if (getModeDef().routesRipplesToGridCells && ev.ripplePetals) {
         for (const rp of ev.ripplePetals) {
           if (rp.target) rippleSkip.add(`${rp.target.r},${rp.target.c}`);
         }
@@ -4543,12 +5913,15 @@ class SpinAnimator {
       }
     }
 
-    // Alt-5 feature: sympathy blooms get a distinctive pre-bloom moment —
-    // a golden tracer streaks from the original bloom to the sympathy cell
-    // and the cell flashes, so the player can see the causal link before
-    // the sympathy bloom animation starts. The bloom itself plays on the
-    // same timeline as the originals right after.
-    if (ALT_MODE === 'alt5' && ev.sympathyBlooms && ev.sympathyBlooms.length) {
+    // Sympathy blooms get a distinctive pre-bloom moment — a golden
+    // tracer streaks from the original bloom to the sympathy cell and
+    // the cell flashes, so the player can see the causal link before
+    // the sympathy bloom animation starts. The bloom itself plays on
+    // the same timeline as the originals right after. Only modes that
+    // opt in (Bloom Ripple) play these tracers; Bloom Jackpot also
+    // emits sympathy blooms but doesn't currently show the tracer FX.
+    if (getModeDef().playsSympathyTracers
+        && ev.sympathyBlooms && ev.sympathyBlooms.length) {
       for (const sb of ev.sympathyBlooms) this._spawnSympathyTracer(sb);
     }
 
@@ -4600,11 +5973,10 @@ class SpinAnimator {
     // finishes. `_playRipple` awaits the RIPPLE banner beat + every
     // petal flight so the gravity / refill events queued after dissolve
     // don't start until the ripple has fully resolved on screen.
-    // Both alt-5 (Bloom Ripple) and alt-6 (Bloom Jackpot) emit
-    // `ev.ripplePetals` — alt-5 routes them to grid cells, alt-6 routes
-    // them to jackpot pots. Same animator entry point.
-    if ((ALT_MODE === 'alt5' || ALT_MODE === 'alt6')
-        && ev.ripplePetals && ev.ripplePetals.length) {
+    // `ev.ripplePetals` is only emitted by modes whose engine hooks
+    // populate it (Bloom Ripple → grid cells; Bloom Jackpot → jackpot
+    // pots). The presence of the field IS the discriminator.
+    if (ev.ripplePetals && ev.ripplePetals.length) {
       await this._playRipple(ev);
     }
 
@@ -4978,20 +6350,19 @@ class SpinAnimator {
     const slot = (tIdx != null) ? pots._slots[tIdx] : null;
     if (!slot) { petal.destroy(); return; }
 
-    // Target = the pot's centre, in fxLayer-local coords.
+    // Target = the SPECIFIC color pot's centre inside this tier widget.
+    // Each tier has two color pots side-by-side; the petal flies into
+    // the one matching its color (AND-fill model needs each pot tracked
+    // separately).
     const slotCont = slot.cont;
-    const worldPos = slotCont.toGlobal(new PIXI.Point(slotCont.width  ? 0 : 0, 0));
-    // Use the slot container's position directly to find a screen point.
-    // The slot is at (sx, 0) inside `pots`, which is at (gridLeft, gridTop - rowH).
-    const slotGlobal = pots.toGlobal(new PIXI.Point(slotCont.x + 0, slotCont.y + 0));
-    // Centre of the slot rect.
-    const slotW = (slot.payTxt && slot.payTxt.x * 2) || 80;
-    const slotH = 90;
-    const slotCenterGlobal = pots.toGlobal(new PIXI.Point(
-      slotCont.x + slotW / 2,
-      slotCont.y + slotH / 2,
+    const colorPot = slot.pots[rp.color];
+    const targetX  = (colorPot ? colorPot.centerX : slot.slotW / 2);
+    const targetY  = (colorPot ? colorPot.centerY : slot.slotH / 2);
+    const endGlobal = pots.toGlobal(new PIXI.Point(
+      slotCont.x + targetX,
+      slotCont.y + targetY,
     ));
-    const endPos = this.scene.fxLayer.toLocal(slotCenterGlobal);
+    const endPos = this.scene.fxLayer.toLocal(endGlobal);
 
     const startX = petal.x, startY = petal.y;
     const midX   = (startX + endPos.x) / 2 + (_rng() - 0.5) * 40;
@@ -5031,21 +6402,36 @@ class SpinAnimator {
     });
   }
 
-  // Per-landing bookkeeping for an alt-6 jackpot pot. Pulses the pot's
-  // fill counter, advances it, and pops the payout if this landing was
-  // the one the engine queued as filling the pot.
+  // Per-landing bookkeeping for an alt-6 jackpot pot. Each landing
+  // bumps ONE color pot inside the tier widget. If after the bump
+  // every color pot is at capacity, the tier pays + both reset.
+  // (AND-fill model: tier pays only when both color pots are full.)
   _alt6OnPotLanding(slot, color) {
     if (!slot) return;
-    // The animator tracks per-pot fill in `slot.count`. Advance one
-    // and either show "+1 / N" or trigger the payout flourish.
-    const willFill = (slot.count + 1) >= slot.threshold;
-    if (willFill) {
+    const pot = slot.pots[color];
+    if (!pot) return;
+    // Cap per-pot count at capacity; surplus petals don't help fill
+    // (the *other* color pot has to catch up).
+    if (pot.count < slot.capacity) {
+      slot._setColorCount(color, pot.count + 1);
+      slot._pulsePot(color);
+    }
+    // Tier fills only when ALL color pots are at capacity.
+    let allFull = true;
+    for (const c of slot.colors) {
+      if (slot.pots[c].count < slot.capacity) { allFull = false; break; }
+    }
+    if (allFull) {
       slot._payAndReset();
-      // Float a "×N" pay text up from the pot.
       this._spawnAlt6PayoutText(slot);
-    } else {
-      slot._setCount(slot.count + 1);
-      slot._pulseFill();
+      // Credit the jackpot payout to the feature's running total
+      // IMMEDIATELY so the bottom WIN readout reflects the prize the
+      // moment the pots flash, not at end of spin.
+      const bet = (player.feature && player.feature.lockedBet)
+                  || player.bet || 1;
+      const cash = slot.payout * bet;
+      player.feature.totalWin = (player.feature.totalWin || 0) + cash;
+      updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
     }
   }
 
@@ -5053,8 +6439,8 @@ class SpinAnimator {
     const pots = this.scene.alt6JackpotPots;
     if (!pots) return;
     const slotCont = slot.cont;
-    const slotW = (slot.payTxt && slot.payTxt.x * 2) || 80;
-    const slotH = 90;
+    const slotW = slot.slotW || 80;
+    const slotH = slot.slotH || 90;
     const cx = pots.x + slotCont.x + slotW / 2;
     const cy = pots.y + slotCont.y + slotH / 2;
 
@@ -5161,14 +6547,10 @@ class SpinAnimator {
     const payoutAmount = (d.pay !== undefined)
       ? d.pay * this.currentBet
       : d.basePay * this.currentBet;
-    // Alt-1 (Chain): the payout flies to the BLOOM WIN side of the top
-    // pill, mirroring how empty pots fly to the MULTIPLIER side. When
-    // the text LANDS we tick the pill's BLOOM WIN value up by this
-    // bloom's pay — timed so the number change happens exactly as the
-    // "+N" lands, not earlier (via the dissolve event's bulk update,
-    // which we skip for alt-1 below). Every other mode keeps the
-    // classic float-up-and-fade over the bloom.
-    if (ALT_MODE === 'alt1') {
+    // Modes with a top-pill BLOOM WIN counter (Bloom Chain) fly the
+    // payout text to that pill and tick the pill on landing. Every
+    // other mode keeps the classic float-up-and-fade over the bloom.
+    if (getModeDef().winPillReceivesPayoutFlights) {
       spawnPayoutTextToWinPill(
         this.scene.fxLayer, fxPos.x, fxPos.y - 6, payoutAmount,
         () => {
@@ -5248,10 +6630,10 @@ class SpinAnimator {
       tl.to(flower.scale, { x: 0.05, y: 0.05, duration: T(0.35), ease: 'power2.in' }, T(1.65));
       tl.to(flower,       { alpha: 0,         duration: T(0.35), ease: 'power2.in' }, T(1.65));
     }).then(() => {
-      // Alt-2 / Alt-4: after the bloom animates away, drop its
-      // multiplier tile (big reveal at cell centre → shrink to corner)
-      // plus half-value echoes flying to all 8 adjacent cells.
-      if ((ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && d.newTile) {
+      // Modes that drop multiplier tiles on bloom (Bloom Tiles, Bloom
+      // Wilds): after the bloom animates away, play the tile-drop
+      // reveal + half-value echoes to neighbours.
+      if (getModeDef().dropsMultiplierTilesOnBloom && d.newTile) {
         return this._animateBloomMultiplierDrop(d);
       }
     });
@@ -6506,10 +7888,11 @@ function buildScene(L) {
   // when the grid expands — the animator's gridExpand handler rebuilds the
   // scene in-place rather than calling buildScene again.
   const ROWS = GAME.ROWS, COLS = GAME.COLS;
-  // Pick the correct frame asset for the current grid size in alt-3.
-  const activeFrameTexture = (ALT_MODE === 'alt3')
-    ? (frameTexturesBySize[ROWS] || frameTexturesBySize[4])
-    : frameTexture;
+  // Pick the correct frame asset for the current grid size. Bloom Reels
+  // swaps frame art per size (4×4 / 5×5 / 6×6); other modes use the
+  // shared default.
+  const activeFrameTexture = getModeDef().getActiveFrameTexture?.(ROWS)
+    || frameTexture;
 
   // ─── BACKGROUND ────────────────────────────────────────────────────────────
   // Flat color wash — no image. Color is set on the PIXI app backgroundColor,
@@ -6524,12 +7907,10 @@ function buildScene(L) {
   const gameScale = Math.min(L.sw / DESIGN_W, L.sh / DESIGN_H, 1.0);
   currentGameScale = gameScale;
 
-  // Dimensions. In alt-3 we apply an extra per-texture scale so every
-  // grid size renders with the SAME outer pixel footprint (locked to the
-  // 4×4 frame's dimensions). Cells inside naturally shrink as the count
-  // grows. Outside alt-3 the extra scale is 1.0.
-  const frameTexScale = (ALT_MODE === 'alt3')
-    ? alt3FrameScale(GAME.ROWS) : 1.0;
+  // Dimensions. Bloom Reels applies an extra per-texture scale so every
+  // grid size renders with the SAME outer pixel footprint (locked to
+  // the 4×4 frame's dimensions); other modes use 1.0.
+  const frameTexScale = getModeDef().getFrameTexScale?.(GAME.ROWS) ?? 1.0;
   const frameW  = activeFrameTexture.width  * gameScale * frameTexScale;
   const frameH  = activeFrameTexture.height * gameScale * frameTexScale;
   const logoScale = gameScale * 0.45;
@@ -6670,17 +8051,11 @@ function buildScene(L) {
   }
   app.stage.addChild(scene.tileBadgeLayer);
 
-  // If we're mid-feature and the scene is being rebuilt (resize, mode swap
-  // — though the mode swap is blocked during the feature), restore the
-  // accumulated tile multipliers so they survive the rebuild. This also
-  // redraws the cell tints behind the flowers via setCellTileBadge.
-  if ((ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && player.feature.active && player.feature.cellMults) {
-    const cm = player.feature.cellMults;
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        if (cm[r][c] > 0) setCellTileBadge(r, c, cm[r][c], { skipEntry: true });
-      }
-    }
+  // Mid-feature scene rebuild — give the active mode a chance to
+  // restore any persistent grid state it carries (Bloom Tiles and
+  // Bloom Wilds re-paint their accumulated cell-multiplier tiles).
+  if (player.feature.active) {
+    getModeDef().restoreFeatureGridState?.(player, scene, { ROWS, COLS });
   }
 
   // Grid mask — anything drawn to flowerLayer outside the cell grid area is
@@ -7262,412 +8637,31 @@ function buildScene(L) {
   //   pill centerY = pill bottom - pillH/2 = gridTop - 0.25 * pillH
   const avalancheCY = gridTop - 0.25 * avalanchePillH;
   const avalancheCX = (gridLeft + gridRight) / 2;
-  // The top "Bloom Win / Multiplier" pill is only used in Alt-1 (chain-
-  // multiplier mode). Alt-2 (tile-multiplier mode) multiplies per-bloom and
-  // counts running wins in the bottom status text instead.
-  if (ALT_MODE === 'alt1') {
-    scene.winPill = makeSplitPill({
-      x: avalancheCX,
-      y: avalancheCY,
-      width: avalanchePillW,
-      height: avalanchePillH,
-      leftLabel:  'BLOOM WIN',
-      leftValue:  fmtCurrency(0),
-      leftAccent: 0x7FE080,        // green for the win side
-      rightLabel: 'MULTIPLIER',
-      rightValue: '\u2013',
-      rightAccent: 0xFFD700,       // gold for the multiplier side
-      permanent:  true,
-      labelFontSize: 17 * gameScale,
-      valueFontSize: 34 * gameScale,
-    });
-    app.stage.addChild(scene.winPill);
-  } else {
-    scene.winPill = null;
-  }
-
-  // ─── ALT-3 FREE-SPIN MULTIPLIER PILL ────────────────────────────────────
-  // Compact pill above the grid that displays the persistent global bloom
-  // multiplier during Expanding Reels free spins. Only visible while the
-  // alt-3 feature is active. Starts at 2× and bumps +1× per Full Bloom.
-  scene.alt3MultPill = null;
-  if (ALT_MODE === 'alt3') {
-    // Build label + value first so we can size the pill to actually fit
-    // the longest label string ("BLOOM MULT  ×88" etc.). Text-driven
-    // sizing instead of a fixed pillW prevents any clipping.
-    const cont = new PIXI.Container();
-    cont.x = avalancheCX;
-
-    const label = new PIXI.Text('BLOOM MULT', {
-      fontFamily: FONT,
-      fontSize: 16 * gameScale,
-      fill: 0xFFECB3,
-      letterSpacing: 1.5,
-    });
-    const valueText = new PIXI.Text('×2', {
-      fontFamily: FONT,
-      fontSize: 32 * gameScale,
-      fill: 0xFFD54F,
-    });
-    const innerGap = 12 * gameScale;
-    const padX     = 22 * gameScale;
-    const contentW = label.width + innerGap + valueText.width;
-    const pillW    = Math.max(220 * gameScale, contentW + padX * 2);
-    const pillH    = 56 * gameScale;
-
-    const bg = new PIXI.Graphics();
-    bg.lineStyle(2 * gameScale, 0xFFD54F, 1);
-    bg.beginFill(0x2A1808, 0.95);
-    bg.drawRoundedRect(-pillW / 2, -pillH / 2, pillW, pillH, pillH * 0.45);
-    bg.endFill();
-    cont.addChild(bg);
-
-    // Lay out label + value as a single horizontal block, centred in the pill.
-    const blockW = contentW;
-    const blockLeft = -blockW / 2;
-    label.anchor.set(0, 0.5);
-    label.x = blockLeft;
-    label.y = 0;
-    cont.addChild(label);
-    valueText.anchor.set(0, 0.5);
-    valueText.x = blockLeft + label.width + innerGap;
-    valueText.y = -1 * gameScale;
-    cont.addChild(valueText);
-    cont.valueText = valueText;
-
-    // Position vertically using the actual pillH we just computed.
-    cont.y = gridTop - 0.25 * pillH;
-    cont.visible = !!(player.feature.active);
-    if (cont.visible) {
-      valueText.text = `×${player.feature.bloomMult || ALT3_FEATURE_MULT_START}`;
-    }
-    scene.alt3MultPill = cont;
-    app.stage.addChild(cont);
-  }
-
-  // ─── ALT-5 FREE-SPIN PROGRESSION BAR ────────────────────────────────────
-  // Vertical bar on the RIGHT edge of the grid. Visible only during the
-  // alt-5 feature. The bar fills from bottom to top as petal transfers
-  // happen (any colour counts). Three reward markers sit at the
-  // thresholds defined in ALT5_REWARDS — crossing one triggers a popup
-  // with bonus spins + a new bloom multiplier.
-  scene.alt5MultPill    = null;   // legacy reference; bar takes its place
+  // Default every per-mode feature widget to null. The active mode's
+  // `buildSceneFeatureWidget` hook (called below, after all layout
+  // vars are computed) will populate whichever it owns.
+  scene.winPill         = null;
+  scene.alt3MultPill    = null;
   scene.alt5ProgressBar = null;
-  if (ALT_MODE === 'alt5') {
-    const cont = new PIXI.Container();
-    const barW = Math.max(28, 38 * gameScale);
-    const barX = scene.gridBounds.right + Math.max(10, 16 * gameScale);
-    const barY = scene.gridBounds.top;
-    const barH = scene.gridBounds.bottom - scene.gridBounds.top;
-    cont.x = barX;
-    cont.y = barY;
+  scene.alt6JackpotPots = null;
 
-    const maxThreshold = ALT5_MAX_THRESHOLD;
+  // ─── ACTIVE MODE'S FEATURE WIDGET ───────────────────────────────────────
+  // Single dispatch — the active mode populates whichever feature
+  // widget(s) it owns (BLOOM WIN pill, multiplier pill, progression
+  // bar, jackpot pots, etc.). Modes that don't use this hook leave
+  // every scene.* feature widget at null (initialised above).
+  getModeDef().buildSceneFeatureWidget?.(scene, app, {
+    avalancheCX, avalancheCY, avalanchePillW, avalanchePillH,
+    gridTop, gridLeft, gridRight,
+    gameScale,
+  });
 
-    // Outline + dim background.
-    const outline = new PIXI.Graphics();
-    outline.lineStyle(2 * gameScale, 0x6FD2FF, 0.95);
-    outline.beginFill(0x0A2A3E, 0.85);
-    outline.drawRoundedRect(0, 0, barW, barH, barW * 0.45);
-    outline.endFill();
-    cont.addChild(outline);
-
-    // Live fill — drawn from bottom up. Inset 2px from outline so the
-    // outline edge stays visible.
-    const fillInset = 3 * gameScale;
-    const fillW     = barW - fillInset * 2;
-    const fillBaseY = barH - fillInset;
-    const fillMaxH  = barH - fillInset * 2;
-    const fill = new PIXI.Graphics();
-    cont.addChild(fill);
-
-    // Smooth-tweened display value. Engine value can leap by 1 per
-    // landing but we tween the displayed fill so it looks fluid.
-    const fillState = { v: 0 };
-    const drawFill = () => {
-      const ratio = Math.max(0, Math.min(1, fillState.v / maxThreshold));
-      const h = fillMaxH * ratio;
-      fill.clear();
-      if (h > 0.5) {
-        // Hard-cornered rectangle so the top edge of the fill aligns
-        // exactly with the milestone marker lines — rounded corners
-        // made it ambiguous whether progress had crossed a marker.
-        fill.beginFill(0x6FD2FF, 0.92);
-        fill.drawRect(fillInset, fillBaseY - h, fillW, h);
-        fill.endFill();
-      }
-    };
-    drawFill();
-
-    // Marker lines + reward labels (to the LEFT of the bar so we don't
-    // bleed off the canvas's right edge on narrow viewports).
-    const markers = [];
-    for (let i = 0; i < ALT5_REWARDS.length; i++) {
-      const r = ALT5_REWARDS[i];
-      const ratio = r.threshold / maxThreshold;
-      const my = fillBaseY - fillMaxH * ratio;
-
-      const mark = new PIXI.Graphics();
-      cont.addChild(mark);
-
-      // Two-line label on the RIGHT side of the bar — "+N FREESPINS"
-      // on top, "×M MULTIPLIER" underneath. Bigger than the petal
-      // labels so the reward reads at a glance.
-      const labelFs = Math.max(14, 19 * gameScale);
-      const label = new PIXI.Text(
-        `+${r.spins} FREESPINS\n×${r.mult} MULTIPLIER`,
-        {
-          fontFamily: FONT,
-          fontSize: labelFs,
-          fill: 0xFFECB3,
-          align: 'left',
-          stroke: 0x2A1808,
-          strokeThickness: Math.max(2, 3.5 * gameScale),
-          lineHeight: labelFs * 1.15,
-          letterSpacing: 0.4,
-        }
-      );
-      label.anchor.set(0, 0.5);   // left-anchored so it grows rightward
-      label.x = barW + Math.max(8, 12 * gameScale);
-      label.y = my;
-      label.alpha = 0.55;
-      cont.addChild(label);
-
-      const m = { mark, label, y: my, threshold: r.threshold, activated: false };
-      const drawMarker = () => {
-        const lw = m.activated ? 3 * gameScale : 2 * gameScale;
-        const a  = m.activated ? 1 : 0.55;
-        const c  = m.activated ? 0xFFD54F : 0xFFE082;
-        m.mark.clear();
-        m.mark.lineStyle(lw, c, a);
-        m.mark.moveTo(0, m.y);
-        m.mark.lineTo(barW, m.y);
-      };
-      m._draw = drawMarker;
-      drawMarker();
-      markers.push(m);
-    }
-
-    cont._fillState   = fillState;
-    cont._drawFill    = drawFill;
-    cont._markers     = markers;
-    cont._maxThresh   = maxThreshold;
-
-    // Smoothly tween the bar fill toward `target`. Each landing calls
-    // _setFillTarget(currentEngineCount). gsap kills any in-flight
-    // tween so back-to-back landings chain naturally.
-    cont._setFillTarget = (target) => {
-      if (cont._fillTween) cont._fillTween.kill();
-      cont._fillTween = gsap.to(fillState, {
-        v: target,
-        duration: 0.35,
-        ease: 'power2.out',
-        onUpdate: drawFill,
-      });
-    };
-
-    // Activate marker `idx` — bright gold + scale-pop on the label.
-    cont._activateMarker = (idx) => {
-      const m = markers[idx];
-      if (!m || m.activated) return;
-      m.activated = true;
-      m._draw();
-      m.label.alpha = 1;
-      gsap.fromTo(m.label.scale,
-        { x: 1.4, y: 1.4 },
-        { x: 1, y: 1, duration: 0.5, ease: 'back.out(2.4)' });
-    };
-
-    // Snap-to-state for scene rebuild (mid-feature resize). Sets fill
-    // height + activates any markers that have already been crossed.
-    cont._restore = (progress) => {
-      if (!progress) return;
-      fillState.v = progress.transferCount || 0;
-      drawFill();
-      for (let i = 0; i < markers.length; i++) {
-        const m = markers[i];
-        const wasActivated = (i < progress.rewardIdx);
-        if (wasActivated && !m.activated) {
-          m.activated = true;
-          m._draw();
-          m.label.alpha = 1;
-        } else if (!wasActivated && m.activated) {
-          m.activated = false;
-          m._draw();
-          m.label.alpha = 0.55;
-        }
-      }
-    };
-
-    cont.visible = !!(player.feature.active);
-    if (cont.visible && player.feature.alt5Progress) {
-      cont._restore(player.feature.alt5Progress);
-    }
-    scene.alt5ProgressBar = cont;
-    app.stage.addChild(cont);
-  }
 
   // ─── ALT-6 JACKPOT POTS (Bloom Jackpot feature) ───────────────────────────
   // Four pots in a row above the grid. Visible only during the alt-6
   // feature. Each pot accepts ripple stray petals of its assigned colours
   // and pays out when filled. The animator drives fill counts per landing
   // and triggers a payout flourish when a pot reaches its threshold.
-  scene.alt6JackpotPots = null;
-  if (ALT_MODE === 'alt6') {
-    const cont = new PIXI.Container();
-    const gridLeftEdge  = scene.gridBounds.left;
-    const gridRightEdge = scene.gridBounds.right;
-    const rowW = (gridRightEdge - gridLeftEdge);
-    const gap  = Math.max(4, 8 * gameScale);
-    const slotW = (rowW - gap * (ALT6_JACKPOTS.length - 1)) / ALT6_JACKPOTS.length;
-    const slotH = Math.max(64, 90 * gameScale);
-
-    cont.x = gridLeftEdge;
-    cont.y = gridTop - slotH - Math.max(8, 12 * gameScale);
-
-    const slots = [];
-    for (let i = 0; i < ALT6_JACKPOTS.length; i++) {
-      const def = ALT6_JACKPOTS[i];
-      const sx = i * (slotW + gap);
-      const slot = new PIXI.Container();
-      slot.x = sx; slot.y = 0;
-
-      // Pot background frame.
-      const bg = new PIXI.Graphics();
-      const drawBg = (highlight) => {
-        bg.clear();
-        bg.lineStyle(2 * gameScale, highlight ? 0xFFD54F : 0x6B4521, 0.95);
-        bg.beginFill(highlight ? 0x3D2A0E : 0x1F1409, 0.95);
-        bg.drawRoundedRect(0, 0, slotW, slotH, 8 * gameScale);
-        bg.endFill();
-      };
-      drawBg(false);
-      slot.addChild(bg);
-
-      // Tier label (TINY / MINI / MAJOR / GRAND).
-      const tierTxt = new PIXI.Text(def.label, {
-        fontFamily: FONT,
-        fontSize: Math.max(11, 14 * gameScale),
-        fill: 0xFFD54F,
-        stroke: 0x2A1808,
-        strokeThickness: Math.max(1, 2 * gameScale),
-        letterSpacing: 1.2,
-      });
-      tierTxt.anchor.set(0.5, 0);
-      tierTxt.x = slotW / 2;
-      tierTxt.y = 4 * gameScale;
-      slot.addChild(tierTxt);
-
-      // Payout — shown as a CASH value (× current bet), not a multiplier.
-      // Updated on demand via slot._refreshPayLabel(bet) when the bet
-      // changes (e.g. at feature start with the locked bet).
-      const payTxt = new PIXI.Text('', {
-        fontFamily: FONT,
-        fontSize: Math.max(16, 22 * gameScale),
-        fill: 0x6FD2FF,
-        stroke: 0x0A2A3E,
-        strokeThickness: Math.max(1.5, 3 * gameScale),
-      });
-      payTxt.anchor.set(0.5, 0.5);
-      payTxt.x = slotW / 2;
-      payTxt.y = slotH * 0.42;
-      slot.addChild(payTxt);
-
-      // Two small color swatches in a row, sitting between the payout
-      // and the count so the layout doesn't pile elements on top of
-      // each other.
-      const swatchY = slotH * 0.66;
-      const swR = Math.max(3, 4 * gameScale);
-      const swSpacing = swR * 2.4;
-      for (let c = 0; c < def.colors.length; c++) {
-        const colorName = def.colors[c];
-        const colorHex  = hexToNumber(COLOR_BY_NAME[colorName].hex);
-        const dot = new PIXI.Graphics();
-        dot.beginFill(colorHex, 1);
-        dot.drawCircle(0, 0, swR);
-        dot.endFill();
-        dot.lineStyle(1 * gameScale, 0x2A1808, 0.8);
-        dot.drawCircle(0, 0, swR);
-        const offset = (c - (def.colors.length - 1) / 2) * swSpacing;
-        dot.x = slotW / 2 + offset;
-        dot.y = swatchY;
-        slot.addChild(dot);
-      }
-
-      // Fill counter "N / threshold" — at the very bottom, below dots.
-      const cntTxt = new PIXI.Text(`0 / ${def.threshold}`, {
-        fontFamily: FONT,
-        fontSize: Math.max(10, 13 * gameScale),
-        fill: 0xFFECB3,
-        stroke: 0x2A1808,
-        strokeThickness: Math.max(1, 1.5 * gameScale),
-      });
-      cntTxt.anchor.set(0.5, 1);
-      cntTxt.x = slotW / 2;
-      cntTxt.y = slotH - 4 * gameScale;
-      slot.addChild(cntTxt);
-
-      const s = {
-        cont: slot,
-        bg, drawBg,
-        tierTxt, payTxt, cntTxt,
-        threshold: def.threshold,
-        payout:    def.payout,         // × bet → currency
-        tier:      def.tier,
-        count:     0,
-      };
-      s._refreshPayLabel = (bet) => {
-        s.payTxt.text = fmtCurrency(s.payout * (bet || 1));
-      };
-      s._setCount = (n) => {
-        s.count = n;
-        s.cntTxt.text = `${n} / ${s.threshold}`;
-      };
-      s._pulseFill = () => {
-        gsap.fromTo(s.cntTxt.scale,
-          { x: 1.4, y: 1.4 },
-          { x: 1, y: 1, duration: 0.32, ease: 'back.out(2.4)' });
-      };
-      s._payAndReset = () => {
-        // Bright gold flash + scale-pop on the payout text, then reset
-        // the counter to 0/threshold.
-        drawBg(true);
-        gsap.fromTo(s.payTxt.scale,
-          { x: 1.6, y: 1.6 },
-          { x: 1, y: 1, duration: 0.55, ease: 'back.out(2.4)' });
-        // Brief glow pulse on the bg, then back to normal.
-        gsap.delayedCall(0.55, () => drawBg(false));
-        s.count = 0;
-        s.cntTxt.text = `0 / ${s.threshold}`;
-      };
-      cont.addChild(slot);
-      slots.push(s);
-    }
-
-    cont._slots = slots;
-    cont._restore = (jackpots) => {
-      if (!jackpots) return;
-      for (let i = 0; i < slots.length; i++) {
-        const j = jackpots[i];
-        if (j) slots[i]._setCount(j.count | 0);
-        else   slots[i]._setCount(0);
-      }
-    };
-    cont._refreshAllPayLabels = (bet) => {
-      for (const s of slots) s._refreshPayLabel(bet);
-    };
-    // Prime the cash labels with the active bet (locked feature bet
-    // takes precedence, otherwise current player bet).
-    cont._refreshAllPayLabels(
-      (player.feature && player.feature.lockedBet) || player.bet || 1
-    );
-    cont.visible = !!(player.feature.active);
-    if (cont.visible && player.feature.alt6Jackpots) {
-      cont._restore(player.feature.alt6Jackpots);
-    }
-    scene.alt6JackpotPots = cont;
-    app.stage.addChild(cont);
-  }
 
   // ─── MECHANIC BUTTONS (top, centered) ────────────────────────────────────
   // Three buttons for the three mechanics — the active one is shown
@@ -7748,16 +8742,14 @@ function buildScene(L) {
       return cont;
     }
 
-    // Six modes in the Bloom line — all named "Bloom X" for brand
-    // consistency. Centred horizontally on the canvas.
-    const totalRowW  = 6 * btnW + 5 * gap;
-    const rowLeftCX  = (L.sw - totalRowW) / 2 + btnW / 2;
-    const tileCX     = rowLeftCX;
-    const wildsCX    = rowLeftCX + (btnW + gap);
-    const chainCX    = rowLeftCX + 2 * (btnW + gap);
-    const expandCX   = rowLeftCX + 3 * (btnW + gap);
-    const relayCX    = rowLeftCX + 4 * (btnW + gap);
-    const jackpotCX  = rowLeftCX + 5 * (btnW + gap);
+    // Mode buttons — built generically from MODE_DEF entries sorted
+    // by `displayOrder`. Adding a 7th mode means adding an entry to
+    // MODE_DEF; this row picks it up automatically with no edits here.
+    const modeList = Object.values(MODE_DEF)
+      .slice()
+      .sort((a, b) => (a.displayOrder ?? 999) - (b.displayOrder ?? 999));
+    const totalRowW = modeList.length * btnW + (modeList.length - 1) * gap;
+    const rowLeftCX = (L.sw - totalRowW) / 2 + btnW / 2;
 
     // ── GAME MODE caption above the row ───────────────────────────────────
     const modeCaption = new PIXI.Text('GAME MODE', {
@@ -7772,19 +8764,14 @@ function buildScene(L) {
     modeCaption.alpha = 0.85;
     app.stage.addChild(modeCaption);
 
-    scene.tileBtn    = makeMechanicButton('alt2', 'Bloom Tiles',   tileCX);
-    scene.wildsBtn   = makeMechanicButton('alt4', 'Bloom Wilds',   wildsCX);
-    scene.chainBtn   = makeMechanicButton('alt1', 'Bloom Chain',   chainCX);
-    scene.expandBtn  = makeMechanicButton('alt3', 'Bloom Reels',   expandCX);
-    scene.relayBtn   = makeMechanicButton('alt5', 'Bloom Ripple',  relayCX);
-    scene.jackpotBtn = makeMechanicButton('alt6', 'Bloom Jackpot', jackpotCX);
-
-    app.stage.addChild(scene.tileBtn);
-    app.stage.addChild(scene.wildsBtn);
-    app.stage.addChild(scene.chainBtn);
-    app.stage.addChild(scene.expandBtn);
-    app.stage.addChild(scene.relayBtn);
-    app.stage.addChild(scene.jackpotBtn);
+    scene.modeBtns = [];
+    for (let i = 0; i < modeList.length; i++) {
+      const def = modeList[i];
+      const cx  = rowLeftCX + i * (btnW + gap);
+      const btn = makeMechanicButton(def.key, def.name, cx);
+      scene.modeBtns.push(btn);
+      app.stage.addChild(btn);
+    }
   }
 
   // ─── BUY FEATURE BUTTON + FREE-SPINS BANNER (both modes) ────────────────
@@ -8634,17 +9621,18 @@ function _startFeatureCore(cost) {
   player.feature.totalWin        = 0;
   player.feature.costPaid        = cost;
   player.feature.emptyCountCarry = 0;
-  // Alt-3: free spins start at 4×4 just like the first base-game spin,
-  // and the global bloom multiplier seeds at 2×.
-  player.feature.gridSizeCarry = (ALT_MODE === 'alt3') ? GAME.ALT3_SIZES[0] : null;
-  player.feature.bloomMult     = (ALT_MODE === 'alt3') ? ALT3_FEATURE_MULT_START : 1;
+  // Mode-agnostic defaults; per-mode `initFeatureState` overrides any
+  // field that should be non-null at feature start (Bloom Reels seeds
+  // gridSizeCarry/bloomMult; Bloom Ripple seeds alt5Progress; Bloom
+  // Jackpot seeds alt6Jackpots).
+  player.feature.gridSizeCarry = null;
+  player.feature.bloomMult     = 1;
   player.feature.bloomCount    = 0;
-  // Alt-5: fresh 12-square progression bar at feature start.
-  player.feature.alt5Progress  = (ALT_MODE === 'alt5') ? _alt5BlankProgress() : null;
+  player.feature.alt5Progress  = null;
   player.feature._alt5RewardsThisSpin = [];
-  // Alt-6: fresh empty jackpot pots at feature start.
-  player.feature.alt6Jackpots = (ALT_MODE === 'alt6') ? _alt6BlankJackpots() : null;
+  player.feature.alt6Jackpots  = null;
   player.feature._alt6JackpotPaysThisSpin = [];
+  getModeDef().initFeatureState?.(player);
   clearAllTileBadges();
   refreshFeatureUI();
   updateStatusText('WIN 0,00');
@@ -8701,40 +9689,17 @@ function refreshFeatureUI() {
   if (scene.featureBanner && scene.featureBanner._refresh) scene.featureBanner._refresh();
   refreshBetControlsEnabled();
   // Mechanic toggle disabled mid-feature — redraw to reflect.
-  if (scene.chainBtn   && scene.chainBtn._redraw)   scene.chainBtn._redraw();
-  if (scene.tileBtn    && scene.tileBtn._redraw)    scene.tileBtn._redraw();
-  if (scene.expandBtn  && scene.expandBtn._redraw)  scene.expandBtn._redraw();
-  if (scene.wildsBtn   && scene.wildsBtn._redraw)   scene.wildsBtn._redraw();
-  if (scene.relayBtn   && scene.relayBtn._redraw)   scene.relayBtn._redraw();
-  if (scene.jackpotBtn && scene.jackpotBtn._redraw) scene.jackpotBtn._redraw();
-  // Alt-3 bloom multiplier pill: visible only during the alt-3 feature.
-  if (scene.alt3MultPill) {
-    const visible = (ALT_MODE === 'alt3' && player.feature.active);
-    scene.alt3MultPill.visible = visible;
-    if (visible && scene.alt3MultPill.valueText) {
-      const mult = player.feature.bloomMult || ALT3_FEATURE_MULT_START;
-      scene.alt3MultPill.valueText.text = `×${mult}`;
+  // Mode buttons live in `scene.modeBtns` — redraw all of them
+  // generically so adding a new mode doesn't require editing here.
+  if (scene.modeBtns) {
+    for (const btn of scene.modeBtns) {
+      if (btn && btn._redraw) btn._redraw();
     }
   }
-  // Alt-5 progression bar: visible only during the alt-5 feature.
-  // We DO NOT call `_restore` here — that's a destructive snap that
-  // would wipe whatever petals the animator's per-landing advances
-  // have just lit up. The bar's visual is driven incrementally during
-  // a spin and only `_restore`-snapped when the scene is rebuilt
-  // (handled at construction time in buildScene).
-  if (scene.alt5ProgressBar) {
-    scene.alt5ProgressBar.visible = (ALT_MODE === 'alt5' && player.feature.active);
-  }
-  // Alt-6 jackpot pots: visible only during the alt-6 feature. Refresh
-  // cash labels so they reflect the locked bet on entry, or the
-  // current player bet outside the feature.
-  if (scene.alt6JackpotPots) {
-    scene.alt6JackpotPots.visible = (ALT_MODE === 'alt6' && player.feature.active);
-    if (scene.alt6JackpotPots._refreshAllPayLabels) {
-      const b = player.feature.lockedBet || player.bet || 1;
-      scene.alt6JackpotPots._refreshAllPayLabels(b);
-    }
-  }
+  // Per-mode feature-widget refresh. Each mode owns its own widgets
+  // (Bloom Reels' multiplier pill, Bloom Ripple's progression bar,
+  // Bloom Jackpot's pots) and handles visibility + label sync here.
+  getModeDef().refreshFeatureUI?.(player, scene);
   updateSpinButtonState();
 }
 
@@ -9066,10 +10031,10 @@ function openPaytableModal(L) {
     paytableContent.addChild(card);
 
     // Petal count for the preview must match the current mode's max
-    // bloom (8 for alt-1/alt-2, 6 for alt-3). FlowerSymbol's
-    // _layoutPetals early-returns when n exceeds the mode's cap, which
-    // would render the preview as a bare pot in alt-3 if we passed 8.
-    const previewPetals = (ALT_MODE === 'alt3') ? GAME.ALT3_MAX_PETALS : 8;
+    // bloom (8 for most, 6 for Bloom Reels). FlowerSymbol's
+    // _layoutPetals early-returns when n exceeds the mode's cap, so
+    // a wrong value would render the preview as a bare pot.
+    const previewPetals = getModeDef().getPaytablePreviewPetals?.() ?? 8;
     const preview = new FlowerSymbol(color.name, previewPetals, flowerPreviewCell);
     preview.x = cx + cardH / 2;
     preview.y = cy + cardH / 2;
@@ -9120,229 +10085,7 @@ Triggering the Feature
 • Landing 3 or more scatters during a free spin awards +${SCATTER_RETRIGGER_SPINS} extra spins.
 • Scatter symbols also pay on their own — see SCATTER PAYS in the paytable.`;
 
-  const rulesText = (ALT_MODE === 'alt3')
-? `The Grid
-• Spins start on a 4×4 grid of flower pots. Each flower has a colour and
-  starts with 1–3 petals.
-• Every cascade that produces a Full Bloom EXPANDS the grid by one row
-  and one column, anchored at the bottom-left corner:
-    4×4  →  5×5  →  6×6 (max)
-• Existing flowers stay in place; the freshly-revealed row (top) and
-  column (right) are filled with brand-new random flowers.
-• In the base game the grid resets to 4×4 at the start of every new spin.
-
-Transfers
-• Adjacent same-colour flowers exchange petals — a petal moves from one
-  flower to a same-colour neighbour to its right or directly below.
-• Transfers keep going until no more can be made.
-
-Full Bloom
-• A flower blooms at 6 petals (instead of 8).
-• A Full Bloom pays its colour's base value × bet, and triggers the next
-  grid expansion (if the grid is below 6×6).
-
-Empty Dissolve
-• When a flower gives away all its petals, it dissolves with a puff.
-• Empty dissolves do NOT trigger expansions on their own.
-
-Cascades
-• Dissolved cells are refilled from above with fresh random flowers
-  (along with the new row/column when the grid grew this cascade).
-• Transfers run again on the new (possibly larger) grid; cascades keep
-  going as long as new blooms or empties happen.
-
-The Feature
-• The grid size DOES NOT reset between free spins — once the grid grows
-  to 5×5 or 6×6, it stays there for the rest of the feature.
-• A persistent BLOOM MULTIPLIER appears at the top of the grid:
-  – Starts at ×${ALT3_FEATURE_MULT_START}.
-  – Bumps +×${ALT3_FEATURE_MULT_STEP} every time a flower fully blooms (across every cascade,
-    every free spin — it never resets until the feature ends).
-  – Multiplies every Full Bloom payout for the rest of the feature.`
-+ TRIGGER_RULES
-: (ALT_MODE === 'alt4')
-? `The Grid
-• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
-• Some pots spawn as WILDs — pots holding 4–8 mixed-colour petals.
-
-Transfers — Regular Flowers
-• Adjacent same-colour flowers exchange petals — a petal moves from one
-  flower to a same-colour neighbour to its right or directly below.
-• Regular flowers do NOT send petals into a WILD.
-
-Transfers — WILDs
-• WILDs only SEND OUT petals; they never receive.
-• Each cascade, a WILD picks one of its petals and sends it to the
-  NEAREST cell (Manhattan distance, grid-wide) of that petal's colour.
-• When a WILD runs out of petals, it dissolves with a puff and a new
-  flower drops in to take its place.
-
-Full Bloom
-• When a regular flower reaches 8 petals, it blooms and pays its
-  colour's base value × bet.
-• WILDs never bloom — they only ever drain.
-• Each bloom also DROPS a multiplier tile on its own cell and HALF of
-  that tile's value on all 8 adjacent cells. Tile values are randomly
-  picked from:
-    4×   8×   10×   20×   50×   100×   500×
-• When more than one bloom spreads onto the same cell, the values SUM.
-
-Bloom on a Multiplier
-• If a later bloom happens on a cell that already has a multiplier, that
-  bloom's payout is multiplied by the cell's accumulated multiplier.
-• Multipliers persist on their cell for the rest of the spin.
-
-Cascades
-• Dissolved cells are refilled from above with fresh random flowers
-  (which can include new WILDs).
-• Transfers run again on the new grid; cascades continue as long as
-  new blooms, empties, or WILD-dissolves keep happening.
-
-The Feature
-• Multiplier tiles dropped during the feature PERSIST across every free
-  spin — they only reset when the feature ends.
-• WILDs continue to spawn naturally during free spins, feeding tile
-  values into the grid as they drain.`
-+ TRIGGER_RULES
-: (ALT_MODE === 'alt5')
-? `The Grid
-• 4 × 5 grid. Each pot holds a coloured flower with 1–4 petals.
-
-Transfers
-• Same-colour neighbours pass petals until no more moves are possible.
-
-Full Bloom
-• A pot at 8 petals blooms and pays its colour's base value × bet.
-
-Ripple
-• 40% chance per bloom: spawns 1–4 stray petals in random colours.
-• Each stray flies to a random same-colour pot with room and adds 1 petal.
-• If no same-colour pot has room, the petal vanishes.
-
-Chain Blooms
-• A stray that pushes a pot to 8 blooms next cascade. Chains can roll on.
-
-Empty Dissolve
-• A pot that loses all its petals just puffs away. Empties don't ripple.
-
-The Feature
-• A 12-square PROGRESSION BAR appears above the grid:
-    Squares  1– 3  │  Empty pots — 16 petals each (any colour)
-    Square      4  │  REWARD: +5 FREESPINS, all blooms pay ×5
-    Squares  5– 7  │  Empty pots — 16 petals each
-    Square      8  │  REWARD: +10 FREESPINS, all blooms pay ×10
-    Squares  9–11  │  Empty pots — 16 petals each
-    Square     12  │  REWARD: +12 FREESPINS, all blooms pay ×25
-• Every petal that lands during a transfer fills the active pot one
-  petal at a time — regular cluster transfers AND ripple-petal landings
-  both count, regardless of colour.
-• When a row of three pots fills, the next reward square activates with
-  a popup awarding free spins + a new bloom multiplier. The bar then
-  starts filling the next row.
-• Ripple chance climbs to 60% during the feature, with 8 stray petals
-  per ripple. Every bloom also has a 50% chance to fire a SYMPATHY bloom
-  (a random same-colour pot anywhere on the grid blooms alongside the
-  original). A bloom fires Ripple OR Sympathy, never both.
-• Reach square 12 for the maximum: ×25 on every bloom for the rest of
-  the run.`
-+ TRIGGER_RULES
-: (ALT_MODE === 'alt6')
-? `The Grid
-• 4 × 5 grid. Each pot holds a coloured flower with 1–4 petals.
-
-Transfers / Full Bloom / Ripple
-• Same as Bloom Ripple: same-colour neighbours pass petals; a pot at
-  8 petals blooms; every bloom rolls a chance to spawn random-colour
-  stray petals (Ripple).
-
-The Feature
-• Four JACKPOT POTS sit above the grid:
-    TINY  (Sky / Pearl)      fills at 10 → pays ×20   bet
-    MINI  (Teal / Lime)      fills at 15 → pays ×50   bet
-    MAJOR (Magenta / Gold)   fills at 20 → pays ×200  bet
-    GRAND (Scarlet / Indigo) fills at 25 → pays ×1000 bet
-• During free spins, every Ripple stray petal flies UP to its colour's
-  jackpot pot instead of going to a grid cell.
-• When a pot fills, it pays its jackpot and resets to empty.
-• All blooms pay ×5 for the duration of the feature.
-• 50% sympathy chance per bloom (same as Bloom Ripple feature).
-• Pot fill counts persist across all 15 free spins.`
-+ TRIGGER_RULES
-: (ALT_MODE === 'alt2')
-? `The Grid
-• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
-• Each flower has a colour and starts with 1 – 4 petals.
-
-Transfers
-• Adjacent same-colour flowers exchange petals — a petal moves from one
-  flower to a same-colour neighbour to its right or directly below.
-• Transfers keep going until no more can be made.
-
-Full Bloom
-• When a flower reaches 8 petals, it blooms and pays its colour's base
-  value × bet.
-• Each bloom also DROPS a multiplier tile on its own cell and HALF of
-  that tile's value on all 8 adjacent cells (up, down, left, right and
-  diagonals). Tile values are randomly picked from:
-    4×   8×   10×   20×   50×   100×   500×
-• When more than one bloom spreads onto the same cell, the values SUM.
-
-Bloom on a Multiplier
-• If a later bloom happens on a cell that already has a multiplier, that
-  bloom's payout is multiplied by the cell's accumulated multiplier.
-• Multipliers persist on their cell for the rest of the spin — they don't
-  disappear after a bloom, so a new flower growing there can cash them in.
-
-Empty Dissolve
-• A flower that gives away all its petals just poofs away. In this mode
-  empties do NOT add multipliers — only blooms do.
-
-Cascades
-• Dissolved cells are refilled from above with fresh random flowers.
-• Transfers run again on the new grid; cascades continue as long as
-  new blooms or empties keep happening.
-
-The Feature
-• The grid clears of any base-game tile multipliers when the feature
-  begins.
-• Multiplier tiles dropped during the feature PERSIST across every free
-  spin — every bloom keeps adding to the cells, and a later bloom on
-  a tiled cell pays at the accumulated rate.`
-+ TRIGGER_RULES
-: `The Grid
-• 4 rows × 5 columns of flower pots. Every cell always holds one flower.
-• Each flower has a colour and starts with 1 – 4 petals.
-
-Transfers
-• Adjacent same-colour flowers exchange petals — a petal moves from one
-  flower to a same-colour neighbour to its right or directly below.
-• Transfers keep going until no more can be made.
-
-Full Bloom
-• When a flower reaches 8 petals, it blooms and dissolves.
-• A Full Bloom pays its colour's base value × bet.
-
-Empty Dissolve
-• When a flower gives away all its petals, it dissolves.
-• Empty Dissolves grow the spin multiplier along a tier ladder:
-    1 empty → 2×   3 empties → 3×   6 empties → 5×   10 empties → 10×
-    every +5 empties beyond that → +5× more
-
-Cascades
-• Dissolved cells are refilled from above with fresh random flowers.
-• Transfers run again on the new grid; cascades continue as long as
-  new blooms or empties keep happening.
-
-Final Win
-• Final Win  =  Total Payout × Multiplier
-• Total Payout is the sum of every Full Bloom paid during the spin.
-
-The Feature
-• The spin multiplier does NOT reset between free spins — the tier
-  ladder keeps climbing from wherever the previous free spin ended.
-• Empty dissolves keep feeding the ladder across the whole run.
-• Each free spin's Final Win adds to the cumulative feature total.`
-+ TRIGGER_RULES;
+  const rulesText = (getModeDef().getRulesText?.(TRIGGER_RULES)) || (MODE_DEF.alt1.getRulesText(TRIGGER_RULES));
 
   // ── Scrollable viewport for the rules body ─────────────────────────────
   // Rules text grew long enough (especially with alt-3 / Expanding Reels)
@@ -9886,33 +10629,11 @@ function openBuyFeatureModal() {
   if (!canBuyFeature()) return;
   const cost  = featureCost();
   const spins = featureSpinCount();
-  let persistLines;
-  if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
-    persistLines = [
-      `Multiplier tiles dropped during the feature PERSIST across all ${spins} spins.`,
-    ];
-  } else if (ALT_MODE === 'alt3') {
-    persistLines = [
-      `Grid size and bloom multiplier carry across all ${spins} spins of the feature.`,
-    ];
-  } else if (ALT_MODE === 'alt5') {
-    persistLines = [
-      `A vertical progression bar fills as petal transfers happen during the feature.`,
-      `Reaching each marker awards more free spins and a bigger bloom multiplier.`,
-      `Reach the top marker for the maximum reward.`,
-    ];
-  } else if (ALT_MODE === 'alt6') {
-    const _b = player.bet || 1;
-    persistLines = [
-      `Four jackpot pots above the grid collect ripple petals by colour.`,
-      `Fill a pot to claim its cash jackpot — Tiny ${fmtCurrency(20 * _b)}, Mini ${fmtCurrency(50 * _b)}, Major ${fmtCurrency(200 * _b)}, Grand ${fmtCurrency(1000 * _b)}.`,
-      `All blooms pay ×5 throughout the feature.`,
-    ];
-  } else {
-    persistLines = [
-      `The spin multiplier keeps climbing across all ${spins} free spins.`,
-    ];
-  }
+  // Each mode supplies its own persistence-description lines. Falls
+  // back to a generic message if the mode hasn't defined any.
+  const persistLines = getModeDef().getBuyFeatureLines?.(player, spins) || [
+    `The spin multiplier keeps climbing across all ${spins} free spins.`,
+  ];
   const dialog = _openSimpleModal({
     title: 'Buy Feature',
     bodyLines: [
@@ -9987,13 +10708,10 @@ async function onSpinClick() {
   // 2. Reset the spin UI state
   scene.spinButton._setBusy(true);
   if (scene.winPill && scene.winPill.resetPermanent) scene.winPill.resetPermanent();
-  // Chain-mode pill: outside the feature resets to baseline. Inside the
-  // feature, seed with the carried-over emptyCount so the tier ladder
-  // keeps climbing spin-over-spin.
-  if (inFeature && ALT_MODE === 'alt1') {
-    const carry = player.feature.emptyCountCarry || 0;
-    updateMultiplierBar(multForEmpties(carry), carry);
-  } else {
+  // Per-mode spin-start widget reset. Most modes just reset the
+  // multiplier bar to baseline; Bloom Chain seeds it from the carried
+  // emptyCount so the tier ladder keeps climbing across feature spins.
+  if (!getModeDef().resetSpinStartUI?.(player, scene, { inFeature })) {
     updateMultiplierBar(1, 0);
   }
   updateWinText(0);
@@ -10016,119 +10734,31 @@ async function onSpinClick() {
   const runOpts = {};
   if (inFeature) {
     runOpts.freeSpin = true;
-    if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') runOpts.cellMults = player.feature.cellMults;
-    if (ALT_MODE === 'alt1') runOpts.emptyCountStart    = player.feature.emptyCountCarry || 0;
-    if (ALT_MODE === 'alt5') {
-      runOpts.alt5FeatureActive = true;
-      // Carry progression so the bar advances spin-over-spin and the
-      // bloom multiplier reflects the latest unlocked tier.
-      runOpts.alt5Progress = player.feature.alt5Progress || _alt5BlankProgress();
-    }
-    if (ALT_MODE === 'alt6') {
-      runOpts.alt6FeatureActive = true;
-      // Carry jackpot fill counts so each pot keeps its progress
-      // across feature spins.
-      runOpts.alt6Jackpots = player.feature.alt6Jackpots || _alt6BlankJackpots();
-    }
-    if (ALT_MODE === 'alt3') {
-      // Carry the previous free spin's grid size so we DON'T reset to
-      // 4×4 between free spins — and the persistent global bloom
-      // multiplier (starts at 2× when the feature begins, +1× per Full
-      // Bloom forever during the feature). Mark the feature as active so
-      // the model actually applies the multiplier.
-      runOpts.gridSizeStart      = player.feature.gridSizeCarry || GAME.ALT3_SIZES[0];
-      runOpts.alt3BloomMultStart = player.feature.bloomMult     || ALT3_FEATURE_MULT_START;
-      runOpts.alt3FeatureActive  = true;
-    }
+    // Per-mode runOpts — each mode's MODE_DEF.populateRunOpts adds
+    // exactly the fields its engine hooks read (e.g. Bloom Reels seeds
+    // gridSize/multiplier carry; Bloom Jackpot seeds the pot fill
+    // state). Modes without feature carry do nothing here.
+    getModeDef().populateRunOpts?.(player, runOpts);
   }
   const result = BloomSort.runSpin(bet, runOpts);
-  if (inFeature && (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') && result.cellMults) {
-    player.feature.cellMults = result.cellMults;
-  }
-  if (inFeature && ALT_MODE === 'alt1' && typeof result.emptyCount === 'number') {
-    player.feature.emptyCountCarry = result.emptyCount;
-  }
-  // Alt-5: STASH the new progression state (don't commit yet). The
-  // animator's progression bar reads `player.feature.alt5Progress` at
-  // spin start to know where the bar should BEGIN. Committing the new
-  // (post-spin) state here would make the bar start at the END state
-  // and the per-landing advances would push it well past the real
-  // total — petals would appear/disappear inconsistently. Apply it in
-  // onEnd, AFTER the animation has caught up to the engine.
-  if (inFeature && ALT_MODE === 'alt5') {
-    player.feature._alt5PendingProgress = result.alt5Progress || null;
-    player.feature._alt5RewardsThisSpin = result.alt5Rewards || [];
-  }
-  // Alt-6: same idea — stash the post-spin jackpot fill state and pays
-  // earned this spin so the animator can start at the OLD state and
-  // catch up incrementally during the spin.
-  if (inFeature && ALT_MODE === 'alt6') {
-    player.feature._alt6PendingJackpots    = result.alt6Jackpots || null;
-    player.feature._alt6JackpotPaysThisSpin = result.alt6JackpotPays || [];
-  }
-  if (inFeature && ALT_MODE === 'alt3') {
-    if (typeof result.alt3GridSizeEnd === 'number') {
-      player.feature.gridSizeCarry = result.alt3GridSizeEnd;
-    }
-    if (typeof result.alt3BloomMultEnd === 'number') {
-      player.feature.bloomMult = result.alt3BloomMultEnd;
-    }
-    player.feature.bloomCount = (player.feature.bloomCount || 0)
-                              + (result.alt3BloomCount || 0);
+  // Per-mode result handling — same one-call dispatch. Most modes
+  // commit immediately; Bloom Ripple and Bloom Jackpot STASH new
+  // state into `_alt5/6Pending*` fields so the animator can replay
+  // from the OLD state and catch up incrementally (committing now
+  // would skip the visual progression).
+  if (inFeature) {
+    getModeDef().applyFeatureResult?.(player, result);
   }
 
   if (!animator) animator = new SpinAnimator({ scene, app });
 
   animator.onProgress = (ev) => {
     if (ev.type === 'dissolve') {
-      // Alt-3 feature: bump the visible multiplier pill ONLY when the
-      // value actually changed. Empty-only cascades emit a dissolve
-      // event with the unchanged multiplier; we'd otherwise pulse the
-      // pill animation for nothing, which reads as a false "you got
-      // a bloom" signal.
-      if (ALT_MODE === 'alt3' && player.feature.active && scene.alt3MultPill
-          && typeof ev.alt3BloomMult === 'number') {
-        const pill = scene.alt3MultPill;
-        pill.visible = true;
-        if (pill.valueText) {
-          const newLabel = `×${ev.alt3BloomMult}`;
-          if (pill.valueText.text !== newLabel) {
-            pill.valueText.text = newLabel;
-            gsap.fromTo(pill.valueText.scale,
-              { x: 1.4, y: 1.4 },
-              { x: 1, y: 1, duration: 0.45, ease: 'elastic.out(1, 0.4)' });
-          }
-        }
-      }
-      const runningWin = ev.payoutTotal * bet;
-      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt3' || ALT_MODE === 'alt4') {
-        // Tile-multiplier and Expanding-Reels modes: running total shows
-        // in the bottom status text. Counts UP smoothly from whatever
-        // value is currently shown to the new running total. During the
-        // free-spin feature, it's cumulative across all spins
-        // (feature.totalWin baseline + this spin's running).
-        const displayWin = inFeature
-          ? player.feature.totalWin + runningWin
-          : runningWin;
-        if (displayWin > 0) {
-          countUpStatusWin(displayWin);
-        }
-      } else {
-        // Chain-multiplier mode: the BLOOM WIN pill is now ticked per
-        // bloom by spawnPayoutTextToWinPill's onArrive callback (timed
-        // to the "+N" landing on the pill). Intentionally NOT calling
-        // updateWinText(runningWin) here — doing so would jump the pill
-        // to the cumulative value before the flights land, clobbering
-        // the sync. At spin end, onEnd's animateMultiplication (or its
-        // else branch) finalises the pill.
-        if (inFeature) {
-          const baseline = player.feature.totalWin || 0;
-          // runningWin is PRE-multiplier — use it for an honest feature
-          // running display on the bottom status.
-          const displayWin = baseline + runningWin;
-          updateStatusText(`WIN ${fmtCurrency(displayWin)}`);
-        }
-      }
+      // Per-mode dissolve handling — runs after each cascade. Modes
+      // bump their feature widgets here (Bloom Reels' multiplier pill
+      // pulses on changes) and update the running win readout in
+      // their preferred place (status line vs. BLOOM WIN pill).
+      getModeDef().onCascadeDissolve?.(player, scene, ev, { bet, inFeature });
     }
   };
 
@@ -10138,29 +10768,13 @@ async function onSpinClick() {
       const baseWin = finalResult.totalPayout * bet;   // pre-multiplier
       const finalWin = finalResult.finalWin;           // post-multiplier
 
-      // Alt-5: commit the spin's progression state now that the animation
-      // has caught up with the engine. Done at onEnd start (not at runSpin
-      // time) so the animator's bar starts each spin at the OLD state and
-      // advances IN STEP with the engine, instead of starting at the new
-      // post-spin state and visibly overshooting.
-      if (player.feature.active && ALT_MODE === 'alt5'
-          && player.feature._alt5PendingProgress) {
-        player.feature.alt5Progress = player.feature._alt5PendingProgress;
-        player.feature._alt5PendingProgress = null;
-      }
-      // Alt-6: commit the post-spin jackpot fill state (same reasoning).
-      // Then credit jackpot payouts to the feature win total — these
-      // pay × bet, accumulated during the spin and added in bulk here.
-      if (player.feature.active && ALT_MODE === 'alt6') {
-        if (player.feature._alt6PendingJackpots) {
-          player.feature.alt6Jackpots = player.feature._alt6PendingJackpots;
-          player.feature._alt6PendingJackpots = null;
-        }
-        const pays = player.feature._alt6JackpotPaysThisSpin || [];
-        if (pays.length) {
-          const totalPay = pays.reduce((s, p) => s + (p.payout || 0), 0) * bet;
-          player.feature.totalWin = (player.feature.totalWin || 0) + totalPay;
-        }
+      // Per-mode commit: Bloom Ripple / Bloom Jackpot stash the
+      // post-spin state during runSpin so the animator's bar / pots
+      // can replay from the OLD state. Now that animation has caught
+      // up with the engine, commit the new state for the next spin
+      // and credit any tier-paid jackpots.
+      if (player.feature.active) {
+        getModeDef().commitFeatureResult?.(player, finalResult, bet);
       }
 
       // Balance: outside the feature, credit this spin's win immediately.
@@ -10175,41 +10789,14 @@ async function onSpinClick() {
       updateRtpText();
       currentGrid = finalResult.finalGrid;
 
-      if (ALT_MODE === 'alt2' || ALT_MODE === 'alt4') {
-        // Tile mode (and Tile+Wilds): no × reveal (no global multiplier).
-        // The bottom status has already been ticking up during the
-        // cascade; just finalise.
-        if (player.feature.active) {
-          // Accumulate this spin's win into the feature total. The status
-          // shows the cumulative amount won across the feature so far.
-          player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
-          updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
-        } else if (finalWin > 0) {
-          updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
-        } else {
-          updateStatusText('Good luck!');
-        }
-      } else {
-        // Chain mode: original × reveal, then final readout in the status.
-        if (mult > 1 && finalWin > 0) {
-          await animateMultiplication(baseWin, finalWin);
-          if (finalWin >= bet) pulseWinPill();
-        } else {
-          updateWinText(finalWin, true);
-          if (finalWin > 0 && finalWin >= bet) pulseWinPill();
-        }
-        if (player.feature.active) {
-          // Accumulate this spin's win into the feature total so the end
-          // popup reports the full amount won across all free spins, and
-          // the bottom status stays showing the running cumulative total.
-          player.feature.totalWin = (player.feature.totalWin || 0) + finalWin;
-          updateStatusText(`WIN ${fmtCurrency(player.feature.totalWin)}`);
-        } else if (finalWin > 0) {
-          updateStatusText(`WIN ${fmtCurrency(finalWin)}`);
-        } else {
-          updateStatusText('Good luck!');
-        }
-      }
+      // Per-mode spin-end finalisation: tile-style modes (Bloom Tiles,
+      // Bloom Wilds) skip the × multiplication reveal since they have
+      // no global multiplier; chain-style modes (Bloom Chain, Reels,
+      // Ripple, Jackpot) do the reveal animation. All modes accumulate
+      // the spin's finalWin into player.feature.totalWin and finalise
+      // the status text.
+      await getModeDef().onSpinEnd?.(player, scene, finalResult,
+        { bet, baseWin, finalWin, mult });
       // Outside the feature, reset the pill state baseline. Inside the
       // feature we keep the displayed multiplier so the next free spin
       // picks up where this one left off.
@@ -10278,41 +10865,17 @@ async function onSpinClick() {
           }
         });
       }
-      // Alt-5 progression rewards: if any phase completed during this
-      // spin, pause the chain on a popup. On OK, COMMIT the phase
-      // advance (engine kept phaseIdx/currentCount frozen at the fill
-      // moment so the visible bar matched what the player saw) and
-      // apply the bonus spins + multiplier bump.
-      //
-      // The engine caps at one phase per spin, so rewards.length is
-      // effectively always 1 here — the sum/latest logic is kept for
-      // safety in case that cap ever loosens.
+      // Per-mode reward popup: a mode that's earned a tier reward
+      // this spin (e.g. Bloom Ripple's progression bar hitting a
+      // marker) opens a celebratory modal. Returns true if a popup
+      // opened, which pauses the auto-spin chain.
       if (player.feature.active
-          && ALT_MODE === 'alt5'
-          && player.feature._alt5RewardsThisSpin
-          && player.feature._alt5RewardsThisSpin.length) {
-        const rewards = player.feature._alt5RewardsThisSpin;
-        player.feature._alt5RewardsThisSpin = [];
-        const totalSpins = rewards.reduce((s, r) => s + (r.spins || 0), 0);
-        const latestMult = rewards[rewards.length - 1].mult;
-        const rewardAdvances = rewards.length;
+          && getModeDef().tryOpenFeatureRewardPopup?.(player, () => {
+            if (player.feature.active && player.feature.spinsLeft > 0) {
+              setTimeout(() => { onSpinClick(); }, 250);
+            }
+          })) {
         chainNext = false;
-        openAlt5ProgressionRewardModal(totalSpins, latestMult, () => {
-            // Apply bonus spins now (next spin reads spinsLeft).
-          player.feature.spinsLeft += totalSpins;
-          // Advance the bar's pointer to the next reward and bump the
-          // bloom multiplier for all subsequent spins. transferCount
-          // stays cumulative — the bar's visible fill keeps climbing
-          // rather than resetting between rewards.
-          if (player.feature.alt5Progress) {
-            player.feature.alt5Progress.rewardIdx += rewardAdvances;
-            player.feature.alt5Progress.bloomMult  = latestMult;
-          }
-          refreshFeatureUI();
-          if (player.feature.active && player.feature.spinsLeft > 0) {
-            setTimeout(() => { onSpinClick(); }, 250);
-          }
-        });
       }
       // Stash for the finally block.
       this._chainNext = chainNext;
