@@ -3517,12 +3517,16 @@ function runSpin(bet = 1, opts = {}) {
     // Hook: post-dissolve mode actions. Currently only alt-3 uses this
     // (grows the grid after a winning cascade). The hook receives a
     // setGrid callback so it can mutate the grid reference in this
-    // cascade loop.
-    hooks.afterDissolve(state, {
+    // cascade loop. setGrid also writes back to ctx.grid so the hook
+    // can clone the post-expand grid for its events (otherwise ctx.grid
+    // stays pinned to the pre-call reference and gridAfter ships the
+    // OLD size — root cause of the "no new symbols fill in" bug).
+    const dissolveCtx = {
       fullBlooms, emptyDissolves,
       grid, events, cas,
-      setGrid: (g) => { grid = g; },
-    });
+    };
+    dissolveCtx.setGrid = (g) => { grid = g; dissolveCtx.grid = g; };
+    hooks.afterDissolve(state, dissolveCtx);
 
     // ── 4. Refill ────────────────────────────────────────────────────
     const newCells = refillGrid(grid);
