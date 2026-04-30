@@ -3336,8 +3336,9 @@ MODE_DEF.alt6.buildSceneFeatureWidget = function (scene, app, ctx) {
 MODE_DEF.alt1.buildSceneFeatureWidget = function (scene, app, ctx) {
   // BLOOM WIN / MULTIPLIER pill — large split pill at the top of the
   // grid, overlapping by 25% of its own height. Permanent (both
-  // halves always on).
-  scene.winPill = makeSplitPill({
+  // halves always on). makeSplitPill is buildScene-local; passed in
+  // through ctx so this top-level hook can reach it.
+  scene.winPill = ctx.makeSplitPill({
     x: ctx.avalancheCX,
     y: ctx.avalancheCY,
     width: ctx.avalanchePillW,
@@ -8654,6 +8655,9 @@ function buildScene(L) {
     avalancheCX, avalancheCY, avalanchePillW, avalanchePillH,
     gridTop, gridLeft, gridRight,
     gameScale,
+    // Pass buildScene-local helpers that mode hooks need but can't see
+    // through their lexical scope (they're defined at top level).
+    makeSplitPill,
   });
 
 
